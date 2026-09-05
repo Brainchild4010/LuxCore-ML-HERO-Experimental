@@ -170,6 +170,8 @@ public:
 
 	// ML HERO global spectral mode
 	bool mlHeroEnabled;
+	// 1 = uniform GOLDSTAND, 2 = Sampling 2.0 O1
+	int mlHeroSamplingMode;
 
 	// Clamping settings
 	float sqrtVarianceClampMaxValue;

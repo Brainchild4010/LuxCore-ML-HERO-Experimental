@@ -30,12 +30,78 @@
 // They are currently defined in the global namespace (same as the BIDIR patch).
 void SetMLHeroEnabled(const bool enabled);
 void SetMLDispersionWaveLength(const float waveLength);
+void SetMLDispersionWaveLength(const float waveLength, const float sampleWeight);
 luxrays::Spectrum GetMLDispersionSampleColor();
 bool GetMLDispersionUsed();
 
 using namespace std;
 using namespace luxrays;
 using namespace slg;
+
+//------------------------------------------------------------------------------
+// ML HERO Sampling 2.0 - O1 CPU PATH diagnostic
+// 16 wavelength bins; 80% CIE-Y-like photopic importance + 20% uniform floor.
+// sampleWeight = p_uniform / p_sampling2, so the existing uniform-normalized
+// WaveLength2RGB estimator remains energy-correct.
+//------------------------------------------------------------------------------
+static float MLHeroSampling2Sample(const float u, float *sampleWeight) {
+	static const float binProb[16] = {
+		0.0126331286f, 0.0133533552f, 0.0166194938f, 0.0275044480f,
+		0.0568548852f, 0.1352293344f, 0.1936849374f, 0.1927480102f,
+		0.1493873570f, 0.0880972731f, 0.0418778055f, 0.0203700156f,
+		0.0139428652f, 0.0126807265f, 0.0125154610f, 0.0125009033f
+	};
+
+	const float uu = Clamp(u, 0.f, 0.99999994f);
+	float cdf0 = 0.f;
+	for (u_int i = 0; i < 16u; ++i) {
+		const float cdf1 = cdf0 + binProb[i];
+		if ((uu < cdf1) || (i == 15u)) {
+			const float localU = Clamp((uu - cdf0) / binProb[i], 0.f, 0.99999994f);
+			*sampleWeight = 1.f / (16.f * binProb[i]);
+			return 380.f + (i + localU) * 25.f;
+		}
+		cdf0 = cdf1;
+	}
+	*sampleWeight = 1.f;
+	return 780.f;
+}
+
+//------------------------------------------------------------------------------
+// ML HERO Sampling 3.0 - O2 CPU PATH diagnostic
+//
+// "RGB sensor weighted" here means importance sampled against LuxCore's own
+// wavelength-to-RGB output response, not a physical camera sensor model.
+// We integrate the current WaveLength2RGB response into 16 x 25 nm bins and
+// use an 80% sensor-importance / 20% uniform mixture.
+//
+// sampleWeight = p_uniform / p_sampling3, preserving the same uniform-spectrum
+// estimator used by Sampling 1.0 and keeping the estimator unbiased.
+//------------------------------------------------------------------------------
+static float MLHeroSampling3Sample(const float u, float *sampleWeight) {
+    static const float binProb[16] = {
+        0.05676103f, 0.08028577f, 0.08038660f, 0.10020402f,
+        0.10460621f, 0.06266096f, 0.07141445f, 0.08194949f,
+        0.07852106f, 0.06112917f, 0.04512863f, 0.04199809f,
+        0.04186904f, 0.03748120f, 0.03102849f, 0.02457578f
+    };
+
+    const float uu = Clamp(u, 0.f, 0.99999994f);
+    float cdf0 = 0.f;
+    for (u_int i = 0; i < 16u; ++i) {
+        const float cdf1 = cdf0 + binProb[i];
+        if ((uu < cdf1) || (i == 15u)) {
+            const float localU = Clamp((uu - cdf0) / binProb[i], 0.f, 0.99999994f);
+            *sampleWeight = 1.f / (16.f * binProb[i]);
+            return 380.f + (i + localU) * 25.f;
+        }
+        cdf0 = cdf1;
+    }
+
+    *sampleWeight = 1.f;
+    return 780.f;
+}
+
 
 //------------------------------------------------------------------------------
 // PathTracer
@@ -84,7 +150,7 @@ const Film::FilmChannels PathTracer::lightSampleResultsChannels({
 }); 
 
 PathTracer::PathTracer() : pixelFilterDistribution(nullptr),
-		photonGICache(nullptr), mlHeroEnabled(false) {
+		photonGICache(nullptr), mlHeroEnabled(false), mlHeroSamplingMode(1) {
 }
 
 PathTracer::~PathTracer() {
@@ -761,7 +827,16 @@ void PathTracer::RenderEyeSample(
 			(mlStratum + Clamp(mlSubPixelY, 0.f, 0.99999994f)) /
 			mlStrataCount;
 
-	SetMLDispersionWaveLength(Lerp(mlSpectralU, 380.f, 780.f));
+	if (mlHeroSamplingMode == 3) {
+		float mlSampleWeight;
+		const float mlWaveLength = MLHeroSampling3Sample(mlSpectralU, &mlSampleWeight);
+		SetMLDispersionWaveLength(mlWaveLength, mlSampleWeight);
+	} else if (mlHeroSamplingMode == 2) {
+		float mlSampleWeight;
+		const float mlWaveLength = MLHeroSampling2Sample(mlSpectralU, &mlSampleWeight);
+		SetMLDispersionWaveLength(mlWaveLength, mlSampleWeight);
+	} else
+		SetMLDispersionWaveLength(Lerp(mlSpectralU, 380.f, 780.f));
 	}
 
 	RenderEyePath(device, scene, sampler, pathInfo, eyeRay, Spectrum(1.f), sampleResults);
@@ -898,9 +973,19 @@ void PathTracer::RenderLightSample(IntersectionDevice *device,
 	// ML CPU PATH HERO for the optional CPU light-tracing path. Keep this
 	// state independent from the eye path and reuse the first light BSDF-X
 	// sample as wavelength source (same no-extra-dimension strategy).
-	if (mlHeroEnabled)
-		SetMLDispersionWaveLength(Lerp(
-				sampler.GetSample(lightSampleBootSize + 4), 380.f, 780.f));
+	if (mlHeroEnabled) {
+		const float mlLightU = sampler.GetSample(lightSampleBootSize + 4);
+		if (mlHeroSamplingMode == 3) {
+			float mlSampleWeight;
+			const float mlWaveLength = MLHeroSampling3Sample(mlLightU, &mlSampleWeight);
+			SetMLDispersionWaveLength(mlWaveLength, mlSampleWeight);
+		} else if (mlHeroSamplingMode == 2) {
+			float mlSampleWeight;
+			const float mlWaveLength = MLHeroSampling2Sample(mlLightU, &mlSampleWeight);
+			SetMLDispersionWaveLength(mlWaveLength, mlSampleWeight);
+		} else
+			SetMLDispersionWaveLength(Lerp(mlLightU, 380.f, 780.f));
+	}
 
 	Spectrum lightPathFlux;
 
@@ -1152,6 +1237,7 @@ void PathTracer::ParseOptions(
 
 	// ML HERO global spectral mode
 	mlHeroEnabled = cfg.Get(defaultProps.Get("path.mlhero.enable")).Get<bool>();
+	mlHeroSamplingMode = Clamp(cfg.Get(defaultProps.Get("path.mlhero.samplingmode")).Get<int>(), 1, 3);
 
 	// Russian Roulette settings
 	rrDepth = (u_int)Max(1, cfg.Get(defaultProps.Get("path.russianroulette.depth")).Get<int>());
@@ -1223,6 +1309,7 @@ PropertiesUPtr PathTracer::ToProperties(const Properties &cfg) {
 
 	props <<
 			cfg.Get(GetDefaultProps()->Get("path.mlhero.enable")) <<
+			cfg.Get(GetDefaultProps()->Get("path.mlhero.samplingmode")) <<
 			cfg.Get(GetDefaultProps()->Get("path.hybridbackforward.enable")) <<
 			cfg.Get(GetDefaultProps()->Get("path.hybridbackforward.partition")) <<
 			cfg.Get(GetDefaultProps()->Get("path.hybridbackforward.glossinessthreshold")) <<
@@ -1241,6 +1328,7 @@ PropertiesUPtr PathTracer::GetDefaultProps() {
 	auto props = std::make_unique<Properties>();
 	*props <<
 			Property("path.mlhero.enable")(false) <<
+			Property("path.mlhero.samplingmode")(1) <<
 			Property("path.hybridbackforward.enable")(false) <<
 			Property("path.hybridbackforward.partition")(0.8) <<
 			Property("path.hybridbackforward.glossinessthreshold")(.05f) <<

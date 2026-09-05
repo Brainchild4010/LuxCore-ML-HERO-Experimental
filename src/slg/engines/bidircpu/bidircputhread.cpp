@@ -32,12 +32,63 @@
 // ML dispersion experiment: implemented in glass.cpp
 void SetMLHeroEnabled(const bool enabled);
 void SetMLDispersionWaveLength(const float waveLength);
+void SetMLDispersionWaveLength(const float waveLength, const float sampleWeight);
 luxrays::Spectrum GetMLDispersionSampleColor();
 
 using namespace std;
 using namespace luxrays;
 using namespace slg;
 using namespace std::literals::chrono_literals;
+
+//------------------------------------------------------------------------------
+// ML HERO Sampling 2.0 / 3.0 for CPU BIDIR.
+// Same 16-bin distributions and PDF correction as CPU Path O1/O2.
+//------------------------------------------------------------------------------
+static float MLBidirHeroSampling2Sample(const float u, float *sampleWeight) {
+    static const float binProb[16] = {
+        0.0126331286f, 0.0133533552f, 0.0166194938f, 0.0275044480f,
+        0.0568548852f, 0.1352293344f, 0.1936849374f, 0.1927480102f,
+        0.1493873570f, 0.0880972731f, 0.0418778055f, 0.0203700156f,
+        0.0139428652f, 0.0126807265f, 0.0125154610f, 0.0125009033f
+    };
+
+    const float uu = Clamp(u, 0.f, 0.99999994f);
+    float cdf0 = 0.f;
+    for (u_int i = 0; i < 16u; ++i) {
+        const float cdf1 = cdf0 + binProb[i];
+        if ((uu < cdf1) || (i == 15u)) {
+            const float localU = Clamp((uu - cdf0) / binProb[i], 0.f, 0.99999994f);
+            *sampleWeight = 1.f / (16.f * binProb[i]);
+            return 380.f + (i + localU) * 25.f;
+        }
+        cdf0 = cdf1;
+    }
+    *sampleWeight = 1.f;
+    return 780.f;
+}
+
+static float MLBidirHeroSampling3Sample(const float u, float *sampleWeight) {
+    static const float binProb[16] = {
+        0.05676103f, 0.08028577f, 0.08038660f, 0.10020402f,
+        0.10460621f, 0.06266096f, 0.07141445f, 0.08194949f,
+        0.07852106f, 0.06112917f, 0.04512863f, 0.04199809f,
+        0.04186904f, 0.03748120f, 0.03102849f, 0.02457578f
+    };
+
+    const float uu = Clamp(u, 0.f, 0.99999994f);
+    float cdf0 = 0.f;
+    for (u_int i = 0; i < 16u; ++i) {
+        const float cdf1 = cdf0 + binProb[i];
+        if ((uu < cdf1) || (i == 15u)) {
+            const float localU = Clamp((uu - cdf0) / binProb[i], 0.f, 0.99999994f);
+            *sampleWeight = 1.f / (16.f * binProb[i]);
+            return 380.f + (i + localU) * 25.f;
+        }
+        cdf0 = cdf1;
+    }
+    *sampleWeight = 1.f;
+    return 780.f;
+}
 
 //------------------------------------------------------------------------------
 // BiDirCPU RenderThread
@@ -852,7 +903,17 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 		// light-path BSDF-X sample, matching the Path/GPU HERO strategy.
 		if (engine->mlHeroEnabled) {
 			const float mlHeroU0 = sampler->GetSample(sampleBootSize + 2);
-			SetMLDispersionWaveLength(Lerp(mlHeroU0, 380.f, 780.f));
+
+			if (engine->mlHeroSamplingMode == 3) {
+				float mlSampleWeight;
+				const float mlWaveLength = MLBidirHeroSampling3Sample(mlHeroU0, &mlSampleWeight);
+				SetMLDispersionWaveLength(mlWaveLength, mlSampleWeight);
+			} else if (engine->mlHeroSamplingMode == 2) {
+				float mlSampleWeight;
+				const float mlWaveLength = MLBidirHeroSampling2Sample(mlHeroU0, &mlSampleWeight);
+				SetMLDispersionWaveLength(mlWaveLength, mlSampleWeight);
+			} else
+				SetMLDispersionWaveLength(Lerp(mlHeroU0, 380.f, 780.f));
 		}
 
 		/*

@@ -35,6 +35,7 @@ using namespace slg;
 thread_local float mlDispersionWaveLength = -1.f;
 thread_local bool mlDispersionUsed = false;
 thread_local float mlDispersionCurrentCauchyB = 0.f;
+thread_local float mlDispersionSampleWeight = 1.f;
 thread_local bool mlHeroEnabled = true;
 
 void SetMLHeroEnabled(const bool enabled) {
@@ -42,6 +43,7 @@ void SetMLHeroEnabled(const bool enabled) {
 	mlDispersionWaveLength = -1.f;
 	mlDispersionUsed = false;
 	mlDispersionCurrentCauchyB = 0.f;
+	mlDispersionSampleWeight = 1.f;
 }
 
 bool GetMLHeroEnabled() {
@@ -50,6 +52,14 @@ bool GetMLHeroEnabled() {
 
 void SetMLDispersionWaveLength(const float waveLength) {
 	mlDispersionWaveLength = waveLength;
+	mlDispersionSampleWeight = 1.f;
+	// Start a new hero-wavelength sample.
+	mlDispersionUsed = false;
+}
+
+void SetMLDispersionWaveLength(const float waveLength, const float sampleWeight) {
+	mlDispersionWaveLength = waveLength;
+	mlDispersionSampleWeight = sampleWeight;
 	// Start a new hero-wavelength sample.
 	mlDispersionUsed = false;
 }
@@ -128,7 +138,7 @@ Spectrum GetMLDispersionSampleColor() {
 	if (!mlDispersionUsed || (mlDispersionWaveLength < 380.f) || (mlDispersionWaveLength > 780.f))
 		return Spectrum(1.f);
 
-	return WaveLength2RGB(mlDispersionWaveLength);
+	return WaveLength2RGB(mlDispersionWaveLength) * mlDispersionSampleWeight;
 }
 
 bool GetMLDispersionUsed() {

@@ -68,6 +68,7 @@ void BiDirCPURenderEngine::StartLockLess() {
 	
 	mlHeroEnabled = cfg.Get(GetDefaultProps()->Get("path.mlhero.enable")).Get<bool>();
 
+	mlHeroSamplingMode = Clamp(cfg.Get(GetDefaultProps()->Get("path.mlhero.samplingmode")).Get<int>(), 1, 3);
 	rrDepth = (u_int)Max(1, cfg.Get(GetDefaultProps()->Get("path.russianroulette.depth")).Get<int>());
 	rrImportanceCap = Clamp(cfg.Get(GetDefaultProps()->Get("path.russianroulette.cap")).Get<double>(), 0.0, 1.0);
 
@@ -196,6 +197,7 @@ PropertiesUPtr BiDirCPURenderEngine::GetDefaultProps() {
 		Property("light.maxdepth")(5) <<
 		Property("path.aovs.warmup.spp")(0) <<
 		Property("path.mlhero.enable")(false) <<
+		Property("path.mlhero.samplingmode")(1) <<
 		Property("path.russianroulette.depth")(5) <<
 		Property("path.russianroulette.cap")(.5f) <<
 		Property("path.clamping.variance.maxvalue")(0.f) <<

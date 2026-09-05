@@ -154,7 +154,10 @@ public:
 	// ML HERO global spectral mode
 	bool mlHeroEnabled;
 	
-	// Clamping settings
+	
+	// ML HERO wavelength sampling: 1=Linear, 2=CIE Weighted, 3=Sensor Weighted
+	int mlHeroSamplingMode;
+// Clamping settings
 	float sqrtVarianceClampMaxValue;
 
 	// Albedo AOV settings
