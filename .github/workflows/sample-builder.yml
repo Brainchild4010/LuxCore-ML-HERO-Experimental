@@ -1,0 +1,403 @@
+# SPDX-FileCopyrightText: 2025 Howetuft
+#
+# SPDX-License-Identifier: Apache-2.0
+
+
+name: LuxCore Samples Builder
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      repository:
+        description: 'Repository to check out'
+        required: false
+        default: ''
+        type: string
+      ref:
+        description: 'The branch, tag or SHA to checkout.'
+        required: false
+        default: ''
+        type: string
+      version:
+        description: 'The version to build - must comply to semver, or blank for default'
+        type: string
+    outputs:
+      commit:
+        description: "The commit that has been checked out"
+        value: ${{ jobs.build-samples.outputs.commit }}
+      branch:
+        description: "The branch that has been checked out"
+        value: ${{ jobs.build-samples.outputs.branch }}
+      attestation-url:
+        description: "The url to the attestations"
+        value: ${{ jobs.attest-samples.outputs.attestation-url }}
+      version:
+        description: "The version actually built"
+        value: ${{ jobs.build-samples.outputs.version }}
+
+jobs:
+  build-samples:
+    name: Build samples ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        #os: [ubuntu-latest, windows-2022, macos-15, macos-15-intel, windows-11-arm]
+        os: [ubuntu-latest, windows-2022, macos-15, macos-15-intel]
+    env:
+      BUILD_TYPE: Release
+      #CXX_VERSION: 20
+      #GCC_VERSION: 14
+      #GLIBC_VERSION: 2_28
+      PYTHON_MINOR: ${{ matrix.python-minor }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      OWNER: ${{ github.repository_owner }}
+      REPO: ${{ github.event.repository.name }}
+    outputs:
+      commit: ${{ steps.current-commit.outputs.commit }}
+      branch: ${{ steps.current-commit.outputs.branch }}
+      version: ${{ steps.output-version.outputs.version }}
+
+    steps:
+
+      - name: Configure git for long paths
+        shell: bash
+        if: runner.os == 'Windows'
+        run: git config --system core.longpaths true
+
+      - name: Checkout main repository (standard context)
+        if: ${{ !env.ACT }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+
+      - name: Checkout main repository (act context)
+        if: env.ACT
+        uses: actions/checkout@v4
+
+      - name: Get current commit
+        id: current-commit
+        run: |
+          echo "commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "branch=$(git symbolic-ref HEAD)" >> $GITHUB_OUTPUT
+          echo "commit=$(git rev-parse HEAD)"
+          echo "branch=$(git symbolic-ref HEAD)"
+
+      - name: Output version
+        id: output-version
+        shell: python
+        run: |
+          import os
+          import json
+          from pathlib import Path
+
+          if (input_version := "${{ inputs.release-version }}"):
+            version = input_version
+          else:
+            # Fall back to default
+            build_settings_file = Path("build-system", "build-settings.json")
+            with open(build_settings_file) as in_file:
+              default_version = json.load(in_file)["DefaultVersion"]
+            version = ".".join(default_version[i] for i in ("major", "minor", "patch"))
+            if (prerelease := default_version["prerelease"]):
+              version = f"{version}-{prerelease}"
+
+          print(f"Version: {version}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output_file:
+            output_file.write(f"version={version}\n")
+
+      - name: Find workspace
+        shell: bash
+        run: |
+          case ${{ runner.os }} in
+            Linux) _workspace="/project";;
+            Windows) _workspace=$(cygpath -u $GITHUB_WORKSPACE);;
+            macOS) _workspace="$GITHUB_WORKSPACE";;
+            *) echo "Unhandled os ${{ runner.os }}";exit 64;;
+          esac
+          echo "WORKSPACE=${_workspace}" >> $GITHUB_ENV
+
+      - name: Set Conan parameters
+        shell: bash
+        run: |
+            _build_type=$(echo "${{ env.BUILD_TYPE }}" | tr '[:upper:]' '[:lower:]')
+            _conan_home="${{ env.WORKSPACE }}/.conan2"
+            echo "CONAN_PRESET=conan-${_build_type}" >> $GITHUB_ENV
+            echo "CONAN_HOME=${_conan_home}" >> $GITHUB_ENV
+
+      - name: Configure ccache
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const workspace = String.raw`${{ github.workspace }}`;
+
+            const envVariables = {
+                'cache-variant': String.raw`ccache`,
+                'CMAKE_CXX_COMPILER_LAUNCHER': String.raw`ccache`,
+                'CMAKE_C_COMPILER_LAUNCHER': String.raw`ccache`,
+                'CCACHE_CONFIGPATH': String.raw`${workspace}/ccache.conf`,
+                'CCACHE_DIR': String.raw`${workspace}/.ccache`,
+                'CCACHE_DEBUGDIR': String.raw`${workspace}/ccache-debug`,
+                'CCACHE_LOGFILE': String.raw`${workspace}/ccache.log`
+            };
+
+            for (const [key, value] of Object.entries(envVariables)) {
+                core.exportVariable(key, value);
+            }
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: 3.13
+
+      # Update apt: needed to install ccache-action
+      - name: Update apt (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update -y
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          create-symlink: false
+          variant: ${{ env.cache-variant }}
+          key: samples-${{ matrix.os }}
+          max-size: 5G
+          verbose: 1
+
+      - name: Prepare msvc
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+
+      - name: Set MacOS deployment target
+        if: runner.os == 'macOS'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            if ('${{ runner.arch }}' == 'X64') {
+              target = '10.15';
+              arch='x86_64';
+            }
+            else if ('${{ env.PYTHON_MINOR }}' != '8') {
+              target = '11.0';
+              arch='armv8';
+            }
+            else {
+              target = '12.0';
+              arch='armv8';
+            }
+            core.exportVariable('MACOSX_DEPLOYMENT_TARGET', target);
+            core.exportVariable('PKG_ARCH', arch);
+
+      - name: Prepare MacOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+            # We make conan believe we use apple-clang (see profiles), but
+            # actually we use recent version of llvm, to get full compatibility
+            # with C++20 (in particular: joining threads)
+
+            # llvm
+            brew install llvm@20
+            LLVM_PREFIX=$(brew --prefix llvm@20)
+            echo "CC=clang" >> $GITHUB_ENV
+            echo "CXX=clang++" >> $GITHUB_ENV
+            echo "AR=llvm-ar" >> $GITHUB_ENV
+            echo "RANLIB=llvm-ranlib" >> $GITHUB_ENV
+
+            # lld
+            brew install lld@20
+            LLD_PREFIX=$(brew --prefix lld@20)
+
+            # Set paths
+            echo "PATH=${LLVM_PREFIX}/bin:${LLD_PREFIX}/bin:$PATH" >> $GITHUB_ENV
+            echo "DYLD_LIBRARY_PATH=${LLVM_PREFIX}/lib:${LLD_PREFIX}/lib:${DYLD_LIBRARY_PATH}" >> $GITHUB_ENV
+
+            # Set flags
+            echo "LDFLAGS=${LD_FLAGS} -fuse-ld=${LLD_PREFIX}/bin/ld64.lld -L${LLVM_PREFIX}/lib -L${LLD_PREFIX}/lib" >> $GITHUB_ENV
+            echo "CPPFLAGS=${CPPFLAGS} -I${LLVM_PREFIX}/include -I${LLD_PREFIX}/include" >> $GITHUB_ENV
+
+            # OpenMP
+            brew install libomp
+            echo "OpenMP_ROOT=$(brew --prefix libomp)" >> $GITHUB_ENV
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        env:
+          CONAN_HOME: ${{ github.workspace }}\.conan2
+        run: |
+          rem We have to install 'wheel', despite it is useless for samples,
+          rem Otherwise 'make deps' will complain
+
+          pip install conan && pip install wheel && make deps && make luxcore && make luxcoreui && make luxcoreconsole
+
+      - name: Build (MacOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # We have to install 'wheel', despite it is useless for samples,
+          # otherwise make deps will complain
+          pip install conan && pip install wheel && make deps
+          make luxcore
+          make luxcoreui
+          make luxcoreconsole
+
+      # Build for Linux is containerized in manylinux_2_28_x86_64
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          CONTAINER: manylinux
+          # COMMAND contains code that'll be executed in container
+          COMMAND: |
+            # Set Python
+            manylinux-interpreters ensure cp313-cp313
+            PATH=/opt/python/cp313-cp313/bin:$PATH
+            which python
+
+            # We have to install 'wheel', despite it is useless for samples,
+            # otherwise make deps will complain
+            python -m pip install conan
+            python -m pip install wheel
+
+            # Install toolchain (gcc, ccache...)
+            CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc
+            CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++
+            export CMAKE_C_COMPILER_LAUNCHER=ccache
+            export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+            export VERBOSE=1
+            dnf install -y sudo
+            #export CLICOLOR_FORCE=1
+
+            # Install conda
+            dnf install -y wget
+            mkdir -p miniconda3
+            wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
+              -O miniconda3/miniconda.sh
+            bash miniconda3/miniconda.sh -b -u -p miniconda3
+            rm miniconda3/miniconda.sh
+            source miniconda3/bin/activate
+            conda init --all
+            conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+            conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+
+            # Install gh
+            conda install conda-forge::gh --channel conda-forge -y
+            echo ${{ secrets.GITHUB_TOKEN }} | gh auth login --with-token
+
+            # Install ccache
+            conda install conda-forge::ccache -y
+            export CCACHE_CONFIGPATH=/project/ccache.conf
+            ccache -o cache_dir=/project/.ccache
+            ccache -o depend_mode=false
+            echo "ccache configuration:"
+            ccache -p
+
+            # Build
+            make deps
+            make luxcore
+            make luxcoreui
+            make luxcoreconsole
+
+            # Re-inspect ccache
+            echo "ccache results:"
+            ccache -sv
+
+        # run contains code that'll be executed on host side
+        run: |
+          # Clean (remove container if it exists)
+          CONTAINER_LIST=$(docker container ps -a)
+          if [[ ${CONTAINER_LIST} == *${{ env.CONTAINER }}* ]]; then
+            echo "Removing existing container '${{ env.CONTAINER }}'"
+            docker rm --force ${{ env.CONTAINER }}
+          fi
+
+          # Start
+          echo ""
+          echo "******** LAUCHING MANYLINUX CONTAINER ********"
+          echo ""
+          docker create \
+            -t \
+            --name ${{ env.CONTAINER }} \
+            quay.io/pypa/manylinux_2_28_x86_64
+          docker start ${{ env.CONTAINER }}
+          docker exec ${{ env.CONTAINER }} env
+
+          # Copy source tree
+          docker exec ${{ env.CONTAINER }} sh -c "echo Copying source tree"
+          docker cp ${{ github.workspace }} ${{ env.CONTAINER }}:/project
+
+          # Copy ccache
+          echo "Copying ${{ env.CCACHE_DIR }} to container"
+          docker cp ${{ env.CCACHE_DIR }}/. ${{ env.CONTAINER }}:/root/.ccache
+
+          # Execute COMMAND in container
+          docker exec --workdir=/project ${{ env.CONTAINER }} sh -c '${{ env.COMMAND }}'
+
+          # Copy ccache back
+          docker cp ${{ env.CONTAINER }}:/root/.ccache/. ${{ env.CCACHE_DIR }}
+
+          # Get artifact
+          mkdir -p ${{ github.workspace }}/out/build
+          docker cp ${{ env.CONTAINER }}:/project/out ${{ github.workspace }}
+
+          # Stop container
+          docker stop ${{ env.CONTAINER }}
+
+          # Remove superfluous files (hack)
+          rm -f ${{ github.workspace }}/out/install/Release/lib/libnvrtc*.alt.*
+
+      #- name: Setup tmate session (debug)
+        #if: ${{ failure() }}
+        #uses: mxschmitt/action-tmate@v3
+
+      - name: Install 7zip (act)
+        if: ${{ env.ACT }}
+        shell: bash
+        run: |
+          apt install -y p7zip-full
+
+      - name: Bundle artifacts
+        working-directory: ${{ github.workspace }}/out/install
+        shell: bash
+        run: |
+          mv Release LuxCore
+          7z a -snl ../../LuxCoreSamples-${{ runner.os }}-${{ runner.arch }}.zip LuxCore/
+
+      # Upload artifacts
+      - uses: actions/upload-artifact@v4
+        id: upload
+        with:
+          name: LuxCore-Samples-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ github.workspace }}/LuxCoreSamples-${{ runner.os }}-${{ runner.arch }}.zip
+          #path: ${{ github.workspace }}/out/install/Release
+
+  attest-samples:
+    needs: [build-samples]
+    runs-on: ubuntu-latest
+    permissions:
+      attestations: write
+      id-token: write
+    outputs:
+      attestation-url: ${{ steps.attestation-step.outputs.attestation-url }}
+
+    steps:
+      - uses: actions/download-artifact@v4
+        if: ${{ !env.ACT }}
+        with:
+          pattern: LuxCore-*
+          path: ${{ github.workspace }}/dist
+          merge-multiple: false
+
+      - name: Generate artifact attestations
+        id: attestation-step
+        if: ${{ !env.ACT }}
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ github.workspace }}/dist/*

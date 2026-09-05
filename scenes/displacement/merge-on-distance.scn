@@ -1,0 +1,49 @@
+scene.lights.__BACKGROUND__.type = "constantinfinite"
+scene.lights.__BACKGROUND__.color = 0.3 0.3 0.3
+scene.lights.__BACKGROUND__.gain = 1.0 1.0 1.0
+scene.lights.KEY.type = "distant"
+scene.lights.KEY.color = 1.0 1.0 1.0
+scene.lights.KEY.direction = -1 1 -1.5
+scene.lights.KEY.theta = 5
+scene.lights.KEY.gain = 100.0 100.0 100.0
+scene.lights.FILL.type = "distant"
+scene.lights.FILL.color = 1.0 1.0 1.0
+scene.lights.FILL.direction = 1 1 -0.5
+scene.lights.FILL.theta = 30
+scene.lights.FILL.gain = 5.0 5.0 5.0
+scene.lights.RIM.type = "distant"
+scene.lights.RIM.color = 1.0 1.0 1.0
+scene.lights.RIM.direction = 0 -1 0
+scene.lights.RIM.theta = 90
+scene.lights.RIM.gain = 25.0 25.0 25.0
+scene.camera.lookat.orig = 0.014920395 -0.017703007 0.02421595
+scene.camera.lookat.target = 0.014510819931509147 -0.016993600180917518 0.023642373302155687
+scene.camera.up = -0.0002867879943353558 0.000496732196072639 0.0008191518611893385
+scene.camera.fieldofview = 57.82240346130564
+
+scene.objects.__ground_plane__.shape = __ground_plane___mesh
+scene.objects.__ground_plane__.material = __ground_plane__
+scene.objects.__ground_plane__.transformation = 1.0 0.0 0.0 0.0  0.0 1.0 0.0 0.0  0.0 0.0 1.0 0.0  0.0 0.0 0.0 1.0
+scene.shapes.__ground_plane___mesh.type = mesh
+scene.shapes.__ground_plane___mesh.ply = "merge-on-distance/aca8f1f5aa593d259fb252af0fb997a7.ply"
+scene.materials.__ground_plane__.type = matte
+scene.materials.__ground_plane__.kd = nop 0.8000000162146039 0.8000000162146039 0.8000000162146039
+
+scene.objects.Unnamed#Box.shape = Subdivided
+scene.objects.Unnamed#Box.material = Unnamed#Box
+scene.objects.Unnamed#Box.transformation = 1.0 0.0 0.0 0.0  0.0 1.0 0.0 0.0  0.0 0.0 1.0 0.0  0.0 0.0 0.0 1.0
+scene.materials.Unnamed#Box.type = matte
+scene.materials.Unnamed#Box.kd = nop 0.6120656199306977 0.6120656199306977 0.6120656199306977
+
+scene.shapes.Unnamed#Box_mesh.type = mesh
+scene.shapes.Unnamed#Box_mesh.ply = "merge-on-distance/b0da7550d6fe3e6a88c266e7c5ceef5d.ply"
+
+scene.shapes.Merged.type = mergeondistance
+scene.shapes.Merged.source = Unnamed#Box_mesh
+scene.shapes.Merged.tolerance = 1
+
+scene.shapes.Subdivided.type = subdiv
+scene.shapes.Subdivided.source = Merged
+scene.shapes.Subdivided.maxlevel = 4
+#scene.shapes.Subdivided.maxedgescreensize = 0.1
+scene.shapes.Subdivided.enhanced = 1

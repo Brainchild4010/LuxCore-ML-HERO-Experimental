@@ -1,0 +1,66 @@
+# SPDX-FileCopyrightText: 2025 Howetuft
+#
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# This workflow publishes a release to Pypi (or Pypi test)
+
+
+name: LuxCore Python Wheels Publisher
+
+on:
+  workflow_dispatch:
+    inputs:
+      release-tag:
+        description: "Version of the release to publish (major.minor.patch[-rev])"
+        required: True
+        default: 0.0.1
+        type: string
+      test:
+        description: "Publish on Pypi test"
+        required: True
+        default: True
+        type: boolean
+
+jobs:
+  publish-wheels:
+    name: Publish release '${{ inputs.release-tag }}'
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.test && 'testpypi' || 'pypi' }}
+      url: ${{ inputs.test && 'https://test.pypi.org/p/pyluxcore' || 'https://pypi.org/p/pyluxcore' }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download wheels from release '${{ inputs.release-tag }}'
+        shell: bash
+        run: |
+          # Warning: Target release must not be in 'draft' status,
+          # otherwise gh release won't find it
+          gh release download wheels-v${{ inputs.release-tag}} -D tmp -R LuxCoreRender/LuxCore
+          mkdir dist
+          for d in tmp/*.zip ; do
+              echo "unzip ${d}"
+              unzip ${d} -d dist
+          done
+          ls -Rl dist
+
+      - name: Publish package distributions to PyPI test
+        if: inputs.test
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          verbose: true
+          verify-metadata: true
+          skip-existing: true
+
+      - name: Publish package distributions to PyPI
+        if: ${{ ! inputs.test }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+

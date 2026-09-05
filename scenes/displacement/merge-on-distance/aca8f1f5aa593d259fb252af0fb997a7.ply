@@ -1,0 +1,17 @@
+ply
+format ascii 1.0
+comment Created by FreeCAD-Render
+comment '__ground_plane__'
+element vertex 4
+property float x
+property float y
+property float z
+element face 2
+property list uchar int vertex_indices
+end_header
+-0.00866025 -0.00866025 0.00000 
+0.0186603 -0.00866025 0.00000 
+0.0186603 0.0186603 0.00000 
+-0.00866025 0.0186603 0.00000 
+3 0 1 2
+3 0 2 3

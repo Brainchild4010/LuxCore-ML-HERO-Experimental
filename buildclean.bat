@@ -1,0 +1,1 @@
+cmake --build out\build-py313 --config Release --target clean

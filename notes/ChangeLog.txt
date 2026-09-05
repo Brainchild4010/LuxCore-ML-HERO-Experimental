@@ -1,0 +1,10 @@
+Change Log for 2.10
+- all: implement a new, scalable, dependency system, based on Conan, and refactor build system accordingly. Create a dependency provider (LuxCoreDeps)
+- all: upgrade all dependencies to latest versions
+- luxcore: package pyluxcore as Python wheels and publish them on Pypi
+- luxcore: add compilation workflows for Linux, Windows, MacOS Intel, MacOS Arm
+- luxcore: remove most of static hard-coded deps and replace with Conan equivalent, latest versions
+- luxcore: move from boost::python to pybind11
+- luxcore: remove static/shared option for luxcore.so: always build both static (for pyluxcore) and shared (for luxcoreui/console)
+- luxcoreui: remove hard-coded deps (nfd, glfw, imgui) and replace them with Conan equivalents
+- luxcoreui: replace nativefiledialog, which requires gtk3, by ImGuiFileDialog, which is pure ImGui (exit gtk3)

@@ -1,0 +1,434 @@
+# SPDX-FileCopyrightText: 2024-2025 Authors (see AUTHORS.txt)
+#
+# SPDX-License-Identifier: Apache-2.0
+
+
+name: LuxCore Python Wheels Builder
+
+on:
+  workflow_dispatch:
+      inputs:
+        build-type:
+          description: 'Build type'
+          required: true
+          default: 'Release'
+          type: choice
+          options:
+            - Release
+            - Debug
+  workflow_call:
+    inputs:
+      repository:
+        description: 'Repository to check out'
+        required: false
+        default: ''
+        type: string
+      ref:
+        description: 'The branch, tag or SHA to checkout.'
+        required: false
+        default: ''
+        type: string
+      version:
+        description: 'The version to build - must comply to semver, or blank for default'
+        type: string
+      build-type:
+        description: 'Build type'
+        required: true
+        default: 'Release'
+        type: string
+    outputs:
+      commit:
+        description: "The commit that has been checked out"
+        value: ${{ jobs.build-wheels.outputs.commit }}
+      branch:
+        description: "The branch that has been checked out"
+        value: ${{ jobs.build-wheels.outputs.branch }}
+      attestation-url:
+        description: "The url to the attestations"
+        value: ${{ jobs.attest-wheels.outputs.attestation-url }}
+      version:
+        description: "The version actually built"
+        value: ${{ jobs.build-wheels.outputs.version }}
+  push:
+
+jobs:
+  build-wheels:
+    name: Build wheel ${{ matrix.os }}-3.${{ matrix.python-minor }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-minor: [10, 11, 12, 13, 14]
+        #os: [ubuntu-latest, windows-2022, macos-15-intel, macos-15, windows-11-arm]
+        os: [ubuntu-latest, windows-2022, macos-15-intel, macos-15]
+    env:
+      # Reminder: report all variables here to CIBW_ENVIRONMENT_PASS_LINUX
+      BUILD_TYPE: ${{ github.event.inputs.build-type || 'Release' }}
+      CXX_VERSION: 20
+      GCC_VERSION: 14
+      GLIBC_VERSION: 2_28
+      GH_TOKEN: ${{ github.token }}
+      PYTHON_MINOR: ${{ matrix.python-minor }}
+    outputs:
+      commit: ${{ steps.current-commit.outputs.commit }}
+      branch: ${{ steps.current-commit.outputs.branch }}
+      version: ${{ steps.output-version.outputs.version }}
+
+    steps:
+
+      - name: Configure git for long paths
+        shell: bash
+        if: runner.os == 'Windows'
+        run: git config --system core.longpaths true
+
+      - name: Checkout main repository (standard context)
+        if: ${{ !env.ACT }}
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+
+      - name: Checkout main repository (act context)
+        if: env.ACT
+        uses: actions/checkout@v6
+
+      - name: Get current commit
+        shell: bash
+        id: current-commit
+        run: |
+          echo "commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "branch=$(git symbolic-ref HEAD)" >> $GITHUB_OUTPUT
+          echo "commit=$(git rev-parse HEAD)"
+          echo "branch=$(git symbolic-ref HEAD)"
+
+      - name: Find workspace
+        shell: bash
+        run: |
+          case ${{ runner.os }} in
+            Linux) _workspace="/project";;
+            Windows) _workspace=$(cygpath -u $GITHUB_WORKSPACE);;
+            macOS) _workspace="$GITHUB_WORKSPACE";;
+            *) echo "Unhandled os ${{ runner.os }}";exit 64;;
+          esac
+          echo "WORKSPACE=${_workspace}" >> $GITHUB_ENV
+
+      - name: Set Conan parameters
+        shell: bash
+        run: |
+            _build_type=$(echo "${{ env.BUILD_TYPE }}" | tr '[:upper:]' '[:lower:]')
+            if [[ "${{ runner.os }}" == "Windows" ]]; then
+              _conan_home=$(cygpath -w "${{ env.WORKSPACE }}/.conan2")
+            else
+              _conan_home="${{ env.WORKSPACE }}/.conan2"
+            fi
+            echo "CONAN_PRESET=conan-${_build_type}" >> $GITHUB_ENV
+            echo "CONAN_HOME=${_conan_home}" >> $GITHUB_ENV
+
+      - name: Configure ccache
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const workspace = String.raw`${{ github.workspace }}`;
+
+            const envVariables = {
+                'cache-variant': String.raw`ccache`,
+                'CMAKE_CXX_COMPILER_LAUNCHER': String.raw`ccache`,
+                'CMAKE_C_COMPILER_LAUNCHER': String.raw`ccache`,
+                'CCACHE_CONFIGPATH': String.raw`${workspace}/build-system/ccache.conf`,
+                'CCACHE_DIR': String.raw`${workspace}/.ccache`,
+                'CCACHE_DEBUGDIR': String.raw`${workspace}/ccache-debug`,
+                'CCACHE_LOGFILE': String.raw`${workspace}/ccache.log`
+            };
+
+            for (const [key, value] of Object.entries(envVariables)) {
+                core.exportVariable(key, value);
+            }
+
+      # Update apt: needed to install ccache
+      - name: Update apt (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update -y
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          create-symlink: false
+          variant: ${{ env.cache-variant }}
+          key: cpl-${{ matrix.os }}-${{ matrix.python-minor}}
+          restore-keys: cpl-${{ matrix.os }}-${{ matrix.python-minor}}-
+          max-size: 5G
+          verbose: 1
+
+      - name: Prepare msvc
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+
+      - name: Prepare Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          _V=${{ env.GCC_VERSION }}
+          _T=/opt/rh/gcc-toolset-${_V}/root
+
+          echo "TOOLSET_ROOT=${_T}" >> $GITHUB_ENV
+          echo "CXX=${_T}/usr/bin/g++" >> $GITHUB_ENV
+          echo "CC=${_T}/usr/bin/gcc" >> $GITHUB_ENV
+          echo "AR=${_T}/usr/bin/ar" >> $GITHUB_ENV
+          echo "RANLIB=${_T}/usr/bin/ranlib" >> $GITHUB_ENV
+
+      - name: Set MacOS deployment target and other set-ups
+        if: runner.os == 'macOS'
+        uses: actions/github-script@v8
+        with:
+          # Minimum targets driven by:
+          # Intel: libomp
+          # Arm: opensubdiv
+          script: |
+            if ('${{ runner.arch }}' == 'X64') {
+              target = '11.0';  // Required by libomp
+              arch='x86_64';
+            }
+            else {
+              target = '14.2';  // Required by opensubdiv
+              arch='armv8';
+            }
+            core.exportVariable('MACOSX_DEPLOYMENT_TARGET', target);
+            core.exportVariable('CMAKE_OSX_DEPLOYMENT_TARGET', target);
+            core.exportVariable('PKG_ARCH', arch);
+
+      - name: Prepare MacOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+            # We make conan believe we use apple-clang (see profiles), but
+            # actually we use recent version of llvm, to get full compatibility
+            # with C++20 (in particular: joining threads)
+
+            # llvm
+            brew install llvm@20
+            brew link llvm@20 --overwrite
+            LLVM_PREFIX=$(brew --prefix llvm@20)
+            echo "CC=clang" >> $GITHUB_ENV
+            echo "CXX=clang++" >> $GITHUB_ENV
+            echo "AR=llvm-ar" >> $GITHUB_ENV
+            echo "RANLIB=llvm-ranlib" >> $GITHUB_ENV
+
+            # lld
+            brew install lld@20
+            brew link lld@20 --overwrite
+            LLD_PREFIX=$(brew --prefix lld@20)
+
+            # Set paths
+            echo "PATH=${LLVM_PREFIX}/bin:${LLD_PREFIX}/bin:$PATH" >> $GITHUB_ENV
+            echo "DYLD_LIBRARY_PATH=${LLVM_PREFIX}/lib:${LLD_PREFIX}/lib:${DYLD_LIBRARY_PATH}" >> $GITHUB_ENV
+
+            # Set flags
+            echo "LDFLAGS=${LD_FLAGS} -fuse-ld=${LLD_PREFIX}/bin/ld64.lld -L${LLVM_PREFIX}/lib -L${LLD_PREFIX}/lib" >> $GITHUB_ENV
+            echo "CPPFLAGS=${CPPFLAGS} -I${LLVM_PREFIX}/include -I${LLD_PREFIX}/include" >> $GITHUB_ENV
+
+
+      # TODO: The following block is an ugly hack but, at the moment (2025-02-25),
+      # scikit-build-core lacks a preset parameter, so this is the only way
+      # I found to pass a calculated environment var to CMake build step
+      - name: Set M4 env var
+        if: runner.os != 'Windows'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            if ('${{ runner.arch }}' == 'X64') {
+              arch = 'x86_64'
+            } else {
+              arch = 'armv8'
+            }
+            base = '${{ env.WORKSPACE }}/out/dependencies/full_deploy/host/m4/1.4.19/Release/'
+            core.exportVariable('M4', base + arch + '/bin/m4')
+
+      - name: Export version for scikit-build-core
+        shell: python
+        run: |
+          import json
+          from pathlib import Path
+          if (input_version := "${{ inputs.release-version }}"):
+            result = input_version
+          else:
+            build_settings_file = Path("build-system", "build-settings.json")
+            with open(build_settings_file) as in_file:
+              default_version = json.load(in_file)["DefaultVersion"]
+            result = ".".join(default_version[i] for i in ("major", "minor", "patch"))
+            if (prerelease := default_version["prerelease"]):
+              result = f"{result}-{prerelease}"
+
+          print(f"Version: {result}")
+
+          with open("SKVERSION", "w+") as out_file:
+            out_file.write(result)
+
+      - name: Output version
+        id: output-version
+        shell: bash
+        run: |
+          _version=$(cat SKVERSION)
+          echo "version=${_version}" >> "$GITHUB_OUTPUT"
+
+
+      # Build wheel
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v3.4.0
+        env:
+          CIBW_BUILD_FRONTEND: build
+          CIBW_BUILD_VERBOSITY: 1
+          CIBW_BUILD: cp3${{ matrix.python-minor }}-*
+          CIBW_SKIP: "*musllinux*"
+          CIBW_ARCHS: auto64
+          CIBW_MANYLINUX_X86_64_IMAGE: quay.io/pypa/manylinux_${{ env.GLIBC_VERSION }}_x86_64
+          CIBW_ENVIRONMENT: >
+            SKBUILD_CMAKE_ARGS='--preset conan-default;--log-level=VERBOSE;-DLUXCORE_VERSION=${{ steps.output-version.outputs.version }};-G Ninja Multi-Config'
+            SKBUILD_CMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+            GH_TOKEN=${{ secrets.GITHUB_TOKEN }}
+            LUX_BUILD_TYPE=${{ env.BUILD_TYPE }}
+            DEPS_WITHOUT_SUDO=1
+          CIBW_ENVIRONMENT_PASS_LINUX: |
+            CC
+            CXX
+            BUILD_TYPE
+            GCC_VERSION
+            SANITIZE
+            ASAN_PATH
+            RUNNER_OS
+            RUNNER_ARCH
+            WORKSPACE
+            CMAKE_CXX_COMPILER_LAUNCHER
+            CMAKE_C_COMPILER_LAUNCHER
+            PYTHON_MINOR
+            BOOST_INSTALL_LAYOUT
+            SPDLOG_FMT_EXTERNAL
+            CXX_VERSION
+            CONAN_HOME
+            CONAN_PRESET
+            M4
+          CIBW_BEFORE_ALL_LINUX: |
+            # Install toolchain (gcc, ccache...)
+            dnf install -y epel-release
+            dnf install -y almalinux-release-devel
+            dnf install -y ccache
+            dnf install -y perl-IPC-Cmd perl-Digest-SHA
+            dnf install -y ninja-build
+
+            # Install gh (via conda)
+            dnf install -y wget
+            mkdir -p miniconda3
+            wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda3/miniconda.sh
+            bash miniconda3/miniconda.sh -b -u -p miniconda3
+            rm miniconda3/miniconda.sh
+            source miniconda3/bin/activate
+            conda init --all
+
+            # Accept conda terms of service
+            conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+            conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+
+            # Install gh
+            conda install gh --channel conda-forge -y
+            echo ${{ secrets.GITHUB_TOKEN }} | gh auth login --with-token
+
+            # Manylinux_2_34 compatibility (for future use)
+            if [[ ${{ env.GLIBC_VERSION }} != 2_28 ]]; then
+              dnf install -y perl-FindBin perl-lib
+            fi
+
+            # Install dependencies
+            pip install "conan==2.21" && pip install wheel && make deps
+
+          CIBW_BEFORE_ALL_MACOS: |
+            pip install "conan==2.21" && pip install wheel && make deps
+
+          CIBW_BEFORE_ALL_WINDOWS: |
+            pip install "conan==2.21" && pip install wheel && make deps
+
+
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: |
+            paths=$(find /project -type d -wholename "*/lib" -print0 | xargs -0 realpath | tr "\n" ":")
+            LD_LIBRARY_PATH=$paths:$LD_LIBRARY_PATH
+            echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
+            export LD_LIBRARY_PATH
+
+            ## Check build data
+            unzip {wheel} -d /tmp/wheel
+
+            auditwheel \
+              --verbose repair -w {dest_dir} \
+              --plat manylinux_${{ env.GLIBC_VERSION }}_x86_64 \
+              --only-plat \
+              ${{ env.BUILD_TYPE == 'Release' && '--strip' || '' }} \
+              {wheel}
+
+          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: |
+            bash.exe ${{ env.WORKSPACE }}/build-system/wheels/repair_wheel_windows.sh '{wheel}' '{dest_dir}' '%VCToolsRedistDir%%Platform%' '${{ env.WORKSPACE }}'
+          CIBW_REPAIR_WHEEL_COMMAND_MACOS: |
+            cp {wheel} ${{ env.WORKSPACE }}
+            paths=$(find ${{ env.WORKSPACE }} -type d -wholename "*/lib" -print0 | xargs -0 realpath | tr "\n" ":")
+            DYLD_LIBRARY_PATH=$paths:$DYLD_LIBRARY_PATH
+            echo "DYLD_LIBRARY_PATH=${DYLD_LIBRARY_PATH}"
+            export DYLD_LIBRARY_PATH
+            delocate-listdeps -v {wheel}
+            delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel}
+          CIBW_TEST_COMMAND_LINUX: pyluxcoretest
+          CIBW_TEST_COMMAND_WINDOWS: pyluxcoretest
+          CIBW_TEST_COMMAND_MACOS: pyluxcoretest
+          CIBW_CONTAINER_ENGINE: >
+            docker;
+            create_args:
+              --mount type=bind,source=${{ env.CCACHE_DIR }},target=/root/.ccache
+
+        with:
+            package-dir: .
+            output-dir: wheelhouse
+            config-file: "{package}/pyproject.toml"
+
+
+      - name: Save dependency cache
+        if: always()
+        id: cache-deps-save
+        uses: actions/cache/save@v5
+        with:
+          path: conan-cache
+          key: deps-${{ matrix.os }}-${{ matrix.python-minor}}-${{ hashFiles('**/conan-cache') }}
+
+      #- name: Setup tmate session (debug)
+        #if: ${{ failure() }}
+        #uses: mxschmitt/action-tmate@v3
+
+      # Upload artifacts
+      - uses: actions/upload-artifact@v5
+        id: upload
+        with:
+          name: cibw-wheels-${{ matrix.os }}-${{ matrix.python-minor }}
+          path: ./wheelhouse/*.whl
+
+  attest-wheels:
+    needs: [build-wheels]
+    runs-on: ubuntu-latest
+    permissions:
+      attestations: write
+      id-token: write
+    outputs:
+      attestation-url: ${{ steps.attestation-step.outputs.attestation-url }}
+
+    steps:
+      - uses: actions/download-artifact@v7
+        if: ${{ !env.ACT }}
+        with:
+          pattern: cibw-wheels-*
+          path: ${{ github.workspace }}/dist
+          merge-multiple: false
+
+      - name: Generate artifact attestations
+        id: attestation-step
+        if: ${{ !env.ACT }}
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: ${{ github.workspace }}/dist/*

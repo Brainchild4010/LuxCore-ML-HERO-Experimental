@@ -1,0 +1,11 @@
+pylint . \
+  --disable=missing-function-docstring \
+  --disable=missing-module-docstring \
+  --disable=missing-class-docstring \
+  --disable=invalid-name \
+  --disable=broad-exception-caught \
+  --disable=bare-except \
+  --disable=too-many-instance-attributes \
+  --disable=too-many-positional-arguments \
+  --disable=fixme \
+  --ignored-class=pyluxcore
