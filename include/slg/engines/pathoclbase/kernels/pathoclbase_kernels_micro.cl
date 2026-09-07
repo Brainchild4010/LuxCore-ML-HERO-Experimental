@@ -76,6 +76,104 @@ OPENCL_FORCE_INLINE float MLCudaHero_SelectWaveLength(
 
 #endif
 
+// ML HERO Sampling 1.0/2.0/3.0 GPU importance mapping (O4a)
+OPENCL_FORCE_INLINE float MLHeroSampling_CIEBinProb(const uint i) {
+	switch (i) {
+		case 0u: return 0.0126331286f;
+		case 1u: return 0.0133533552f;
+		case 2u: return 0.0166194938f;
+		case 3u: return 0.0275044480f;
+		case 4u: return 0.0568548852f;
+		case 5u: return 0.1352293344f;
+		case 6u: return 0.1936849374f;
+		case 7u: return 0.1927480102f;
+		case 8u: return 0.1493873570f;
+		case 9u: return 0.0880972731f;
+		case 10u: return 0.0418778055f;
+		case 11u: return 0.0203700156f;
+		case 12u: return 0.0139428652f;
+		case 13u: return 0.0126807265f;
+		case 14u: return 0.0125154610f;
+		case 15u: return 0.0125009033f;
+		default: return 0.0125009033f;
+	}
+}
+OPENCL_FORCE_INLINE float MLHeroSampling_SensorBinProb(const uint i) {
+	switch (i) {
+		case 0u: return 0.05676103f;
+		case 1u: return 0.08028577f;
+		case 2u: return 0.08038660f;
+		case 3u: return 0.10020402f;
+		case 4u: return 0.10460621f;
+		case 5u: return 0.06266096f;
+		case 6u: return 0.07141445f;
+		case 7u: return 0.08194949f;
+		case 8u: return 0.07852106f;
+		case 9u: return 0.06112917f;
+		case 10u: return 0.04512863f;
+		case 11u: return 0.04199809f;
+		case 12u: return 0.04186904f;
+		case 13u: return 0.03748120f;
+		case 14u: return 0.03102849f;
+		case 15u: return 0.02457578f;
+		default: return 0.02457578f;
+	}
+}
+
+OPENCL_FORCE_INLINE float MLHeroSampling_BinProb(const int samplingMode, const uint i) {
+	if (samplingMode == 2)
+		return MLHeroSampling_CIEBinProb(i);
+	else if (samplingMode == 3)
+		return MLHeroSampling_SensorBinProb(i);
+	else
+		return 1.f / 16.f;
+}
+
+OPENCL_FORCE_INLINE uint MLHeroSampling_FindBin(const float u, const int samplingMode,
+		float *cdfBefore) {
+	const float x = clamp(u, 0.f, 0.99999994f);
+	float cdf = 0.f;
+
+	for (uint i = 0u; i < 16u; ++i) {
+		const float p = MLHeroSampling_BinProb(samplingMode, i);
+		if ((x < cdf + p) || (i == 15u)) {
+			*cdfBefore = cdf;
+			return i;
+		}
+		cdf += p;
+	}
+
+	*cdfBefore = 0.f;
+	return 0u;
+}
+
+OPENCL_FORCE_INLINE float MLHeroSampling_SelectWaveLength(const float u,
+		const int samplingMode) {
+	if (samplingMode <= 1)
+		return mix(380.f, 780.f, clamp(u, 0.f, 0.99999994f));
+
+	float cdfBefore;
+	const uint i = MLHeroSampling_FindBin(u, samplingMode, &cdfBefore);
+	const float p = MLHeroSampling_BinProb(samplingMode, i);
+	const float localU = clamp((u - cdfBefore) / p, 0.f, 0.99999994f);
+
+	return 380.f + 25.f * ((float)i + localU);
+}
+
+OPENCL_FORCE_INLINE float MLHeroSampling_GetSampleWeight(const float u,
+		const int samplingMode) {
+	if (samplingMode <= 1)
+		return 1.f;
+
+	float cdfBefore;
+	const uint i = MLHeroSampling_FindBin(u, samplingMode, &cdfBefore);
+	const float p = MLHeroSampling_BinProb(samplingMode, i);
+
+	// PDF correction relative to the original uniform 380..780 nm estimator.
+	return 1.f / (16.f * p);
+}
+
+
 //------------------------------------------------------------------------------
 // Evaluation of the Path finite state machine.
 //
@@ -876,15 +974,24 @@ __kernel void AdvancePaths_MK_GENERATE_NEXT_VERTEX_RAY(
 			if (mlCudaHeroDispersiveMaterial &&
 					!MLCudaHero_IsValidWaveLength(
 							taskState->mlDispersionWaveLength)) {
-				taskState->mlDispersionWaveLength =
+				const float mlCudaUniformWaveLength =
 						MLCudaHero_SelectWaveLength(
 								(uint)gid, taskStats[gid].sampleCount);
+				const float mlCudaSpectralU = clamp(
+						(mlCudaUniformWaveLength - 380.f) * (1.f / 400.f),
+						0.f, 0.99999994f);
+				taskState->mlDispersionWaveLength =
+						MLHeroSampling_SelectWaveLength(
+							mlCudaSpectralU, taskConfig->mlHeroSamplingMode);
+				taskState->mlDispersionSampleWeight =
+						MLHeroSampling_GetSampleWeight(
+							mlCudaSpectralU, taskConfig->mlHeroSamplingMode);
 			}
 
 			if (mlCudaHeroDispersiveMaterial || mlCudaFineRoughGlass) {
 				if (mlCudaHeroDispersiveMaterial && !mlCudaHeroAlreadyApplied) {
 					mlCudaHeroRGB = GlassMaterial_WaveLength2RGB(
-							taskState->mlDispersionWaveLength);
+							taskState->mlDispersionWaveLength) * taskState->mlDispersionSampleWeight;
 					mlCudaApplyHeroRGB = true;
 				}
 
@@ -936,7 +1043,11 @@ __kernel void AdvancePaths_MK_GENERATE_NEXT_VERTEX_RAY(
 						(float)mlStrataCount;
 
 				taskState->mlDispersionWaveLength =
-						mix(380.f, 780.f, mlSpectralU);
+						MLHeroSampling_SelectWaveLength(mlSpectralU,
+								taskConfig->mlHeroSamplingMode);
+				taskState->mlDispersionSampleWeight =
+						MLHeroSampling_GetSampleWeight(mlSpectralU,
+								taskConfig->mlHeroSamplingMode);
 			}
 
 			bsdfSample = BSDF_Sample(bsdf,
@@ -1129,7 +1240,7 @@ __kernel void AdvancePaths_MK_SPLAT_SAMPLE(
 			(taskState->mlDispersionWaveLength >= 380.f) &&
 			(taskState->mlDispersionWaveLength <= 780.f)) {
 		const float3 mlDispersionColor =
-				GlassMaterial_WaveLength2RGB(taskState->mlDispersionWaveLength);
+				GlassMaterial_WaveLength2RGB(taskState->mlDispersionWaveLength) * taskState->mlDispersionSampleWeight;
 
 		// Same split-radiance rule as the successful CPU Path test:
 		// final = neutral_before_glass
@@ -1289,10 +1400,12 @@ __kernel void AdvancePaths_MK_GENERATE_CAMERA_RAY(
 #if defined(LUXRAYS_CUDA_DEVICE)
 	// ML CUDA HERO state: reset for every new eye path.
 	taskState->mlDispersionWaveLength = -1.f;
+	taskState->mlDispersionSampleWeight = 1.f;
 	taskState->mlCudaHeroRGBApplied = 0;
 #else
 	// ML GPU HERO state: reset for every new eye path (OpenCL GOLDSTAND).
 	taskState->mlDispersionWaveLength = -1.f;
+	taskState->mlDispersionSampleWeight = 1.f;
 	taskState->mlDispersionUsed = 0;
 	taskState->mlDispersionSnapshotTaken = 0;
 #endif

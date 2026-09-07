@@ -130,9 +130,78 @@ OPENCL_FORCE_INLINE float GlassMaterial_WaveLength2IOR(const float waveLength, c
 	return cauchyEq;
 }
 
+
+//------------------------------------------------------------------------------
+// ML Sellmeier runtime model/presets
+//
+// dispersionModel: 0 = Cauchy, 1 = Sellmeier
+// sellmeierPreset: 0 = N-BK7, 1 = Fused Silica, 2 = SF10, 3 = SF11
+// These numeric values mirror slg/materials/glass.h.
+//------------------------------------------------------------------------------
+
+OPENCL_FORCE_INLINE float GlassMaterial_WaveLength2IORSellmeier(
+		const float waveLength, const uint sellmeierPreset) {
+	float B1, B2, B3, C1, C2, C3;
+
+	switch (sellmeierPreset) {
+		case 1u: // Fused Silica
+			B1 = 0.6961663f;
+			B2 = 0.4079426f;
+			B3 = 0.8974794f;
+			C1 = 0.00467914826f;
+			C2 = 0.0135120631f;
+			C3 = 97.9340025f;
+			break;
+		case 2u: // SF10
+			B1 = 1.62153902f;
+			B2 = 0.256287842f;
+			B3 = 1.64447552f;
+			C1 = 0.0122241457f;
+			C2 = 0.0595736775f;
+			C3 = 147.468793f;
+			break;
+		case 3u: // SF11
+			B1 = 1.73759695f;
+			B2 = 0.313747346f;
+			B3 = 1.89878101f;
+			C1 = 0.013188707f;
+			C2 = 0.0623068142f;
+			C3 = 155.23629f;
+			break;
+		case 0u: // N-BK7
+		default:
+			B1 = 1.03961212f;
+			B2 = 0.231792344f;
+			B3 = 1.01046945f;
+			C1 = 0.00600069867f;
+			C2 = 0.0200179144f;
+			C3 = 103.560653f;
+			break;
+	}
+
+	const float lambda = waveLength / 1000.f;
+	const float lambda2 = lambda * lambda;
+	const float n2 = 1.f +
+			B1 * lambda2 / (lambda2 - C1) +
+			B2 * lambda2 / (lambda2 - C2) +
+			B3 * lambda2 / (lambda2 - C3);
+
+	return sqrt(fmax(1.f, n2));
+}
+
+OPENCL_FORCE_INLINE float GlassMaterial_MLWaveLength2IOR(
+		const float waveLength, const float IOR, const float cauchyB,
+		const uint dispersionModel, const uint sellmeierPreset) {
+	if (dispersionModel == 1u)
+		return GlassMaterial_WaveLength2IORSellmeier(waveLength, sellmeierPreset);
+
+	return GlassMaterial_WaveLength2IOR(waveLength, IOR, cauchyB);
+}
+
 OPENCL_FORCE_INLINE float3 GlassMaterial_EvalSpecularReflection(__global const HitPoint *hitPoint,
 		const float3 localFixedDir, const float3 kr,
 		const float nc, const float nt, const float cauchyB,
+		const uint dispersionModel, const uint sellmeierPreset,
 		const float mlDispersionWaveLength,
 		float3 *sampledDir, const float localFilmThickness, const float localFilmIor) {
 	if (Spectrum_IsBlack(kr))
@@ -144,8 +213,10 @@ OPENCL_FORCE_INLINE float3 GlassMaterial_EvalSpecularReflection(__global const H
 	// ML spectral Fresnel: reflection uses the same hero-wavelength IOR
 	// as transmission.
 	float lnt = nt;
-	if ((cauchyB > 0.f) && (mlDispersionWaveLength >= 380.f) && (mlDispersionWaveLength <= 780.f))
-		lnt = GlassMaterial_WaveLength2IOR(mlDispersionWaveLength, nt, cauchyB);
+	if (((dispersionModel == 1u) || (cauchyB > 0.f)) &&
+			(mlDispersionWaveLength >= 380.f) && (mlDispersionWaveLength <= 780.f))
+		lnt = GlassMaterial_MLWaveLength2IOR(mlDispersionWaveLength, nt, cauchyB,
+				dispersionModel, sellmeierPreset);
 
 	const float ntc = lnt / nc;
 	const float3 result = kr * FresnelCauchy_Evaluate(ntc, costheta);
@@ -160,6 +231,7 @@ OPENCL_FORCE_INLINE float3 GlassMaterial_EvalSpecularReflection(__global const H
 OPENCL_FORCE_INLINE float3 GlassMaterial_EvalSpecularTransmission(__global const HitPoint *hitPoint,
 		const float3 localFixedDir, const float u0,
 		const float3 kt, const float nc, const float nt, const float cauchyB,
+		const uint dispersionModel, const uint sellmeierPreset,
 		const float mlDispersionWaveLength,
 		float3 *sampledDir) {
 	if (Spectrum_IsBlack(kt))
@@ -168,11 +240,17 @@ OPENCL_FORCE_INLINE float3 GlassMaterial_EvalSpecularTransmission(__global const
 	// Compute transmitted ray direction
 	float3 lkt;
 	float lnt;
-	if (cauchyB > 0.f) {
+	if ((dispersionModel == 1u) || (cauchyB > 0.f)) {
 		if ((mlDispersionWaveLength >= 380.f) && (mlDispersionWaveLength <= 780.f)) {
-			// ML HERO: fixed path wavelength and d-line corrected Cauchy.
-			lnt = GlassMaterial_WaveLength2IOR(mlDispersionWaveLength, nt, cauchyB);
+			// ML HERO: fixed path wavelength and selected runtime IOR model.
+			lnt = GlassMaterial_MLWaveLength2IOR(mlDispersionWaveLength, nt, cauchyB,
+					dispersionModel, sellmeierPreset);
 			lkt = kt;
+		} else if (dispersionModel == 1u) {
+			// Standard per-bounce wavelength with Sellmeier IOR.
+			const float waveLength = mix(380.f, 780.f, u0);
+			lnt = GlassMaterial_WaveLength2IORSellmeier(waveLength, sellmeierPreset);
+			lkt = kt * GlassMaterial_WaveLength2RGB(waveLength);
 		} else {
 			// LuxCore Standard: original per-bounce wavelength, Cauchy-A IOR,
 			// and RGB weighting inside the transmission event.
@@ -252,10 +330,13 @@ OPENCL_FORCE_INLINE void GlassMaterial_Sample(__global const Material* restrict 
 	const float nt = ExtractInteriorIors(hitPoint, material->glass.interiorIorTexIndex TEXTURES_PARAM);
 
 	const float cauchyB = (material->glass.cauchyBTex != NULL_INDEX) ? Texture_GetFloatValue(material->glass.cauchyBTex, hitPoint TEXTURES_PARAM) : -1.f;
+	const uint dispersionModel = material->glass.dispersionModel;
+	const uint sellmeierPreset = material->glass.sellmeierPreset;
 
 	float3 transLocalSampledDir; 
 	const float3 trans = GlassMaterial_EvalSpecularTransmission(hitPoint, fixedDir, u0,
-			kt, nc, nt, cauchyB, mlDispersionWaveLength, &transLocalSampledDir);
+			kt, nc, nt, cauchyB, dispersionModel, sellmeierPreset,
+			mlDispersionWaveLength, &transLocalSampledDir);
 	
 	const float localFilmThickness = (material->glass.filmThicknessTexIndex != NULL_INDEX) 
 									 ? Texture_GetFloatValue(material->glass.filmThicknessTexIndex, hitPoint TEXTURES_PARAM) : 0.f;
@@ -264,7 +345,8 @@ OPENCL_FORCE_INLINE void GlassMaterial_Sample(__global const Material* restrict 
 	
 	float3 reflLocalSampledDir;
 	const float3 refl = GlassMaterial_EvalSpecularReflection(hitPoint, fixedDir,
-			kr, nc, nt, cauchyB, mlDispersionWaveLength,
+			kr, nc, nt, cauchyB, dispersionModel, sellmeierPreset,
+			mlDispersionWaveLength,
 			&reflLocalSampledDir, localFilmThickness, localFilmIor);
 
 	// Decide to transmit or reflect
@@ -360,11 +442,14 @@ OPENCL_FORCE_INLINE float3 GlassMaterial_SampleMLCuda(
 	const float cauchyB = (material->glass.cauchyBTex != NULL_INDEX) ?
 			Texture_GetFloatValue(material->glass.cauchyBTex, hitPoint TEXTURES_PARAM) :
 			-1.f;
+	const uint dispersionModel = material->glass.dispersionModel;
+	const uint sellmeierPreset = material->glass.sellmeierPreset;
 
 	float3 transLocalSampledDir;
 	const float3 trans = GlassMaterial_EvalSpecularTransmission(
 			hitPoint, fixedDir, u0,
-			kt, nc, nt, cauchyB, mlDispersionWaveLength,
+			kt, nc, nt, cauchyB, dispersionModel, sellmeierPreset,
+			mlDispersionWaveLength,
 			&transLocalSampledDir);
 
 	const float localFilmThickness =
@@ -384,7 +469,8 @@ OPENCL_FORCE_INLINE float3 GlassMaterial_SampleMLCuda(
 	float3 reflLocalSampledDir;
 	const float3 refl = GlassMaterial_EvalSpecularReflection(
 			hitPoint, fixedDir,
-			kr, nc, nt, cauchyB, mlDispersionWaveLength,
+			kr, nc, nt, cauchyB, dispersionModel, sellmeierPreset,
+			mlDispersionWaveLength,
 			&reflLocalSampledDir, localFilmThickness, localFilmIor);
 
 	float threshold;

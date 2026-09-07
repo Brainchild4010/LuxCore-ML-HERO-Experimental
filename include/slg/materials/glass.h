@@ -24,6 +24,22 @@
 namespace slg {
 
 //------------------------------------------------------------------------------
+// Glass dispersion models
+//------------------------------------------------------------------------------
+
+enum GlassDispersionModel {
+	GLASS_DISPERSION_CAUCHY = 0,
+	GLASS_DISPERSION_SELLMEIER = 1
+};
+
+enum GlassSellmeierPreset {
+	GLASS_SELLMEIER_N_BK7 = 0,
+	GLASS_SELLMEIER_FUSED_SILICA = 1,
+	GLASS_SELLMEIER_SF10 = 2,
+	GLASS_SELLMEIER_SF11 = 3
+};
+
+//------------------------------------------------------------------------------
 // Glass material
 //------------------------------------------------------------------------------
 
@@ -34,7 +50,9 @@ public:
 			TexRef emitted, TexRef bump,
 			TexRef refl, TexRef trans,
 			TexRef exteriorIorFact, TexRef interiorIorFact,
-			TexRef B, 
+			TexRef B,
+			const GlassDispersionModel dispersionModel,
+			const GlassSellmeierPreset sellmeierPreset,
 			TexRef filmThickness, TexRef filmIor);
 
 	virtual MaterialType GetType() const { return GLASS; }
@@ -63,6 +81,8 @@ public:
 	TexRef GetExteriorIOR() const { return exteriorIor; }
 	TexRef GetInteriorIOR() const { return interiorIor; }
 	TexRef GetCauchyB() const { return cauchyB; }
+	GlassDispersionModel GetDispersionModel() const { return dispersionModel; }
+	GlassSellmeierPreset GetSellmeierPreset() const { return sellmeierPreset; }
 	TexRef GetFilmThickness() const { return filmThickness; }
 	TexRef GetFilmIOR() const { return filmIor; }
 
@@ -84,6 +104,8 @@ private:
 	TexRef exteriorIor;
 	TexRef interiorIor;
 	TexRef cauchyB;
+	GlassDispersionModel dispersionModel;
+	GlassSellmeierPreset sellmeierPreset;
 	TexRef filmThickness;
 	TexRef filmIor;
 };

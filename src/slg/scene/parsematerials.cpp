@@ -325,6 +325,24 @@ MaterialUPtr Scene::CreateMaterial(
 			cauchyB = parseTex("cauchyc", {0.f, 0.f, 0.f});
 		}
 
+		const string dispersionModelName = parseString("dispersionmodel", "cauchy");
+		GlassDispersionModel dispersionModel;
+		if (dispersionModelName == "sellmeier")
+			dispersionModel = GLASS_DISPERSION_SELLMEIER;
+		else
+			dispersionModel = GLASS_DISPERSION_CAUCHY;
+
+		const string sellmeierPresetName = parseString("sellmeierpreset", "n_bk7");
+		GlassSellmeierPreset sellmeierPreset;
+		if (sellmeierPresetName == "fused_silica")
+			sellmeierPreset = GLASS_SELLMEIER_FUSED_SILICA;
+		else if (sellmeierPresetName == "sf10")
+			sellmeierPreset = GLASS_SELLMEIER_SF10;
+		else if (sellmeierPresetName == "sf11")
+			sellmeierPreset = GLASS_SELLMEIER_SF11;
+		else
+			sellmeierPreset = GLASS_SELLMEIER_N_BK7;
+
 		TextureConstPtr filmThickness = nullptr;
 		if (isDefined("filmthickness"))
 			filmThickness = parseTex("filmthickness", {0.f});
@@ -335,7 +353,8 @@ MaterialUPtr Scene::CreateMaterial(
 
 		mat = std::make_unique<GlassMaterial>(
 			frontTransparencyTex, backTransparencyTex, emissionTex, bumpTex, kr, kt,
-			exteriorIor, interiorIor, cauchyB, filmThickness, filmIor
+			exteriorIor, interiorIor, cauchyB, dispersionModel, sellmeierPreset,
+			filmThickness, filmIor
 		);
 	} else if (matType == "archglass") {
 		auto kr = parseTex("kr", {1.f, 1.f, 1.f});

@@ -68,6 +68,7 @@ typedef struct {
 
 	// ML HERO global spectral mode (0 = LuxCore Standard, 1 = ML HERO)
 	int mlHeroEnabled;
+	int mlHeroSamplingMode;
 	Filter pixelFilter;
 	Film film;
 } GPUTaskConfiguration;
@@ -97,21 +98,22 @@ typedef struct {
 
 	Seed seedPassThroughEvent;
 
-#if defined(LUXRAYS_CUDA_DEVICE)
-	// ML CUDA HERO state.
-	// Dedicated per-eye-path wavelength plus the clean RGB-applied flag
-	// introduced by Test G.
-	float mlDispersionWaveLength;
-	int mlCudaHeroRGBApplied;
-#else
-	// ML GPU HERO dispersion state.
-	// OpenCL keeps the proven GOLDSTAND layout/state.
-	float mlDispersionWaveLength;
-	int mlDispersionUsed;
+    // ML GPU/CUDA HERO wavelength state shared by both backends.
+    float mlDispersionWaveLength;
+	float mlDispersionSampleWeight;
 
-	// Split-radiance state used by the proven OpenCL HERO path.
-	int mlDispersionSnapshotTaken;
-	Spectrum mlRadianceBeforeDispersion[FILM_MAX_RADIANCE_GROUP_COUNT];
+#if defined(LUXRAYS_CUDA_DEVICE)
+    // ML CUDA HERO state.
+    // Clean RGB-applied flag introduced by Test G.
+    int mlCudaHeroRGBApplied;
+#else
+    // ML GPU HERO dispersion state.
+    // OpenCL keeps the proven GOLDSTAND layout/state.
+    int mlDispersionUsed;
+
+    // Split-radiance state used by the proven OpenCL HERO path.
+    int mlDispersionSnapshotTaken;
+    Spectrum mlRadianceBeforeDispersion[FILM_MAX_RADIANCE_GROUP_COUNT];
 #endif
 	
 	int albedoToDo, photonGICacheEnabledOnLastHit,

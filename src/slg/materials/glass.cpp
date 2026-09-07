@@ -35,6 +35,8 @@ using namespace slg;
 thread_local float mlDispersionWaveLength = -1.f;
 thread_local bool mlDispersionUsed = false;
 thread_local float mlDispersionCurrentCauchyB = 0.f;
+thread_local GlassDispersionModel mlDispersionCurrentModel = GLASS_DISPERSION_CAUCHY;
+thread_local GlassSellmeierPreset mlDispersionCurrentSellmeierPreset = GLASS_SELLMEIER_N_BK7;
 thread_local float mlDispersionSampleWeight = 1.f;
 thread_local bool mlHeroEnabled = true;
 
@@ -43,6 +45,8 @@ void SetMLHeroEnabled(const bool enabled) {
 	mlDispersionWaveLength = -1.f;
 	mlDispersionUsed = false;
 	mlDispersionCurrentCauchyB = 0.f;
+	mlDispersionCurrentModel = GLASS_DISPERSION_CAUCHY;
+	mlDispersionCurrentSellmeierPreset = GLASS_SELLMEIER_N_BK7;
 	mlDispersionSampleWeight = 1.f;
 }
 
@@ -75,10 +79,13 @@ GlassMaterial::GlassMaterial(TextureConstPtr frontTransp, TextureConstPtr backTr
 		TextureConstPtr emitted, TextureConstPtr bump,
 		TextureConstPtr refl, TextureConstPtr trans,
 		TextureConstPtr exteriorIorFact, TextureConstPtr interiorIorFact,
-		TextureConstPtr B, TextureConstPtr filmThickness, TextureConstPtr filmIor) :
+		TextureConstPtr B, const GlassDispersionModel dispModel,
+		const GlassSellmeierPreset smPreset,
+		TextureConstPtr filmThickness, TextureConstPtr filmIor) :
 			Material(frontTransp, backTransp, emitted, bump),
 			Kr(refl), Kt(trans), exteriorIor(exteriorIorFact), interiorIor(interiorIorFact),
-			cauchyB(B), filmThickness(filmThickness), filmIor(filmIor) {
+			cauchyB(B), dispersionModel(dispModel), sellmeierPreset(smPreset),
+			filmThickness(filmThickness), filmIor(filmIor) {
 }
 
 Spectrum GlassMaterial::Evaluate(const HitPoint &hitPoint,
@@ -175,6 +182,54 @@ static float WaveLength2IOR(const float waveLength, const float IOR, const float
 	return cauchyEq;
 }
 
+//------------------------------------------------------------------------------
+// ML Sellmeier runtime model/presets
+//------------------------------------------------------------------------------
+
+struct MLSellmeierCoefficients {
+	float B1, B2, B3;
+	float C1, C2, C3;
+};
+
+static MLSellmeierCoefficients GetMLSellmeierCoefficients(const GlassSellmeierPreset preset) {
+	switch (preset) {
+		case GLASS_SELLMEIER_FUSED_SILICA:
+			return {0.6961663f, 0.4079426f, 0.8974794f,
+				0.00467914826f, 0.0135120631f, 97.9340025f};
+		case GLASS_SELLMEIER_SF10:
+			return {1.62153902f, 0.256287842f, 1.64447552f,
+				0.0122241457f, 0.0595736775f, 147.468793f};
+		case GLASS_SELLMEIER_SF11:
+			return {1.73759695f, 0.313747346f, 1.89878101f,
+				0.013188707f, 0.0623068142f, 155.23629f};
+		case GLASS_SELLMEIER_N_BK7:
+		default:
+			return {1.03961212f, 0.231792344f, 1.01046945f,
+				0.00600069867f, 0.0200179144f, 103.560653f};
+	}
+}
+
+static float WaveLength2IORSellmeier(const float waveLength,
+		const GlassSellmeierPreset preset) {
+	const MLSellmeierCoefficients c = GetMLSellmeierCoefficients(preset);
+	const float lambda = waveLength / 1000.f;
+	const float lambda2 = lambda * lambda;
+
+	const float n2 = 1.f +
+			c.B1 * lambda2 / (lambda2 - c.C1) +
+			c.B2 * lambda2 / (lambda2 - c.C2) +
+			c.B3 * lambda2 / (lambda2 - c.C3);
+
+	return sqrtf(Max(1.f, n2));
+}
+
+static float MLWaveLength2IOR(const float waveLength, const float IOR, const float cauchyB) {
+	if (mlDispersionCurrentModel == GLASS_DISPERSION_SELLMEIER)
+		return WaveLength2IORSellmeier(waveLength, mlDispersionCurrentSellmeierPreset);
+
+	return WaveLength2IOR(waveLength, IOR, cauchyB);
+}
+
 Spectrum GlassMaterial::EvalSpecularReflection(const HitPoint &hitPoint,
 		const Vector &localFixedDir, const Spectrum &kr,
 		const float nc, const float nt,
@@ -190,9 +245,10 @@ Spectrum GlassMaterial::EvalSpecularReflection(const HitPoint &hitPoint,
 	// that transmission already uses. This keeps Fresnel reflection and
 	// refraction spectrally consistent for dispersive glass.
 	float lnt = nt;
-	if (mlHeroEnabled && (mlDispersionCurrentCauchyB > 0.f)) {
+	if (mlHeroEnabled && ((mlDispersionCurrentModel == GLASS_DISPERSION_SELLMEIER) ||
+			(mlDispersionCurrentCauchyB > 0.f))) {
 		const float waveLength = GetMLDispersionWaveLength(0.5f);
-		lnt = WaveLength2IOR(waveLength, nt, mlDispersionCurrentCauchyB);
+		lnt = MLWaveLength2IOR(waveLength, nt, mlDispersionCurrentCauchyB);
 		mlDispersionUsed = true;
 	}
 
@@ -216,15 +272,20 @@ Spectrum GlassMaterial::EvalSpecularTransmission(const HitPoint &hitPoint,
 	// Compute transmitted ray direction
 	Spectrum lkt;
 	float lnt;
-	if (cauchyB > 0.f) {
+	if ((mlDispersionCurrentModel == GLASS_DISPERSION_SELLMEIER) || (cauchyB > 0.f)) {
 		if (mlHeroEnabled) {
-			// ML HERO: fixed path wavelength, d-line corrected Cauchy IOR.
+			// ML HERO: one fixed path wavelength with the selected IOR model.
 			const float waveLength = GetMLDispersionWaveLength(u0);
-			lnt = WaveLength2IOR(waveLength, nt, cauchyB);
+			lnt = MLWaveLength2IOR(waveLength, nt, cauchyB);
 			lkt = kt;
 			mlDispersionUsed = true;
+		} else if (mlDispersionCurrentModel == GLASS_DISPERSION_SELLMEIER) {
+			// Standard per-bounce wavelength, but with Sellmeier IOR.
+			const float waveLength = Lerp(u0, 380.f, 780.f);
+			lnt = WaveLength2IORSellmeier(waveLength, mlDispersionCurrentSellmeierPreset);
+			lkt = kt * WaveLength2RGB(waveLength);
 		} else {
-			// LuxCore Standard: original per-bounce wavelength and RGB weighting.
+			// LuxCore Standard: original per-bounce Cauchy wavelength and RGB weighting.
 			const float waveLength = Lerp(u0, 380.f, 780.f);
 			lnt = WaveLength2IORStandard(waveLength, nt, cauchyB);
 			lkt = kt * WaveLength2RGB(waveLength);
@@ -275,6 +336,8 @@ Spectrum GlassMaterial::Sample(const HitPoint &hitPoint,
 	// Make the current material dispersion strength available to the
 	// reflection Fresnel evaluation without changing the public material API.
 	mlDispersionCurrentCauchyB = cauchyBValue;
+	mlDispersionCurrentModel = dispersionModel;
+	mlDispersionCurrentSellmeierPreset = sellmeierPreset;
 
 	Vector transLocalSampledDir; 
 	const Spectrum trans = EvalSpecularTransmission(hitPoint, localFixedDir, u0,
@@ -385,6 +448,20 @@ PropertiesUPtr GlassMaterial::ToProperties(const ImageMapCache &imgMapCache, con
 		props->Set(Property("scene.materials." + name + ".interiorior")(interiorIor->GetSDLValue()));
 	if (cauchyB)
 		props->Set(Property("scene.materials." + name + ".cauchyb")(cauchyB->GetSDLValue()));
+
+	props->Set(Property("scene.materials." + name + ".dispersionmodel")(
+			dispersionModel == GLASS_DISPERSION_SELLMEIER ? "sellmeier" : "cauchy"));
+	if (dispersionModel == GLASS_DISPERSION_SELLMEIER) {
+		string presetName = "n_bk7";
+		switch (sellmeierPreset) {
+			case GLASS_SELLMEIER_FUSED_SILICA: presetName = "fused_silica"; break;
+			case GLASS_SELLMEIER_SF10: presetName = "sf10"; break;
+			case GLASS_SELLMEIER_SF11: presetName = "sf11"; break;
+			case GLASS_SELLMEIER_N_BK7:
+			default: presetName = "n_bk7"; break;
+		}
+		props->Set(Property("scene.materials." + name + ".sellmeierpreset")(presetName));
+	}
 	if (filmThickness)
 		props->Set(Property("scene.materials." + name + ".filmthickness")(filmThickness->GetSDLValue()));
 	if (filmIor)

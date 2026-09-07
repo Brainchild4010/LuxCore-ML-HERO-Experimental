@@ -93,6 +93,10 @@ typedef struct {
 	unsigned int ktTexIndex;
 	unsigned int exteriorIorTexIndex, interiorIorTexIndex;
 	unsigned int cauchyBTex;
+	// ML Sellmeier runtime selection. Values mirror GlassDispersionModel
+	// and GlassSellmeierPreset in slg/materials/glass.h.
+	unsigned int dispersionModel;
+	unsigned int sellmeierPreset;
 	unsigned int filmThicknessTexIndex;
 	unsigned int filmIorTexIndex;
 } GlassParam;

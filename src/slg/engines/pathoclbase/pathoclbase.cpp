@@ -167,6 +167,11 @@ void PathOCLBaseRenderEngine::InitGPUTaskConfiguration() {
 	// Path Tracer configuration
 	taskConfig.pathTracer = compiledScene->compiledPathTracer;
 	taskConfig.mlHeroEnabled = renderConfig.GetProperty("path.mlhero.enable").Get<bool>() ? 1 : 0;
+	taskConfig.mlHeroSamplingMode = renderConfig.GetProperty("path.mlhero.samplingmode").Get<int>();
+	if (taskConfig.mlHeroSamplingMode < 1)
+		taskConfig.mlHeroSamplingMode = 1;
+	else if (taskConfig.mlHeroSamplingMode > 3)
+		taskConfig.mlHeroSamplingMode = 3;
 
 	// Pixel filter configuration
 	taskConfig.pixelFilter = *oclPixelFilter;

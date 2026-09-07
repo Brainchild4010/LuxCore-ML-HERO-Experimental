@@ -682,6 +682,9 @@ void CompiledScene::CompileMaterials() {
 					mat->glass.cauchyBTex = scene.GetTextures().GetTextureIndex(gm.GetCauchyB());
 				else
 					mat->glass.cauchyBTex = NULL_INDEX;
+				// ML Sellmeier runtime selection
+				mat->glass.dispersionModel = static_cast<u_int>(gm.GetDispersionModel());
+				mat->glass.sellmeierPreset = static_cast<u_int>(gm.GetSellmeierPreset());
 				if (gm.GetFilmThickness())
 					mat->glass.filmThicknessTexIndex = scene.GetTextures().GetTextureIndex(gm.GetFilmThickness());
 				else

@@ -866,8 +866,8 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 	const u_int sampleSize =
 		sampleBootSize + // To generate the initial light vertex and trace eye ray
 		engine->maxLightPathDepth * sampleLightStepSize + // For each light vertex
-		engine->maxEyePathDepth * sampleEyeStepSize; // For each eye vertex
-	sampler->SetThreadIndex(threadIndex);
+		engine->maxEyePathDepth * sampleEyeStepSize + 1; // Dedicated HERO wavelength sample dimension
+		sampler->SetThreadIndex(threadIndex);
 	sampler->RequestSamples(PIXEL_NORMALIZED_AND_SCREEN_NORMALIZED, sampleSize);
 
 	VarianceClamping varianceClamping(engine->sqrtVarianceClampMaxValue);
@@ -898,11 +898,12 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 
 		SetMLHeroEnabled(engine->mlHeroEnabled);
 
-		// ML HERO harmonized baseline: use one wavelength for the complete
-		// light + eye path pair. Use the same Sobol dimension as the first
-		// light-path BSDF-X sample, matching the Path/GPU HERO strategy.
+		// ML HERO: use one wavelength for the complete light + eye path pair.
+		// The wavelength uses a dedicated sampler dimension so Metropolis
+		// can mutate and restore it independently from all path/BSDF samples.
 		if (engine->mlHeroEnabled) {
-			const float mlHeroU0 = sampler->GetSample(sampleBootSize + 2);
+			const u_int mlHeroSampleIndex = sampleSize - 1;
+			const float mlHeroU0 = sampler->GetSample(mlHeroSampleIndex);
 
 			if (engine->mlHeroSamplingMode == 3) {
 				float mlSampleWeight;
