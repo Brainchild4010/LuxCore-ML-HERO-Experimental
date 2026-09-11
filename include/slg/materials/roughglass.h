@@ -20,6 +20,7 @@
 #define	_SLG_ROUGHGLASSMAT_H
 
 #include "slg/materials/material.h"
+#include "slg/materials/glass.h"
 
 namespace slg {
 
@@ -36,6 +37,8 @@ public:
 			TexRef refl, TexRef trans,
 			TexRef exteriorIorFact, TexRef interiorIorFact,
 			TexRef cauchyB,
+			const GlassDispersionModel dispersionModel,
+			const GlassSellmeierPreset sellmeierPreset,
 			const bool fineRoughGlass,
 			TexRef u, TexRef v,
 			TexRef filmThickness, TexRef filmIor);
@@ -66,6 +69,8 @@ public:
 	TexRef GetExteriorIOR() const { return exteriorIor; }
 	TexRef GetInteriorIOR() const { return interiorIor; }
 	TexRef GetCauchyB() const { return cauchyB; }
+	GlassDispersionModel GetDispersionModel() const { return dispersionModel; }
+	GlassSellmeierPreset GetSellmeierPreset() const { return sellmeierPreset; }
 	bool IsFineRoughGlassEnabled() const { return fineRoughGlass; }
 	TexRef GetNu() const { return nu; }
 	TexRef GetNv() const { return nv; }
@@ -78,6 +83,8 @@ private:
 	TexRef exteriorIor;
 	TexRef interiorIor;
 	TexRef cauchyB;
+	GlassDispersionModel dispersionModel;
+	GlassSellmeierPreset sellmeierPreset;
 	bool fineRoughGlass;
 	TexRef nu;
 	TexRef nv;

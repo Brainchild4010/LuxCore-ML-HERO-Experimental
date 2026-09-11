@@ -166,13 +166,14 @@ OPENCL_FORCE_INLINE float3 RoughGlassMLCudaSampleDelta(
 		const float mlDispersionWaveLength,
 		const float3 kr, const float3 kt,
 		const float nc, const float ntBase, const float cauchyB,
+		const uint dispersionModel, const uint sellmeierPreset,
 		float *pdfW, BSDFEvent *event
 		MATERIALS_PARAM_DECL) {
 	float3 transLocalSampledDir;
 	const float3 trans = GlassMaterial_EvalSpecularTransmission(
 			hitPoint, fixedDir, u0,
-			kt, nc, ntBase, cauchyB, mlDispersionWaveLength,
-			&transLocalSampledDir);
+			kt, nc, ntBase, cauchyB, dispersionModel, sellmeierPreset,
+			mlDispersionWaveLength, &transLocalSampledDir);
 
 	const float localFilmThickness =
 			(material->roughglass.filmThicknessTexIndex != NULL_INDEX) ?
@@ -191,7 +192,8 @@ OPENCL_FORCE_INLINE float3 RoughGlassMLCudaSampleDelta(
 	float3 reflLocalSampledDir;
 	const float3 refl = GlassMaterial_EvalSpecularReflection(
 			hitPoint, fixedDir,
-			kr, nc, ntBase, cauchyB, mlDispersionWaveLength,
+			kr, nc, ntBase, cauchyB, dispersionModel, sellmeierPreset,
+			mlDispersionWaveLength,
 			&reflLocalSampledDir, localFilmThickness, localFilmIor);
 
 	float threshold;
@@ -554,8 +556,11 @@ OPENCL_FORCE_INLINE float3 RoughGlassMaterial_SampleMLCuda(
 			Texture_GetFloatValue(material->roughglass.cauchyBTex,
 					hitPoint TEXTURES_PARAM) : 0.f;
 
-	const float nt = (cauchyB > 0.f) ?
-			GlassMaterial_WaveLength2IOR(mlDispersionWaveLength, ntBase, cauchyB) :
+	const uint dispersionModel = material->roughglass.dispersionModel;
+	const uint sellmeierPreset = material->roughglass.sellmeierPreset;
+	const float nt = ((dispersionModel == 1u) || (cauchyB > 0.f)) ?
+			GlassMaterial_MLWaveLength2IOR(mlDispersionWaveLength, ntBase, cauchyB,
+					dispersionModel, sellmeierPreset) :
 			ntBase;
 	const float ntc = nt / nc;
 	const float coso = fabs(fixedDir.z);
@@ -569,6 +574,7 @@ OPENCL_FORCE_INLINE float3 RoughGlassMaterial_SampleMLCuda(
 				u0, passThroughEvent,
 				mlDispersionWaveLength,
 				kr, kt, nc, ntBase, cauchyB,
+				dispersionModel, sellmeierPreset,
 				pdfW, event
 				MATERIALS_PARAM);
 

@@ -155,6 +155,8 @@ typedef struct {
 	unsigned int ktTexIndex;
 	unsigned int exteriorIorTexIndex, interiorIorTexIndex;
 		unsigned int cauchyBTex;
+	unsigned int dispersionModel;
+	unsigned int sellmeierPreset;
 	int fineRoughGlass;
 	unsigned int nuTexIndex;
 	unsigned int nvTexIndex;

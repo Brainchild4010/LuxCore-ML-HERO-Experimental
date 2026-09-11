@@ -505,6 +505,20 @@ MaterialUPtr Scene::CreateMaterial(
 		if (isDefined("cauchyb"))
 			cauchyB = parseTex("cauchyb", {0.f});
 
+		const string dispersionModelName = parseString("dispersionmodel", "cauchy");
+		const GlassDispersionModel dispersionModel =
+				(dispersionModelName == "sellmeier") ?
+				GLASS_DISPERSION_SELLMEIER : GLASS_DISPERSION_CAUCHY;
+
+		const string sellmeierPresetName = parseString("sellmeierpreset", "n_bk7");
+		GlassSellmeierPreset sellmeierPreset = GLASS_SELLMEIER_N_BK7;
+		if (sellmeierPresetName == "fused_silica")
+			sellmeierPreset = GLASS_SELLMEIER_FUSED_SILICA;
+		else if (sellmeierPresetName == "sf10")
+			sellmeierPreset = GLASS_SELLMEIER_SF10;
+		else if (sellmeierPresetName == "sf11")
+			sellmeierPreset = GLASS_SELLMEIER_SF11;
+
 		const bool fineRoughGlass = parseBool("fineroughglass.enable", false);
 
 		auto nu = parseTex("uroughness", {.1f});
@@ -520,7 +534,8 @@ MaterialUPtr Scene::CreateMaterial(
 
 		mat = std::make_unique<RoughGlassMaterial>(
 			frontTransparencyTex, backTransparencyTex, emissionTex, bumpTex,
-			kr, kt, exteriorIor, interiorIor, cauchyB, fineRoughGlass,
+			kr, kt, exteriorIor, interiorIor, cauchyB,
+			dispersionModel, sellmeierPreset, fineRoughGlass,
 			nu, nv, filmThickness, filmIor
 		);
 	} else if (matType == "velvet") {

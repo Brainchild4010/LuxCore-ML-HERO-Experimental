@@ -41,6 +41,13 @@ public:
 
 	const std::vector<float> &GetWaveLengths() const { return waveLengths; }
 	const std::vector<float> &GetData() const { return data; }
+
+	// ML HERO: evaluate the original tabulated spectrum at a wavelength.
+	// The wavelength unit must be the same as the values stored in waveLengths.
+	// Linear interpolation is used between samples; values outside the table
+	// are clamped to the first/last sample.
+	float GetSpectralValue(const float waveLength) const;
+
 	const luxrays::Spectrum &GetRGB() const { return rgb; }
 	bool GetEmission() const { return emission; }
 

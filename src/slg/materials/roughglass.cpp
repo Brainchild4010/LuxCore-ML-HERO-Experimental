@@ -44,20 +44,62 @@ static float RoughGlassMLGetWaveLength() {
 
 static float RoughGlassMLWaveLength2IOR(const float waveLength,
 		const float IOR, const float B) {
-	// Same d-line corrected Cauchy convention used by the current HERO Glass.
 	const float A = IOR - B / Sqr(587.56f / 1000.f);
 	return A + B / Sqr(waveLength / 1000.f);
 }
 
+struct RoughGlassMLSellmeierCoefficients {
+	float B1, B2, B3;
+	float C1, C2, C3;
+};
+
+static RoughGlassMLSellmeierCoefficients RoughGlassMLGetSellmeierCoefficients(
+		const GlassSellmeierPreset preset) {
+	switch (preset) {
+		case GLASS_SELLMEIER_FUSED_SILICA:
+			return {0.6961663f, 0.4079426f, 0.8974794f,
+				0.00467914826f, 0.0135120631f, 97.9340025f};
+		case GLASS_SELLMEIER_SF10:
+			return {1.62153902f, 0.256287842f, 1.64447552f,
+				0.0122241457f, 0.0595736775f, 147.468793f};
+		case GLASS_SELLMEIER_SF11:
+			return {1.73759695f, 0.313747346f, 1.89878101f,
+				0.013188707f, 0.0623068142f, 155.23629f};
+		case GLASS_SELLMEIER_N_BK7:
+		default:
+			return {1.03961212f, 0.231792344f, 1.01046945f,
+				0.00600069867f, 0.0200179144f, 103.560653f};
+	}
+}
+
+static float RoughGlassMLWaveLength2IORSellmeier(const float waveLength,
+		const GlassSellmeierPreset preset) {
+	const auto c = RoughGlassMLGetSellmeierCoefficients(preset);
+	const float lambda = waveLength / 1000.f;
+	const float lambda2 = lambda * lambda;
+	const float n2 = 1.f +
+			c.B1 * lambda2 / (lambda2 - c.C1) +
+			c.B2 * lambda2 / (lambda2 - c.C2) +
+			c.B3 * lambda2 / (lambda2 - c.C3);
+	return sqrtf(Max(1.f, n2));
+}
+
 static float RoughGlassMLGetInteriorIOR(const HitPoint &hitPoint,
-		TextureConstPtr interiorIor, TextureConstPtr cauchyB) {
+		TextureConstPtr interiorIor, TextureConstPtr cauchyB,
+		const GlassDispersionModel dispersionModel,
+		const GlassSellmeierPreset sellmeierPreset) {
 	const float nt = ExtractInteriorIors(hitPoint, interiorIor);
+	if (!mlHeroEnabled)
+		return nt;
+
+	const float waveLength = RoughGlassMLGetWaveLength();
+	if (dispersionModel == GLASS_DISPERSION_SELLMEIER)
+		return RoughGlassMLWaveLength2IORSellmeier(waveLength, sellmeierPreset);
+
 	const float b = cauchyB ? cauchyB->GetFloatValue(hitPoint) : 0.f;
+	if (b > 0.f)
+		return RoughGlassMLWaveLength2IOR(waveLength, nt, b);
 
-	if (mlHeroEnabled && (b > 0.f))
-		return RoughGlassMLWaveLength2IOR(RoughGlassMLGetWaveLength(), nt, b);
-
-	// LuxCore Standard RoughGlass has no spectral Cauchy dispersion.
 	return nt;
 }
 
@@ -278,11 +320,14 @@ RoughGlassMaterial::RoughGlassMaterial(TextureConstPtr frontTransp, TextureConst
 		TextureConstPtr refl, TextureConstPtr trans,
 		TextureConstPtr exteriorIorFact, TextureConstPtr interiorIorFact,
 		TextureConstPtr B,
+		const GlassDispersionModel dispModel,
+		const GlassSellmeierPreset smPreset,
 		const bool enableFineRoughGlass,
 		TextureConstPtr u, TextureConstPtr v,
 		TextureConstPtr filmThickness, TextureConstPtr filmIor) :
 			Material(frontTransp, backTransp, emitted, bump), Kr(refl), Kt(trans),
 			exteriorIor(exteriorIorFact), interiorIor(interiorIorFact), cauchyB(B),
+			dispersionModel(dispModel), sellmeierPreset(smPreset),
 			fineRoughGlass(enableFineRoughGlass),
 			nu(u), nv(v), filmThickness(filmThickness), filmIor(filmIor) {
 	glossiness = ComputeGlossiness(nu, nv);
@@ -300,7 +345,7 @@ Spectrum RoughGlassMaterial::Evaluate(const HitPoint &hitPoint,
 		return Spectrum();
 
 	const float nc = ExtractExteriorIors(hitPoint, exteriorIor);
-	const float nt = RoughGlassMLGetInteriorIOR(hitPoint, interiorIor, cauchyB);
+	const float nt = RoughGlassMLGetInteriorIOR(hitPoint, interiorIor, cauchyB, dispersionModel, sellmeierPreset);
 	const float ntc = nt / nc;
 
 	const float u = Clamp(nu->GetFloatValue(hitPoint), 1e-9f, 1.f);
@@ -430,7 +475,7 @@ Spectrum RoughGlassMaterial::Sample(const HitPoint &hitPoint,
 	const float roughWeight = 1.f - deltaWeight;
 
 	const float nc = ExtractExteriorIors(hitPoint, exteriorIor);
-	const float nt = RoughGlassMLGetInteriorIOR(hitPoint, interiorIor, cauchyB);
+	const float nt = RoughGlassMLGetInteriorIOR(hitPoint, interiorIor, cauchyB, dispersionModel, sellmeierPreset);
 	const float ntc = nt / nc;
 
 	// Smooth stochastic near-delta mixture. A delta sample uses exact Glass/HERO;
@@ -452,7 +497,8 @@ Spectrum RoughGlassMaterial::Sample(const HitPoint &hitPoint,
 
 			const float cauchyBValue =
 					cauchyB ? cauchyB->GetFloatValue(hitPoint) : 0.f;
-			if (mlHeroEnabled && (cauchyBValue > 0.f))
+			if (mlHeroEnabled && ((dispersionModel == GLASS_DISPERSION_SELLMEIER) ||
+					(cauchyBValue > 0.f)))
 				mlDispersionUsed = true;
 		}
 
@@ -562,7 +608,8 @@ Spectrum RoughGlassMaterial::Sample(const HitPoint &hitPoint,
 	// successfully sampled an actual event. The existing Path/Bidir HERO
 	// weighting then applies the wavelength RGB estimator exactly once.
 	const float cauchyBValue = cauchyB ? cauchyB->GetFloatValue(hitPoint) : 0.f;
-	if (mlHeroEnabled && (cauchyBValue > 0.f))
+	if (mlHeroEnabled && ((dispersionModel == GLASS_DISPERSION_SELLMEIER) ||
+			(cauchyBValue > 0.f)))
 		mlDispersionUsed = true;
 
 	return result;
@@ -585,7 +632,7 @@ void RoughGlassMaterial::Pdf(const HitPoint &hitPoint,
 		return;
 
 	const float nc = ExtractExteriorIors(hitPoint, exteriorIor);
-	const float nt = RoughGlassMLGetInteriorIOR(hitPoint, interiorIor, cauchyB);
+	const float nt = RoughGlassMLGetInteriorIOR(hitPoint, interiorIor, cauchyB, dispersionModel, sellmeierPreset);
 	const float ntc = nt / nc;
 
 	const float u = Clamp(nu->GetFloatValue(hitPoint), 1e-9f, 1.f);
@@ -732,6 +779,18 @@ PropertiesUPtr RoughGlassMaterial::ToProperties(const ImageMapCache &imgMapCache
 		props->Set(Property("scene.materials." + name + ".interiorior")(interiorIor->GetSDLValue()));
 	if (cauchyB)
 		props->Set(Property("scene.materials." + name + ".cauchyb")(cauchyB->GetSDLValue()));
+	props->Set(Property("scene.materials." + name + ".dispersionmodel")(
+			dispersionModel == GLASS_DISPERSION_SELLMEIER ? "sellmeier" : "cauchy"));
+	if (dispersionModel == GLASS_DISPERSION_SELLMEIER) {
+		string presetName = "n_bk7";
+		switch (sellmeierPreset) {
+			case GLASS_SELLMEIER_FUSED_SILICA: presetName = "fused_silica"; break;
+			case GLASS_SELLMEIER_SF10: presetName = "sf10"; break;
+			case GLASS_SELLMEIER_SF11: presetName = "sf11"; break;
+			default: break;
+		}
+		props->Set(Property("scene.materials." + name + ".sellmeierpreset")(presetName));
+	}
 	props->Set(Property("scene.materials." + name + ".fineroughglass.enable")(fineRoughGlass));
 	props->Set(Property("scene.materials." + name + ".uroughness")(nu->GetSDLValue()));
 	props->Set(Property("scene.materials." + name + ".vroughness")(nv->GetSDLValue()));

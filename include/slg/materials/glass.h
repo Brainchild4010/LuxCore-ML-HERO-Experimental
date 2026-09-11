@@ -39,6 +39,15 @@ enum GlassSellmeierPreset {
 	GLASS_SELLMEIER_SF11 = 3
 };
 
+// ML HERO shared per-thread spectral state
+void SetMLHeroEnabled(const bool enabled);
+bool GetMLHeroEnabled();
+
+void SetMLDispersionWaveLength(const float waveLength);
+void SetMLDispersionWaveLength(const float waveLength, const float sampleWeight);
+float GetMLCurrentWaveLength();
+void MarkMLDispersionUsed();
+
 //------------------------------------------------------------------------------
 // Glass material
 //------------------------------------------------------------------------------

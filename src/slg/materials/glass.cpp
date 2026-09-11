@@ -68,6 +68,14 @@ void SetMLDispersionWaveLength(const float waveLength, const float sampleWeight)
 	mlDispersionUsed = false;
 }
 
+float GetMLCurrentWaveLength() {
+	return mlDispersionWaveLength;
+}
+
+void MarkMLDispersionUsed() {
+	mlDispersionUsed = true;
+}
+
 static float GetMLDispersionWaveLength(const float fallbackU) {
 	if ((mlDispersionWaveLength >= 380.f) && (mlDispersionWaveLength <= 780.f))
 		return mlDispersionWaveLength;

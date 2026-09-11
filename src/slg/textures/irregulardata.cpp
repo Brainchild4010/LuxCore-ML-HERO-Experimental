@@ -16,6 +16,8 @@
  * limitations under the License.                                          *
  ***************************************************************************/
 
+#include <algorithm>
+
 #include "luxrays/core/color/spds/irregular.h"
 
 #include "slg/textures/irregulardata.h"
@@ -46,6 +48,35 @@ IrregularDataTexture::IrregularDataTexture(const u_int n,
 			1.f / 3.f, 1.f / 3.f, 1.f);
 		rgb = colorSpace.ToRGBConstrained(spd.ToNormalizedXYZ()).Clamp(0.f);
 	}
+}
+
+float IrregularDataTexture::GetSpectralValue(const float waveLength) const {
+	if (waveLengths.empty() || data.empty())
+		return 0.f;
+
+	if (waveLength <= waveLengths.front())
+		return data.front();
+	if (waveLength >= waveLengths.back())
+		return data.back();
+
+	const auto upperIt = std::lower_bound(waveLengths.begin(), waveLengths.end(), waveLength);
+	const size_t upperIndex = static_cast<size_t>(upperIt - waveLengths.begin());
+
+	if (*upperIt == waveLength)
+		return data[upperIndex];
+
+	const size_t lowerIndex = upperIndex - 1;
+	const float wl0 = waveLengths[lowerIndex];
+	const float wl1 = waveLengths[upperIndex];
+	const float v0 = data[lowerIndex];
+	const float v1 = data[upperIndex];
+
+	const float delta = wl1 - wl0;
+	if (delta <= 0.f)
+		return v0;
+
+	const float t = (waveLength - wl0) / delta;
+	return v0 + (v1 - v0) * t;
 }
 
 PropertiesUPtr IrregularDataTexture::ToProperties(const ImageMapCache &imgMapCache, const bool useRealFileName) const {

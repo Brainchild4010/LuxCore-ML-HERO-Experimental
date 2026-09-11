@@ -20,6 +20,13 @@
 
 #include "slg/volumes/clear.h"
 #include "slg/bsdf/bsdf.h"
+#include "slg/textures/irregulardata.h"
+
+// ML HERO state is currently implemented as global thread-local helpers in
+// glass.cpp. Keep these declarations global to match the existing definitions.
+bool GetMLHeroEnabled();
+float GetMLCurrentWaveLength();
+void MarkMLDispersionUsed();
 
 using namespace std;
 using namespace luxrays;
@@ -36,6 +43,22 @@ ClearVolume::ClearVolume(
 ) : Volume(iorTex, emiTex), sigmaA(a) {}
 
 Spectrum ClearVolume::SigmaA(const HitPoint &hitPoint) const {
+	// ML HERO: evaluate the original IrregularData spectrum at the current
+	// per-thread hero wavelength. Standard LuxCore RGB behavior stays intact
+	// for all other textures and when HERO is disabled.
+	if (::GetMLHeroEnabled()) {
+		const float waveLength = ::GetMLCurrentWaveLength();
+		if ((waveLength >= 380.f) && (waveLength <= 780.f)) {
+			const IrregularDataTexture *irregular =
+				dynamic_cast<const IrregularDataTexture *>(&GetSigmaA());
+			if (irregular) {
+				const float value = Max(0.f, irregular->GetSpectralValue(waveLength));
+				::MarkMLDispersionUsed();
+				return Spectrum(value);
+			}
+		}
+	}
+
 	return GetSigmaA().GetSpectrumValue(hitPoint).Clamp();
 }
 

@@ -812,6 +812,8 @@ void CompiledScene::CompileMaterials() {
 					mat->roughglass.cauchyBTex = scene.GetTextures().GetTextureIndex(rgm.GetCauchyB());
 				else
 					mat->roughglass.cauchyBTex = NULL_INDEX;
+				mat->roughglass.dispersionModel = static_cast<u_int>(rgm.GetDispersionModel());
+				mat->roughglass.sellmeierPreset = static_cast<u_int>(rgm.GetSellmeierPreset());
 				mat->roughglass.fineRoughGlass = rgm.IsFineRoughGlassEnabled() ? 1 : 0;
 
 				auto nuTex = rgm.GetNu();
