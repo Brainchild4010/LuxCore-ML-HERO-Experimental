@@ -21,6 +21,7 @@ With ML-HERO enabled, the wavelength remains coherent through the light path. Th
 
 Experimental LuxCoreRender branch for ML-HERO spectral rendering research.
 
+## Current Status
 This `main` branch contains active development and experimental features such as:
 
 - HERO wavelength sampling
