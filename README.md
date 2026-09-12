@@ -32,6 +32,7 @@ This `main` branch contains active development and experimental features such as
 
 The `master` branch is kept as a reference to the original LuxCore history.
 
-⚠️ Experimental project
-This branch is not intended as a drop-in replacement for the official LuxCoreRender release.
-Features may be incomplete, renderer-specific or under active development.
+> ⚠️ **Experimental project**
+>
+> This branch is not intended as a drop-in replacement for the official LuxCoreRender release.
+> Features may be incomplete, renderer-specific or under active development.
