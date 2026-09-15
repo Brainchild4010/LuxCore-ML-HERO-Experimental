@@ -2156,10 +2156,6 @@ PYBIND11_MODULE(pyluxcore, m) {
 
   m.def("Version", LuxCoreVersion, "Returns the LuxCore version");
 
-  m.def("MLVersion", []() {
-	return "LuxCore ML Dispersion CIE1";
-  }, "Returns the custom ML dispersion build version");
-
   m.def("Init", &LuxCore_Init);
   m.def("Init", &LuxCore_InitDefaultHandler);
   m.def("SetLogHandler", &LuxCore_SetLogHandler);

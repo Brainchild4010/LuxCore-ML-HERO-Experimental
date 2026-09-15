@@ -16,15 +16,43 @@
  * limitations under the License.                                          *
  ***************************************************************************/
 
+#include <algorithm>
+
 #include "slg/textures/fresnel/fresnelconst.h"
 
 using namespace std;
 using namespace luxrays;
 using namespace slg;
 
+// ML-HERO helpers are currently implemented as global functions in glass.cpp.
+// Keep these declarations global too (do not put them in namespace slg).
+bool GetMLHeroEnabled();
+float GetMLCurrentWaveLength();
+void MarkMLDispersionUsed();
+
 //------------------------------------------------------------------------------
 // Fresnel const texture
 //------------------------------------------------------------------------------
+
+float FresnelConstTexture::GetSpectralValue(const vector<float> &values, const float waveLength) const {
+	if (waveLengths.empty() || values.empty() || (waveLengths.size() != values.size()))
+		return 0.f;
+
+	if (waveLength <= waveLengths.front())
+		return values.front();
+	if (waveLength >= waveLengths.back())
+		return values.back();
+
+	const auto upper = lower_bound(waveLengths.begin(), waveLengths.end(), waveLength);
+	const size_t i1 = upper - waveLengths.begin();
+	const size_t i0 = i1 - 1;
+
+	const float wl0 = waveLengths[i0];
+	const float wl1 = waveLengths[i1];
+	const float t = (waveLength - wl0) / (wl1 - wl0);
+
+	return Lerp(t, values[i0], values[i1]);
+}
 
 float FresnelConstTexture::GetFloatValue(const HitPoint &hitPoint) const {
 	return 0.f;
@@ -43,6 +71,22 @@ float FresnelConstTexture::Filter() const {
 }
 
 Spectrum FresnelConstTexture::Evaluate(const HitPoint &hitPoint, const float cosi) const {
+	// CPU ML-HERO path: if this FresnelConstTexture originated from a spectral
+	// preset, evaluate the conductor Fresnel term at the current HERO wavelength
+	// instead of using the RGB-reduced n/k values.
+	if (::GetMLHeroEnabled() && !waveLengths.empty() &&
+			(waveLengths.size() == nSpectral.size()) &&
+			(waveLengths.size() == kSpectral.size())) {
+		const float waveLength = ::GetMLCurrentWaveLength();
+		if ((waveLength >= 380.f) && (waveLength <= 780.f)) {
+			const float eta = Max(.001f, GetSpectralValue(nSpectral, waveLength));
+			const float kk = Max(.001f, GetSpectralValue(kSpectral, waveLength));
+
+			::MarkMLDispersionUsed();
+			return GeneralEvaluate(Spectrum(eta), Spectrum(kk), cosi);
+		}
+	}
+
 	return GeneralEvaluate(n, k, cosi);
 }
 

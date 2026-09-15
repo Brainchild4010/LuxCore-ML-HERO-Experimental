@@ -26,9 +26,7 @@ using namespace slg;
 BOOST_CLASS_EXPORT_IMPLEMENT(slg::CatmullRomFilter)
 
 PropertiesUPtr CatmullRomFilter::ToProperties() const {
-    auto props = std::make_unique<Properties>();
-    *props << Filter::ToProperties();
-    return props;
+	return Filter::ToProperties();
 }
 
 //------------------------------------------------------------------------------

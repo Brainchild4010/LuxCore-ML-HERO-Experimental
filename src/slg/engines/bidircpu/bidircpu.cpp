@@ -198,7 +198,7 @@ PropertiesUPtr BiDirCPURenderEngine::GetDefaultProps() {
 		Property("path.aovs.warmup.spp")(0) <<
 		Property("path.mlhero.enable")(false) <<
 		Property("path.mlhero.samplingmode")(1) <<
-		Property("path.russianroulette.depth")(5) <<
+		Property("path.russianroulette.depth")(3) <<
 		Property("path.russianroulette.cap")(.5f) <<
 		Property("path.clamping.variance.maxvalue")(0.f) <<
 		Property("path.albedospecular.type")("REFLECT_TRANSMIT") <<

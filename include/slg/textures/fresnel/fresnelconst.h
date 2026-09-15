@@ -19,6 +19,8 @@
 #ifndef _SLG_FRESNELCONSTTEX_H
 #define	_SLG_FRESNELCONSTTEX_H
 
+#include <vector>
+
 #include "slg/textures/fresnel/fresneltexture.h"
 
 namespace slg {
@@ -30,6 +32,12 @@ namespace slg {
 class FresnelConstTexture : public FresnelTexture {
 public:
 	FresnelConstTexture(const luxrays::Spectrum &nVal, const luxrays::Spectrum &kVal) : n(nVal), k(kVal) { }
+	FresnelConstTexture(const luxrays::Spectrum &nVal, const luxrays::Spectrum &kVal,
+			const std::vector<float> &waveLengthsVal,
+			const std::vector<float> &nSpectralVal,
+			const std::vector<float> &kSpectralVal) :
+			n(nVal), k(kVal), waveLengths(waveLengthsVal),
+			nSpectral(nSpectralVal), kSpectral(kSpectralVal) { }
 	virtual ~FresnelConstTexture() { }
 
 	virtual TextureType GetType() const { return FRESNELCONST_TEX; }
@@ -46,7 +54,12 @@ public:
 	virtual luxrays::PropertiesUPtr ToProperties(const ImageMapCache &imgMapCache, const bool useRealFileName) const;
 
 private:
+	float GetSpectralValue(const std::vector<float> &values, const float waveLength) const;
+
 	const luxrays::Spectrum n, k;
+	const std::vector<float> waveLengths;
+	const std::vector<float> nSpectral;
+	const std::vector<float> kSpectral;
 };
 
 }

@@ -15,10 +15,13 @@ import shlex
 import itertools
 import re
 import sysconfig
+import logging
+import sys
+import runpy
 from pathlib import Path
 
 from .constants import PARAMS
-from .utils import logger, pack, fail, Colors, get_dep_version
+from .utils import logger, pack, fail, Colors, get_dep_version, run_module
 from .build import build_and_install
 from .config import config
 from .windows import win_recompose
@@ -86,15 +89,26 @@ def _get_lib_paths():
     paths_bin = (str(p.absolute()) for p in base.rglob("**/bin"))
     paths_lib = (str(p.absolute()) for p in base.rglob("**/lib"))
     paths = itertools.chain(paths_bin, paths_lib)
-    result = [ ["-l", Path(p)] for p in paths ]
+    result = [["-l", Path(p)] for p in paths]
     result = list(itertools.chain.from_iterable(result))
     return result
 
 
+def _check_repairwheel():
+    output = run_module("repairwheel", ["-V"])
+    logger.info("repairwheel version: %s", output)
+    version = output.split(".")
+    if version < ["0", "7", "0"]:
+        fail("repairwheel >= 0.7.0 is required")
+
+
 def make_wheel(args):
     """Build a wheel."""
-    # Set default build type to debug
-    PARAMS.DEFAULT_BUILD_TYPE = "Debug"
+    # Check repairwheel
+    _check_repairwheel()
+
+    # Set default build type to release
+    PARAMS.DEFAULT_BUILD_TYPE = "Release"
 
     # Build and install pyluxcore
     args.target = "pyluxcore"
@@ -144,17 +158,24 @@ def make_wheel(args):
         # Check Python version in extension
         extension_path = PARAMS.INSTALL_DIR / "pyluxcore"
         extensions = [
-            f.name for f in extension_path.iterdir()
-            if f.is_file() and f.name.startswith("pyluxcore")
+            f.name
+            for f in extension_path.iterdir()
+            if f.is_file()
+            and f.name.startswith("pyluxcore")
+            and f.suffix.lower() == ".pyd"
         ]
-        for extension in extensions:
-            break
+
+        if not extensions:
+            raise RuntimeError(f"No pyluxcore extension in {extension_path}")
+
+        extension = extensions[0]
+
+        ext_version = None
+        match = re.search(r"\.[^.]*?(\d+)", extension)
+        if match:
+            ext_version = match.group(1)
         else:
-            raise RuntimeError(f"No extension in {extension_path}")
-        try:
-            ext_version = re.search(r'\.[^.]*?(\d+)', extension).group(1)
-        except AttributeError:
-            logger.warn(
+            logger.warning(
                 f"{Colors.WARNING2}"
                 "Could not get version tag from extension name "
                 f"('{extension}'). "
@@ -163,16 +184,15 @@ def make_wheel(args):
                 f"{Colors.ENDC}"
             )
 
-        soabi = sysconfig.get_config_var("SOABI")
-        abi_version = re.search(r'(\d+)', soabi).group(1)
+            soabi = sysconfig.get_config_var("SOABI")
+            abi_version = re.search(r"(\d+)", soabi).group(1)
 
-        if ext_version != abi_version:
+        if (ext_version is not None) and (ext_version != abi_version):
             raise RuntimeError(
                 "Cannot build wheel: "
                 f"Extension Python version ({ext_version}) is different "
                 f"from Wheel Python version ({abi_version})."
             )
-
         # Create dist-info folder
         dist_info = wheeltree / f"pyluxcore-{version}.dist-info"
         dist_info.mkdir(exist_ok=True)
@@ -234,10 +254,8 @@ def make_wheel(args):
         wheel_lib_dir = PARAMS.INSTALL_DIR / "lib"
         logger.info("Repairing wheel")
         input_path = raw_wheel_dir / wheelname
-        cmd = [
-            sys.executable,
-            "-m",
-            "repairwheel",
+        logging.basicConfig(level=logging.DEBUG)
+        repair_args = [
             "-l",
             wheel_lib_dir,
             *_get_lib_paths(),
@@ -245,16 +263,12 @@ def make_wheel(args):
             PARAMS.WHEELHOUSE_DIR,
             input_path,
         ]
-        try:
-            result = subprocess.check_output(cmd, text=True)
-        except subprocess.CalledProcessError as err:
-            fail(err)
-        logger.info(result)
+        run_module("repairwheel", repair_args)
 
         # And, for Windows, recompose
         if platform.system() == "Windows":
             args.wheel = PARAMS.WHEELHOUSE_DIR / wheelname
-            win_recompose(args)
+            win_recompose(args)        
 
         # Finally, execute hook if exists
         if PARAMS.WHEEL_HOOK:

@@ -1336,7 +1336,7 @@ PropertiesUPtr PathTracer::GetDefaultProps() {
 			Property("path.pathdepth.diffuse")(4) <<
 			Property("path.pathdepth.glossy")(4) <<
 			Property("path.pathdepth.specular")(6) <<
-			Property("path.russianroulette.depth")(5) <<
+			Property("path.russianroulette.depth")(3) <<
 			Property("path.russianroulette.cap")(.5f) <<
 			Property("path.clamping.variance.maxvalue")(0.f) <<
 			Property("path.forceblackbackground.enable")(false) <<
