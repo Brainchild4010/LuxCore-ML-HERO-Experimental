@@ -70,20 +70,35 @@ float FresnelConstTexture::Filter() const {
 	return 0.f;
 }
 
-Spectrum FresnelConstTexture::Evaluate(const HitPoint &hitPoint, const float cosi) const {
-	// CPU ML-HERO path: if this FresnelConstTexture originated from a spectral
-	// preset, evaluate the conductor Fresnel term at the current HERO wavelength
-	// instead of using the RGB-reduced n/k values.
-	if (::GetMLHeroEnabled() && !waveLengths.empty() &&
+bool FresnelConstTexture::HasSpectralData() const {
+	return !waveLengths.empty() &&
 			(waveLengths.size() == nSpectral.size()) &&
-			(waveLengths.size() == kSpectral.size())) {
-		const float waveLength = ::GetMLCurrentWaveLength();
-		if ((waveLength >= 380.f) && (waveLength <= 780.f)) {
-			const float eta = Max(.001f, GetSpectralValue(nSpectral, waveLength));
-			const float kk = Max(.001f, GetSpectralValue(kSpectral, waveLength));
+			(waveLengths.size() == kSpectral.size());
+}
 
+bool FresnelConstTexture::GetNKAtWaveLength(const HitPoint &hitPoint, const float waveLength,
+		Spectrum *eta, Spectrum *kk) const {
+	if (!HasSpectralData() || (waveLength < 380.f) || (waveLength > 780.f))
+		return false;
+
+	const float nValue = Max(.001f, GetSpectralValue(nSpectral, waveLength));
+	const float kValue = Max(.001f, GetSpectralValue(kSpectral, waveLength));
+
+	if (eta)
+		*eta = Spectrum(nValue);
+	if (kk)
+		*kk = Spectrum(kValue);
+
+	return true;
+}
+
+Spectrum FresnelConstTexture::Evaluate(const HitPoint &hitPoint, const float cosi) const {
+	// CPU ML-HERO path: use explicit spectral n/k for the active HERO lane.
+	if (::GetMLHeroEnabled()) {
+		Spectrum eta, kk;
+		if (GetNKAtWaveLength(hitPoint, ::GetMLCurrentWaveLength(), &eta, &kk)) {
 			::MarkMLDispersionUsed();
-			return GeneralEvaluate(Spectrum(eta), Spectrum(kk), cosi);
+			return GeneralEvaluate(eta, kk, cosi);
 		}
 	}
 

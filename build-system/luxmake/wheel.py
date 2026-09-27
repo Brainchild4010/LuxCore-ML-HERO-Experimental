@@ -16,8 +16,8 @@ import itertools
 import re
 import sysconfig
 import logging
-import sys
 import runpy
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .constants import PARAMS
@@ -25,6 +25,18 @@ from .utils import logger, pack, fail, Colors, get_dep_version, run_module
 from .build import build_and_install
 from .config import config
 from .windows import win_recompose
+
+# ---------------------------------------------------------------------------
+# ML LuxCore HERO build metadata
+#
+# BUILD / PHASE / FEATURE and compile switches are read automatically from
+# src/slg/engines/bidircpu/bidircputhread.cpp.
+# ---------------------------------------------------------------------------
+
+ML_HERO_COMPILE_FLAGS = (
+    "ML_HERO_GLASS_PER_LANE_WEIGHT",
+    "ML_HERO_QUARTER_CYCLING",
+)
 
 # Following snippets are intended to wheel reconstruction
 _WHEEL_SNIPPET = """\
@@ -79,7 +91,6 @@ def _compute_platform_tag():
     if system == "Darwin" and machine == "arm64":
         return "macosx_14_2"
 
-    # Failed:
     return fail("Unknown platform/system: '%s' / '%s'", platform, machine)
 
 
@@ -102,20 +113,138 @@ def _check_repairwheel():
         fail("repairwheel >= 0.7.0 is required")
 
 
+
+def _read_ml_hero_source_metadata():
+    """Read BUILD / PHASE / FEATURE from bidircputhread.cpp."""
+    source_file = (
+        PARAMS.SOURCE_DIR
+        / "src"
+        / "slg"
+        / "engines"
+        / "bidircpu"
+        / "bidircputhread.cpp"
+    )
+
+    result = {
+        "build": "UNKNOWN",
+        "phase": "UNKNOWN",
+        "feature": "UNKNOWN",
+    }
+
+    if not source_file.is_file():
+        logger.warning("ML HERO metadata: source file not found: %s", source_file)
+        return result
+
+    try:
+        source = source_file.read_text(encoding="utf-8", errors="ignore")
+    except OSError as err:
+        logger.warning("ML HERO metadata: could not read %s: %s", source_file, err)
+        return result
+
+    define_map = {
+        "build": "ML_HERO_BUILD",
+        "phase": "ML_HERO_TEST_PHASE",
+        "feature": "ML_HERO_FEATURE",
+    }
+
+    for key, define_name in define_map.items():
+        match = re.search(
+            rf'^\s*#\s*define\s+{re.escape(define_name)}\s+"([^"]*)"',
+            source,
+            flags=re.MULTILINE,
+        )
+        if match:
+            result[key] = match.group(1)
+
+    return result
+
+
+def _read_ml_hero_compile_flags():
+    """Read selected ML HERO #define values from the current source tree."""
+    values = {name: None for name in ML_HERO_COMPILE_FLAGS}
+
+    # The current HERO A/B switches live in bidircputhread.cpp.
+    candidates = (
+        PARAMS.SOURCE_DIR / "src" / "slg" / "engines" / "bidircpu" / "bidircputhread.cpp",
+    )
+
+    for source_file in candidates:
+        if not source_file.is_file():
+            continue
+
+        try:
+            source = source_file.read_text(encoding="utf-8", errors="ignore")
+        except OSError as err:
+            logger.warning("ML HERO metadata: could not read %s: %s", source_file, err)
+            continue
+
+        for name in values:
+            match = re.search(
+                rf"^\s*#\s*define\s+{re.escape(name)}\s+([^\s/]+)",
+                source,
+                flags=re.MULTILINE,
+            )
+            if not match:
+                continue
+
+            raw_value = match.group(1).strip()
+            try:
+                values[name] = int(raw_value, 0)
+            except ValueError:
+                values[name] = raw_value
+
+    return values
+
+
+def _write_ml_hero_build_info(wheeltree, version, python_tag, platform_tag):
+    """Write ml_hero_build.json into the pyluxcore package in the wheel."""
+    package_dir = wheeltree / "pyluxcore"
+    package_dir.mkdir(parents=True, exist_ok=True)
+
+    source_metadata = _read_ml_hero_source_metadata()
+
+    build_info = {
+        "schema": 1,
+        "project": "ML LuxCore HERO",
+        "build": source_metadata["build"],
+        "phase": source_metadata["phase"],
+        "feature": source_metadata["feature"],
+        "luxcore_version": version,
+        "python_tag": python_tag,
+        "platform_tag": platform_tag,
+        "build_type": PARAMS.DEFAULT_BUILD_TYPE,
+        "build_date_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "compile_flags": _read_ml_hero_compile_flags(),
+    }
+
+    output_file = package_dir / "ml_hero_build.json"
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(build_info, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+    logger.info(
+        "ML HERO metadata: %s / %s -> %s",
+        source_metadata["build"],
+        source_metadata["phase"],
+        output_file,
+    )
+    logger.info(
+        "ML HERO compile flags: %s",
+        build_info["compile_flags"],
+    )
+
+
 def make_wheel(args):
     """Build a wheel."""
-    # Check repairwheel
     _check_repairwheel()
 
-    # Set default build type to release
+    # ML HERO test wheels are built as Release.
     PARAMS.DEFAULT_BUILD_TYPE = "Release"
 
-    # Build and install pyluxcore
     args.target = "pyluxcore"
     config(args)
     build_and_install(args)
 
-    # Disclaim
     disclaimer = (
         f"{Colors.WARNING2}"
         "This command builds a TEST wheel, "
@@ -127,13 +256,11 @@ def make_wheel(args):
     )
     logger.warning(disclaimer)
 
-    # Compute version
     build_settings_file = Path("build-system", "build-settings.json")
     with open(build_settings_file, encoding="utf-8") as in_file:
         default_version = json.load(in_file)["DefaultVersion"]
     version = ".".join(default_version[i] for i in ("major", "minor", "patch"))
 
-    # Compute tag
     vinfo = sys.version_info
     python_tag = f"cp{vinfo.major}{vinfo.minor}"
     abi_tag = python_tag
@@ -145,17 +272,11 @@ def make_wheel(args):
         tempfile.TemporaryDirectory() as wheeltree,
         tempfile.TemporaryDirectory() as raw_wheel,
     ):
-        # We create an install tree, with all the wheel components, then we
-        # pack it into a raw wheel and eventually we repair it.
-        #
-        # Additionnally, on Windows, we recompose the wheel (restablishing
-        # oidnDenoise.exe and OpenImageDenoise_device_cpu.dll)
-
-        # Set destination folders
         wheeltree = Path(wheeltree)
         raw_wheel_dir = Path(raw_wheel)
 
-        # Check Python version in extension
+        # Check Python version in extension. Ignore unrelated files and only
+        # inspect the actual pyluxcore .pyd.
         extension_path = PARAMS.INSTALL_DIR / "pyluxcore"
         extensions = [
             f.name
@@ -184,24 +305,27 @@ def make_wheel(args):
                 f"{Colors.ENDC}"
             )
 
-            soabi = sysconfig.get_config_var("SOABI")
-            abi_version = re.search(r"(\d+)", soabi).group(1)
+        soabi = sysconfig.get_config_var("SOABI")
+        abi_match = re.search(r"(\d+)", soabi or "")
+        abi_version = abi_match.group(1) if abi_match else None
 
-        if (ext_version is not None) and (ext_version != abi_version):
+        if (
+            ext_version is not None
+            and abi_version is not None
+            and ext_version != abi_version
+        ):
             raise RuntimeError(
                 "Cannot build wheel: "
                 f"Extension Python version ({ext_version}) is different "
                 f"from Wheel Python version ({abi_version})."
             )
-        # Create dist-info folder
+
         dist_info = wheeltree / f"pyluxcore-{version}.dist-info"
         dist_info.mkdir(exist_ok=True)
 
-        # Export WHEEL file
         with open(dist_info / "WHEEL", "w", encoding="utf-8") as f:
             f.write(_WHEEL_SNIPPET.format(tag))
 
-        # Export METADATA file
         with open(dist_info / "METADATA", "w", encoding="utf-8") as f:
             nvrtc_version = get_dep_version("nvrtc")
             logger.info("NVRTC version: %s", nvrtc_version)
@@ -211,14 +335,11 @@ def make_wheel(args):
                 if major <= 12
                 else f"nvidia-cuda-nvrtc=={nvrtc_version}"
             )
-
             f.write(_METADATA_SNIPPET.format(version, requirement))
 
-        # Export entry_points.txt file
         with open(dist_info / "entry_points.txt", "w", encoding="utf-8") as f:
             f.write(_ENTRYPOINTS_SNIPPET)
 
-        # Copy subfolders into tree
         shutil.copytree(
             PARAMS.SOURCE_DIR / "python" / "pyluxcore",
             wheeltree / "pyluxcore",
@@ -245,12 +366,19 @@ def make_wheel(args):
             dirs_exist_ok=True,
         )
 
-        # Pack wheel
+        # ML HERO: generate build provenance after all pyluxcore files have
+        # been copied, so the JSON is guaranteed to be part of the wheel.
+        _write_ml_hero_build_info(
+            wheeltree,
+            version,
+            python_tag,
+            platform_tag,
+        )
+
         logger.info("Packing wheel")
         pack(wheeltree, raw_wheel)
         wheelname = f"pyluxcore-{version}-{tag}.whl"
 
-        # Then repair
         wheel_lib_dir = PARAMS.INSTALL_DIR / "lib"
         logger.info("Repairing wheel")
         input_path = raw_wheel_dir / wheelname
@@ -265,12 +393,10 @@ def make_wheel(args):
         ]
         run_module("repairwheel", repair_args)
 
-        # And, for Windows, recompose
         if platform.system() == "Windows":
             args.wheel = PARAMS.WHEELHOUSE_DIR / wheelname
-            win_recompose(args)        
+            win_recompose(args)
 
-        # Finally, execute hook if exists
         if PARAMS.WHEEL_HOOK:
             logger.info("Executing hook: %s", PARAMS.WHEEL_HOOK)
             try:

@@ -40,6 +40,50 @@ typedef struct {
 	BSDF bsdf;
 	BSDFEvent bsdfEvent;
 	luxrays::Spectrum throughput;
+
+	// ML-HERO phase 6: diagnostic per-wavelength path throughput. These lanes
+	// are propagated alongside the classic RGB throughput but are not yet used
+	// by radiance accumulation or MIS.
+	u_int mlHeroLaneCount;
+	luxrays::Spectrum mlHeroLaneThroughput[8];
+
+	// ML HERO phase 15l: wavelength packet metadata belongs to the vertex.
+	// This makes a stored eye/light vertex self-contained and prevents later
+	// ConnectVertices evaluation from depending on mutable thread-local state.
+	float mlHeroLaneWaveLength[8];
+	float mlHeroLaneSampleWeight[8];
+
+	// ML HERO phase 15bh: explicit wavelength-PDF state for future
+	// TerminateSecondary-style dispersive paths. Diagnostic-only in 15bh.
+	float mlHeroLaneWaveLengthPdf[8];
+	bool mlHeroSecondaryWavelengthsTerminated;
+	u_int mlHeroActiveWavelengthCount;
+
+	// ML HERO phase 15bp: surviving-HERO scalar / packet-average ratio captured
+	// at the first HERO-only dispersive termination. Diagnostic only.
+	float mlHeroTerminationBrightnessRatio;
+
+	// ML HERO phase 15bt: first-termination sampling/reconstruction metadata.
+	// Diagnostic only; these values are never consumed by the renderer estimator.
+	float mlHeroTerminationHeroLambda;
+	float mlHeroTerminationPacketAverage;
+	float mlHeroTerminationHeroScalar;
+	float mlHeroTerminationLaneSelectionPdf;
+	float mlHeroTerminationWavelengthPdf;
+	float mlHeroTerminationCurrentScale;
+	double mlHero15buReferenceThroughput;
+
+	// ML HERO phase 15bn: diagnostic-only spectral path-probability state.
+	// event product ignores perfect-specular directional support; support product
+	// zeros a lane when the sampled HERO direction is impossible at that wavelength.
+	double mlHeroLaneGlassEventPdfProduct[8];
+	double mlHeroLaneDiracSupportPdfProduct[8];
+
+	// ML-HERO phase 7 diagnostic: mark one path so the same lane state can
+	// be observed over several consecutive BIDIR bounces.
+	bool mlHeroDebugTracked;
+	u_int mlHeroDebugLoggedBounces;
+
 	u_int lightID, depth;
 
 	// Check Iliyan Georgiev's latest technical report for the details of how
@@ -157,6 +201,27 @@ public:
 	
 	// ML HERO wavelength sampling: 1=Linear, 2=CIE Weighted, 3=Sensor Weighted
 	int mlHeroSamplingMode;
+	// Number of HERO wavelengths evaluated per path (reserved for multi-wavelength mode)
+	int mlHeroWavelengthCount;
+	// Dispersive Glass transport: 0=current HERO, 1=HERO-only, 2=experimental lane-PDF
+	int mlHeroGlassMode;
+	// Runtime replacement for the former ML_HERO_GLASS_PER_LANE_WEIGHT compile switch
+	bool mlHeroGlassPerLaneWeight;
+	// Runtime replacement for the former ML_HERO_QUARTER_CYCLING compile switch
+	bool mlHeroQuarterCycling;
+	// Experimental BIDIR A/B compensation for doubly HERO-only ConnectVertices.
+	bool mlHeroDualTerminationCompensation;
+	// Experimental Matte spectral basis compensation A/B switch (HERO_76 / phase15cj).
+	bool mlHeroMatteBasisCompensation;
+	// Generic non-specular chromatic HERO reflectance basis compensation (HERO_81 / phase15co).
+	bool mlHeroGenericReflectanceCompensation;
+	// Glossy2 Kd-only spectral basis compensation, consolidated in HERO_83 / phase15cq.
+	bool mlHeroGlossy2BasisCompensation;
+	// ML HERO diagnostics runtime controls. Master OFF removes diagnostic logging/counters from normal renders.
+	bool mlHeroDiagnostics;
+	bool mlHeroCurrentDiagnostics;
+	bool mlHeroLegacyDiagnostics;
+	bool mlHeroHeavyDiagnostics;
 // Clamping settings
 	float sqrtVarianceClampMaxValue;
 

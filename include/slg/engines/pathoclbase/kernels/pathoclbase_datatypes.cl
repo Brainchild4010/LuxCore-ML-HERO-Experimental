@@ -69,6 +69,7 @@ typedef struct {
 	// ML HERO global spectral mode (0 = LuxCore Standard, 1 = ML HERO)
 	int mlHeroEnabled;
 	int mlHeroSamplingMode;
+	int mlHeroWavelengthCount;
 	Filter pixelFilter;
 	Film film;
 } GPUTaskConfiguration;

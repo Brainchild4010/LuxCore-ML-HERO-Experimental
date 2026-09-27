@@ -69,6 +69,18 @@ void BiDirCPURenderEngine::StartLockLess() {
 	mlHeroEnabled = cfg.Get(GetDefaultProps()->Get("path.mlhero.enable")).Get<bool>();
 
 	mlHeroSamplingMode = Clamp(cfg.Get(GetDefaultProps()->Get("path.mlhero.samplingmode")).Get<int>(), 1, 3);
+	mlHeroWavelengthCount = Clamp(cfg.Get(GetDefaultProps()->Get("path.mlhero.wavelengthcount")).Get<int>(), 1, 8);
+	mlHeroGlassMode = Clamp(cfg.Get(GetDefaultProps()->Get("path.mlhero.glassmode")).Get<int>(), 0, 2);
+	mlHeroGlassPerLaneWeight = cfg.Get(GetDefaultProps()->Get("path.mlhero.glassperlaneweight")).Get<bool>();
+	mlHeroQuarterCycling = cfg.Get(GetDefaultProps()->Get("path.mlhero.quartercycling")).Get<bool>();
+	mlHeroDualTerminationCompensation = cfg.Get(GetDefaultProps()->Get("path.mlhero.dualterminationcompensation")).Get<bool>();
+	mlHeroMatteBasisCompensation = cfg.Get(GetDefaultProps()->Get("path.mlhero.mattebasiscompensation")).Get<bool>();
+	mlHeroGenericReflectanceCompensation = cfg.Get(GetDefaultProps()->Get("path.mlhero.genericreflectancecompensation")).Get<bool>();
+	mlHeroGlossy2BasisCompensation = cfg.Get(GetDefaultProps()->Get("path.mlhero.glossy2basiscompensation")).Get<bool>();
+	mlHeroDiagnostics = cfg.Get(GetDefaultProps()->Get("path.mlhero.diagnostics")).Get<bool>();
+	mlHeroCurrentDiagnostics = cfg.Get(GetDefaultProps()->Get("path.mlhero.currentdiagnostics")).Get<bool>();
+	mlHeroLegacyDiagnostics = cfg.Get(GetDefaultProps()->Get("path.mlhero.legacydiagnostics")).Get<bool>();
+	mlHeroHeavyDiagnostics = cfg.Get(GetDefaultProps()->Get("path.mlhero.heavydiagnostics")).Get<bool>();
 	rrDepth = (u_int)Max(1, cfg.Get(GetDefaultProps()->Get("path.russianroulette.depth")).Get<int>());
 	rrImportanceCap = Clamp(cfg.Get(GetDefaultProps()->Get("path.russianroulette.cap")).Get<double>(), 0.0, 1.0);
 
@@ -173,6 +185,19 @@ PropertiesUPtr BiDirCPURenderEngine::ToProperties(const Properties &cfg) {
 			cfg.Get(GetDefaultProps()->Get("light.maxdepth")) <<
 			cfg.Get(GetDefaultProps()->Get("path.aovs.warmup.spp")) <<
 			cfg.Get(GetDefaultProps()->Get("path.mlhero.enable")) <<
+			cfg.Get(GetDefaultProps()->Get("path.mlhero.samplingmode")) <<
+			cfg.Get(GetDefaultProps()->Get("path.mlhero.wavelengthcount")) <<
+			cfg.Get(GetDefaultProps()->Get("path.mlhero.glassmode")) <<
+			cfg.Get(GetDefaultProps()->Get("path.mlhero.glassperlaneweight")) <<
+			cfg.Get(GetDefaultProps()->Get("path.mlhero.quartercycling")) <<
+			cfg.Get(GetDefaultProps()->Get("path.mlhero.dualterminationcompensation")) <<
+			cfg.Get(GetDefaultProps()->Get("path.mlhero.mattebasiscompensation")) <<
+			cfg.Get(GetDefaultProps()->Get("path.mlhero.genericreflectancecompensation")) <<
+			cfg.Get(GetDefaultProps()->Get("path.mlhero.glossy2basiscompensation")) <<
+			cfg.Get(GetDefaultProps()->Get("path.mlhero.diagnostics")) <<
+			cfg.Get(GetDefaultProps()->Get("path.mlhero.currentdiagnostics")) <<
+			cfg.Get(GetDefaultProps()->Get("path.mlhero.legacydiagnostics")) <<
+			cfg.Get(GetDefaultProps()->Get("path.mlhero.heavydiagnostics")) <<
 			cfg.Get(GetDefaultProps()->Get("path.russianroulette.depth")) <<
 			cfg.Get(GetDefaultProps()->Get("path.russianroulette.cap")) <<
 			cfg.Get(GetDefaultProps()->Get("path.clamping.variance.maxvalue")) <<
@@ -198,6 +223,18 @@ PropertiesUPtr BiDirCPURenderEngine::GetDefaultProps() {
 		Property("path.aovs.warmup.spp")(0) <<
 		Property("path.mlhero.enable")(false) <<
 		Property("path.mlhero.samplingmode")(1) <<
+		Property("path.mlhero.wavelengthcount")(1) <<
+		Property("path.mlhero.glassmode")(0) <<
+		Property("path.mlhero.glassperlaneweight")(true) <<
+		Property("path.mlhero.quartercycling")(true) <<
+		Property("path.mlhero.dualterminationcompensation")(false) <<
+		Property("path.mlhero.mattebasiscompensation")(false) <<
+		Property("path.mlhero.genericreflectancecompensation")(true) <<
+		Property("path.mlhero.glossy2basiscompensation")(true) <<
+		Property("path.mlhero.diagnostics")(false) <<
+		Property("path.mlhero.currentdiagnostics")(true) <<
+		Property("path.mlhero.legacydiagnostics")(false) <<
+		Property("path.mlhero.heavydiagnostics")(false) <<
 		Property("path.russianroulette.depth")(3) <<
 		Property("path.russianroulette.cap")(.5f) <<
 		Property("path.clamping.variance.maxvalue")(0.f) <<

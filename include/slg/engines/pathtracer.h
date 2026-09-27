@@ -172,6 +172,8 @@ public:
 	bool mlHeroEnabled;
 	// 1 = uniform GOLDSTAND, 2 = Sampling 2.0 O1
 	int mlHeroSamplingMode;
+	// Number of HERO wavelengths evaluated per path (reserved for multi-wavelength mode)
+	int mlHeroWavelengthCount;
 
 	// Clamping settings
 	float sqrtVarianceClampMaxValue;

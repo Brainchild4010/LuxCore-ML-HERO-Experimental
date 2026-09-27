@@ -47,6 +47,10 @@ public:
 	virtual float Filter() const;
 
 	virtual luxrays::Spectrum Evaluate(const HitPoint &hitPoint, const float cosi) const;
+	virtual bool GetNKAtWaveLength(const HitPoint &hitPoint, const float waveLength,
+			luxrays::Spectrum *eta, luxrays::Spectrum *kk) const;
+
+	bool HasSpectralData() const;
 
 	const luxrays::Spectrum GetN() const { return n; };
 	const luxrays::Spectrum GetK() const { return k; };

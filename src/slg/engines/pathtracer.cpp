@@ -150,7 +150,7 @@ const Film::FilmChannels PathTracer::lightSampleResultsChannels({
 }); 
 
 PathTracer::PathTracer() : pixelFilterDistribution(nullptr),
-		photonGICache(nullptr), mlHeroEnabled(false), mlHeroSamplingMode(1) {
+		photonGICache(nullptr), mlHeroEnabled(false), mlHeroSamplingMode(1), mlHeroWavelengthCount(1) {
 }
 
 PathTracer::~PathTracer() {
@@ -1238,6 +1238,7 @@ void PathTracer::ParseOptions(
 	// ML HERO global spectral mode
 	mlHeroEnabled = cfg.Get(defaultProps.Get("path.mlhero.enable")).Get<bool>();
 	mlHeroSamplingMode = Clamp(cfg.Get(defaultProps.Get("path.mlhero.samplingmode")).Get<int>(), 1, 3);
+	mlHeroWavelengthCount = Clamp(cfg.Get(defaultProps.Get("path.mlhero.wavelengthcount")).Get<int>(), 1, 8);
 
 	// Russian Roulette settings
 	rrDepth = (u_int)Max(1, cfg.Get(defaultProps.Get("path.russianroulette.depth")).Get<int>());
@@ -1310,6 +1311,7 @@ PropertiesUPtr PathTracer::ToProperties(const Properties &cfg) {
 	props <<
 			cfg.Get(GetDefaultProps()->Get("path.mlhero.enable")) <<
 			cfg.Get(GetDefaultProps()->Get("path.mlhero.samplingmode")) <<
+			cfg.Get(GetDefaultProps()->Get("path.mlhero.wavelengthcount")) <<
 			cfg.Get(GetDefaultProps()->Get("path.hybridbackforward.enable")) <<
 			cfg.Get(GetDefaultProps()->Get("path.hybridbackforward.partition")) <<
 			cfg.Get(GetDefaultProps()->Get("path.hybridbackforward.glossinessthreshold")) <<
@@ -1329,6 +1331,7 @@ PropertiesUPtr PathTracer::GetDefaultProps() {
 	*props <<
 			Property("path.mlhero.enable")(false) <<
 			Property("path.mlhero.samplingmode")(1) <<
+			Property("path.mlhero.wavelengthcount")(1) <<
 			Property("path.hybridbackforward.enable")(false) <<
 			Property("path.hybridbackforward.partition")(0.8) <<
 			Property("path.hybridbackforward.glossinessthreshold")(.05f) <<

@@ -21,6 +21,9 @@
 #include "slg/materials/glass.h"
 #include <memory>
 
+#include "slg/materials/metal2.h"
+#include "slg/materials/glossy2.h"
+
 using namespace luxrays;
 using namespace slg;
 using namespace std;
@@ -394,6 +397,215 @@ Spectrum BSDF::Sample(Vector *sampledDir,
 	}
 
 	return result;
+}
+
+bool BSDF::EvaluateMLHeroMetal2SampleAtWaveLength(const Vector &sampledDir,
+		const float waveLength, Spectrum *sampleMultiplier) const {
+	if (!sampleMultiplier || !material || (material->GetType() != METAL2))
+		return false;
+
+	const Metal2Material &metal2 = static_cast<const Metal2Material &>(*material);
+
+	const Vector localFixedDir = frame.ToLocal(hitPoint.fixedDir);
+	const Vector localSampledDir = frame.ToLocal(sampledDir);
+	Spectrum result;
+	if (!metal2.EvaluateSampleAtWaveLength(hitPoint, localFixedDir, localSampledDir,
+			waveLength, &result))
+		return false;
+
+	// Match the post-processing performed by BSDF::Sample() exactly.
+	if ((REFLECT & (GLOSSY | REFLECT)) &&
+			(hitPoint.shadeN != hitPoint.interpolatedN)) {
+		const Vector &lightDir = hitPoint.fromLight ? hitPoint.fixedDir : sampledDir;
+		result *= ShadowTerminatorAvoidanceFactor(hitPoint.GetLandingInterpolatedN(),
+				hitPoint.GetLandingShadeN(), lightDir);
+	}
+
+	if (hitPoint.fromLight) {
+		const float absDotFixedDirNG = AbsDot(hitPoint.fixedDir, hitPoint.geometryN);
+		const float absDotSampledDirNG = AbsDot(sampledDir, hitPoint.geometryN);
+		result *= (absDotSampledDirNG / absDotFixedDirNG);
+	}
+
+	*sampleMultiplier = result;
+	return true;
+}
+
+bool BSDF::EvaluateMLHeroMetal2AtWaveLength(const Vector &generatedDir,
+		const float waveLength, Spectrum *value) const {
+	if (!value || !material || (material->GetType() != METAL2))
+		return false;
+
+	const Vector &eyeDir = hitPoint.fromLight ? generatedDir : hitPoint.fixedDir;
+	const Vector &lightDir = hitPoint.fromLight ? hitPoint.fixedDir : generatedDir;
+
+	const float dotLightDirNG = Dot(lightDir, hitPoint.geometryN);
+	const float absDotLightDirNG = fabsf(dotLightDirNG);
+	const float dotEyeDirNG = Dot(eyeDir, hitPoint.geometryN);
+	const float absDotEyeDirNG = fabsf(dotEyeDirNG);
+	if ((absDotLightDirNG < DEFAULT_COS_EPSILON_STATIC) ||
+			(absDotEyeDirNG < DEFAULT_COS_EPSILON_STATIC))
+		return false;
+	if (dotEyeDirNG * dotLightDirNG <= 0.f)
+		return false;
+	if (Dot(eyeDir, hitPoint.interpolatedN) * Dot(lightDir, hitPoint.interpolatedN) <= 0.f)
+		return false;
+
+	const Metal2Material &metal2 = static_cast<const Metal2Material &>(*material);
+	const Vector localLightDir = frame.ToLocal(lightDir);
+	const Vector localEyeDir = frame.ToLocal(eyeDir);
+	Spectrum result;
+	if (!metal2.EvaluateAtWaveLength(hitPoint, localLightDir, localEyeDir, waveLength, &result))
+		return false;
+
+	if ((hitPoint.shadeN != hitPoint.interpolatedN))
+		result *= ShadowTerminatorAvoidanceFactor(hitPoint.GetLandingInterpolatedN(),
+				hitPoint.GetLandingShadeN(), lightDir);
+
+	if (hitPoint.fromLight)
+		result *= (absDotEyeDirNG / absDotLightDirNG);
+
+	*value = result;
+	return true;
+}
+
+bool BSDF::EvaluateMLHeroMetal2DebugAtWaveLength(const Vector &generatedDir,
+		const float waveLength,
+		Spectrum *eta, Spectrum *kk, Spectrum *fresnel,
+		float *microfacetFactor, float *wrapperFactor, float *cosWH,
+		Spectrum *value) const {
+	if (!eta || !kk || !fresnel || !microfacetFactor ||
+			!wrapperFactor || !cosWH || !value ||
+			!material || (material->GetType() != METAL2))
+		return false;
+
+	const Vector &eyeDir = hitPoint.fromLight ? generatedDir : hitPoint.fixedDir;
+	const Vector &lightDir = hitPoint.fromLight ? hitPoint.fixedDir : generatedDir;
+
+	const float dotLightDirNG = Dot(lightDir, hitPoint.geometryN);
+	const float absDotLightDirNG = fabsf(dotLightDirNG);
+	const float dotEyeDirNG = Dot(eyeDir, hitPoint.geometryN);
+	const float absDotEyeDirNG = fabsf(dotEyeDirNG);
+	if ((absDotLightDirNG < DEFAULT_COS_EPSILON_STATIC) ||
+			(absDotEyeDirNG < DEFAULT_COS_EPSILON_STATIC))
+		return false;
+	if (dotEyeDirNG * dotLightDirNG <= 0.f)
+		return false;
+	if (Dot(eyeDir, hitPoint.interpolatedN) *
+			Dot(lightDir, hitPoint.interpolatedN) <= 0.f)
+		return false;
+
+	const Metal2Material &metal2 = static_cast<const Metal2Material &>(*material);
+	const Vector localLightDir = frame.ToLocal(lightDir);
+	const Vector localEyeDir = frame.ToLocal(eyeDir);
+
+	Spectrum result;
+	if (!metal2.EvaluateAtWaveLengthDebug(hitPoint,
+			localLightDir, localEyeDir, waveLength,
+			eta, kk, fresnel, microfacetFactor, cosWH, &result))
+		return false;
+
+	float correction = 1.f;
+
+	if ((hitPoint.shadeN != hitPoint.interpolatedN)) {
+		const float shadowFactor = ShadowTerminatorAvoidanceFactor(
+				hitPoint.GetLandingInterpolatedN(),
+				hitPoint.GetLandingShadeN(), lightDir);
+		result *= shadowFactor;
+		correction *= shadowFactor;
+	}
+
+	if (hitPoint.fromLight) {
+		const float lightTransportFactor = absDotEyeDirNG / absDotLightDirNG;
+		result *= lightTransportFactor;
+		correction *= lightTransportFactor;
+	}
+
+	*wrapperFactor = correction;
+	*value = result;
+	return true;
+}
+
+
+
+bool BSDF::EvaluateMLHeroGlassDebugAtWaveLength(const Vector &sampledDir,
+		const BSDFEvent sampledEvent, const float samplePdfW,
+		const float waveLength,
+		float *exteriorIOR, float *interiorIORBase, float *interiorIORLambda,
+		float *fresnelR, float *eta, float *eta2, float *transportFactor,
+		float *directionDelta, Spectrum *sampleMultiplier,
+		float *cosFixedOut, float *sinI2Out, float *sinT2Out, bool *tirOut,
+		float *laneEventPdfWOut) const {
+	if (!material || (material->GetType() != GLASS))
+		return false;
+
+	const GlassMaterial &glass = static_cast<const GlassMaterial &>(*material);
+	const Vector localFixedDir = frame.ToLocal(hitPoint.fixedDir);
+	const Vector localSampledDir = frame.ToLocal(sampledDir);
+	return glass.EvaluateMLHeroDebugAtWaveLength(hitPoint,
+			localFixedDir, localSampledDir, sampledEvent, samplePdfW, waveLength,
+			exteriorIOR, interiorIORBase, interiorIORLambda,
+			fresnelR, eta, eta2, transportFactor, directionDelta, sampleMultiplier,
+			cosFixedOut, sinI2Out, sinT2Out, tirOut, laneEventPdfWOut);
+}
+
+bool BSDF::EvaluateMLHeroGlossy2DebugSampleComponents(
+		const Vector &sampledDir, const float pdfW,
+		Spectrum *kdValue, Spectrum *ksValue,
+		Spectrum *schlickS, Spectrum *absorptionValue,
+		Spectrum *baseContribution, Spectrum *coatingContribution,
+		float *wrapperFactor, Spectrum *combinedResult) const {
+	if (!kdValue || !ksValue || !schlickS || !absorptionValue ||
+			!baseContribution || !coatingContribution ||
+			!wrapperFactor || !combinedResult ||
+			!material || (material->GetType() != GLOSSY2))
+		return false;
+
+	const Glossy2Material &glossy2 =
+		static_cast<const Glossy2Material &>(*material);
+
+	const Vector localFixedDir = frame.ToLocal(hitPoint.fixedDir);
+	const Vector localSampledDir = frame.ToLocal(sampledDir);
+
+	Spectrum base, coating, combined;
+	if (!glossy2.EvaluateMLHeroDebugSampleComponents(
+			hitPoint, localFixedDir, localSampledDir, pdfW,
+			kdValue, ksValue, schlickS, absorptionValue,
+			&base, &coating, &combined))
+		return false;
+
+	float correction = 1.f;
+
+	if ((hitPoint.shadeN != hitPoint.interpolatedN)) {
+		const Vector &lightDir = hitPoint.fromLight ? hitPoint.fixedDir : sampledDir;
+		const float shadowFactor = ShadowTerminatorAvoidanceFactor(
+			hitPoint.GetLandingInterpolatedN(),
+			hitPoint.GetLandingShadeN(), lightDir);
+		base *= shadowFactor;
+		coating *= shadowFactor;
+		combined *= shadowFactor;
+		correction *= shadowFactor;
+	}
+
+	if (hitPoint.fromLight) {
+		const float absDotFixedDirNG =
+			AbsDot(hitPoint.fixedDir, hitPoint.geometryN);
+		const float absDotSampledDirNG =
+			AbsDot(sampledDir, hitPoint.geometryN);
+		const float adjointFactor =
+			absDotSampledDirNG / absDotFixedDirNG;
+		base *= adjointFactor;
+		coating *= adjointFactor;
+		combined *= adjointFactor;
+		correction *= adjointFactor;
+	}
+
+	*baseContribution = base;
+	*coatingContribution = coating;
+	*combinedResult = combined;
+	*wrapperFactor = correction;
+
+	return true;
 }
 
 void BSDF::Pdf(const Vector &sampledDir, float *directPdfW, float *reversePdfW) const {

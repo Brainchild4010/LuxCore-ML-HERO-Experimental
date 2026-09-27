@@ -155,6 +155,44 @@ public:
 		const float u0, const float u1,
 		float *pdfW, float *absCosSampledDir,
 		BSDFEvent *event) const;
+
+	// ML-HERO phase 6 diagnostic path: evaluate the already sampled Metal2
+	// bounce at an explicit wavelength. Returns false for non-Metal2 materials
+	// or Metal2 materials without measured Fresnel n/k data.
+	bool EvaluateMLHeroMetal2SampleAtWaveLength(const luxrays::Vector &sampledDir,
+			const float waveLength, luxrays::Spectrum *sampleMultiplier) const;
+	bool EvaluateMLHeroMetal2AtWaveLength(const luxrays::Vector &generatedDir,
+			const float waveLength, luxrays::Spectrum *value) const;
+
+	// ML HERO phase 15n diagnostic: exact factor breakdown for a Metal2 endpoint.
+	bool EvaluateMLHeroMetal2DebugAtWaveLength(const luxrays::Vector &generatedDir,
+			const float waveLength,
+			luxrays::Spectrum *eta, luxrays::Spectrum *kk,
+			luxrays::Spectrum *fresnel, float *microfacetFactor,
+			float *wrapperFactor, float *cosWH,
+			luxrays::Spectrum *value) const;
+
+	// ML HERO phase 15au diagnostic: wavelength-specific GLASS breakdown for
+	// the already selected specular bounce. Diagnostic only.
+	bool EvaluateMLHeroGlassDebugAtWaveLength(const luxrays::Vector &sampledDir,
+			const BSDFEvent sampledEvent, const float samplePdfW,
+			const float waveLength,
+			float *exteriorIOR, float *interiorIORBase, float *interiorIORLambda,
+			float *fresnelR, float *eta, float *eta2, float *transportFactor,
+			float *directionDelta, luxrays::Spectrum *sampleMultiplier,
+			float *cosFixedOut = nullptr, float *sinI2Out = nullptr,
+			float *sinT2Out = nullptr, bool *tirOut = nullptr,
+			float *laneEventPdfWOut = nullptr) const;
+
+	// ML HERO phase 15ac diagnostic: exact RGB component split for Glossy2
+	// using the already sampled bounce direction and mixture PDF.
+	bool EvaluateMLHeroGlossy2DebugSampleComponents(
+			const luxrays::Vector &sampledDir, const float pdfW,
+			luxrays::Spectrum *kdValue, luxrays::Spectrum *ksValue,
+			luxrays::Spectrum *schlickS, luxrays::Spectrum *absorptionValue,
+			luxrays::Spectrum *baseContribution, luxrays::Spectrum *coatingContribution,
+			float *wrapperFactor, luxrays::Spectrum *combinedResult) const;
+
 	luxrays::Spectrum ShadowCatcherSample(Vector *sampledDir,
 		float *pdfW, float *absCosSampledDir, BSDFEvent *event) const;
 	void Pdf(const luxrays::Vector &sampledDir, float *directPdfW, float *reversePdfW) const;

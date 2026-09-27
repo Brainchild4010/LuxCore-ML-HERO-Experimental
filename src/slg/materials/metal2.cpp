@@ -18,6 +18,18 @@
 
 #include "slg/materials/metal2.h"
 
+#include <atomic>
+#include <cstdio>
+
+// ML HERO shared spectral packet state (implemented in glass.cpp).
+bool GetMLHeroEnabled();
+u_int GetMLHeroWavelengthCount();
+float GetMLHeroWaveLengthAt(const u_int lane);
+float GetMLHeroSampleWeightAt(const u_int lane);
+
+namespace {
+}
+
 using namespace std;
 using namespace luxrays;
 using namespace slg;
@@ -65,6 +77,132 @@ Metal2Material::Metal2Material(
 	nv(v)
 {
 	glossiness = ComputeGlossiness(nu, nv);
+}
+
+bool Metal2Material::EvaluateFresnelAtWaveLength(const HitPoint &hitPoint, const float cosi,
+		const float waveLength, Spectrum *fresnel) const {
+	if (!fresnelTex || !fresnel)
+		return false;
+
+	Spectrum eta, kk;
+	if (!fresnelTex->GetNKAtWaveLength(hitPoint, waveLength, &eta, &kk))
+		return false;
+
+	*fresnel = FresnelTexture::GeneralEvaluate(eta, kk, cosi);
+	fresnel->Clamp(0.f, 1.f);
+	return true;
+}
+
+bool Metal2Material::EvaluateAtWaveLength(const HitPoint &hitPoint,
+		const Vector &localLightDir, const Vector &localEyeDir,
+		const float waveLength, Spectrum *value) const {
+	if (!fresnelTex || !value)
+		return false;
+
+	const float u = Clamp(nu->GetFloatValue(hitPoint), 1e-9f, 1.f);
+	const float v = Clamp(nv->GetFloatValue(hitPoint), 1e-9f, 1.f);
+	const float u2 = u * u;
+	const float v2 = v * v;
+	const float anisotropy = (u2 < v2) ? (1.f - u2 / v2) : u2 > 0.f ? (v2 / u2 - 1.f) : 0.f;
+	const float roughness = u * v;
+
+	const Vector wh(Normalize(localLightDir + localEyeDir));
+	const float cosWH = Dot(localLightDir, wh);
+	if (fabsf(cosWH) < DEFAULT_COS_EPSILON_STATIC)
+		return false;
+
+	Spectrum F;
+	if (!EvaluateFresnelAtWaveLength(hitPoint, cosWH, waveLength, &F))
+		return false;
+
+	const float G = SchlickDistribution_G(roughness, localLightDir, localEyeDir);
+	*value = (SchlickDistribution_D(roughness, wh, anisotropy) * G /
+			(4.f * fabsf(localEyeDir.z))) * F;
+	return true;
+}
+
+bool Metal2Material::EvaluateAtWaveLengthDebug(const HitPoint &hitPoint,
+		const Vector &localLightDir, const Vector &localEyeDir,
+		const float waveLength,
+		Spectrum *eta, Spectrum *kk, Spectrum *fresnel,
+		float *microfacetFactor, float *cosWHOut, Spectrum *value) const {
+	if (!fresnelTex || !eta || !kk || !fresnel ||
+			!microfacetFactor || !cosWHOut || !value)
+		return false;
+
+	const float u = Clamp(nu->GetFloatValue(hitPoint), 1e-9f, 1.f);
+	const float v = Clamp(nv->GetFloatValue(hitPoint), 1e-9f, 1.f);
+	const float u2 = u * u;
+	const float v2 = v * v;
+	const float anisotropy = (u2 < v2) ? (1.f - u2 / v2) :
+		u2 > 0.f ? (v2 / u2 - 1.f) : 0.f;
+	const float roughness = u * v;
+
+	const Vector wh(Normalize(localLightDir + localEyeDir));
+	const float cosWH = Dot(localLightDir, wh);
+	if (fabsf(cosWH) < DEFAULT_COS_EPSILON_STATIC)
+		return false;
+
+	if (!fresnelTex->GetNKAtWaveLength(hitPoint, waveLength, eta, kk))
+		return false;
+
+	*fresnel = FresnelTexture::GeneralEvaluate(*eta, *kk, cosWH);
+	fresnel->Clamp(0.f, 1.f);
+
+	const float G = SchlickDistribution_G(roughness, localLightDir, localEyeDir);
+	const float factor = SchlickDistribution_D(roughness, wh, anisotropy) * G /
+		(4.f * fabsf(localEyeDir.z));
+
+	*microfacetFactor = factor;
+	*cosWHOut = cosWH;
+	*value = factor * (*fresnel);
+	return true;
+}
+
+bool Metal2Material::EvaluateSampleAtWaveLength(const HitPoint &hitPoint,
+		const Vector &localFixedDir, const Vector &localSampledDir,
+		const float waveLength, Spectrum *sampleMultiplier) const {
+	if (!fresnelTex || !sampleMultiplier)
+		return false;
+
+	if (fabsf(localFixedDir.z) < DEFAULT_COS_EPSILON_STATIC)
+		return false;
+
+	const float u = Clamp(nu->GetFloatValue(hitPoint), 1e-9f, 1.f);
+	const float v = Clamp(nv->GetFloatValue(hitPoint), 1e-9f, 1.f);
+	const float u2 = u * u;
+	const float v2 = v * v;
+	const float anisotropy = (u2 < v2) ? (1.f - u2 / v2) : u2 > 0.f ? (v2 / u2 - 1.f) : 0.f;
+	const float roughness = u * v;
+
+	const Vector wh(Normalize(localFixedDir + localSampledDir));
+	const float cosWH = Dot(localFixedDir, wh);
+	if (fabsf(cosWH) < DEFAULT_COS_EPSILON_STATIC)
+		return false;
+
+	const float specPdf = SchlickDistribution_Pdf(roughness, wh, anisotropy);
+	if (specPdf <= 0.f)
+		return false;
+
+	const float d = SchlickDistribution_D(roughness, wh, anisotropy);
+	const float G = SchlickDistribution_G(roughness, localFixedDir, localSampledDir);
+	const float coso = fabsf(localFixedDir.z);
+	const float cosi = fabsf(localSampledDir.z);
+	if ((cosi < DEFAULT_COS_EPSILON_STATIC) || (localFixedDir.z * localSampledDir.z < 0.f))
+		return false;
+
+	Spectrum F;
+	if (!EvaluateFresnelAtWaveLength(hitPoint, cosWH, waveLength, &F))
+		return false;
+
+	float factor = (d / specPdf) * G * fabsf(cosWH);
+	if (!hitPoint.fromLight)
+		factor /= coso;
+	else
+		factor /= cosi;
+
+	*sampleMultiplier = factor * F;
+	return true;
 }
 
 Spectrum Metal2Material::Albedo(const HitPoint &hitPoint) const {

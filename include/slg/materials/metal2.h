@@ -58,6 +58,31 @@ public:
 
 	virtual luxrays::PropertiesUPtr ToProperties(const ImageMapCache &imgMapCache, const bool useRealFileName) const;
 
+	// ML-HERO helper: explicitly evaluate measured spectral Fresnel data at a
+	// requested wavelength without changing the active HERO wavelength.
+	// Returns false when this Metal2 material has no measured spectral n/k data.
+	bool EvaluateFresnelAtWaveLength(const HitPoint &hitPoint, const float cosi,
+			const float waveLength, luxrays::Spectrum *fresnel) const;
+	bool EvaluateAtWaveLength(const HitPoint &hitPoint,
+			const luxrays::Vector &localLightDir, const luxrays::Vector &localEyeDir,
+			const float waveLength, luxrays::Spectrum *value) const;
+
+	// ML HERO phase 15n diagnostic: expose the exact measured n/k, Fresnel term
+	// and shared microfacet factor used by EvaluateAtWaveLength().
+	bool EvaluateAtWaveLengthDebug(const HitPoint &hitPoint,
+			const luxrays::Vector &localLightDir, const luxrays::Vector &localEyeDir,
+			const float waveLength,
+			luxrays::Spectrum *eta, luxrays::Spectrum *kk,
+			luxrays::Spectrum *fresnel, float *microfacetFactor,
+			float *cosWH, luxrays::Spectrum *value) const;
+
+	// ML-HERO phase 6 helper: evaluate the exact Metal2 BSDF sample multiplier
+	// for an already sampled pair of local directions at an explicit wavelength.
+	// This keeps geometry, microfacet sampling and PDF shared between HERO lanes.
+	bool EvaluateSampleAtWaveLength(const HitPoint &hitPoint,
+			const luxrays::Vector &localFixedDir, const luxrays::Vector &localSampledDir,
+			const float waveLength, luxrays::Spectrum *sampleMultiplier) const;
+
 	FresnelTextureConstPtr GetFresnel() const { return fresnelTex; }
 	TextureConstPtr GetN() const { return n; }
 	TextureConstPtr GetK() const { return k; }

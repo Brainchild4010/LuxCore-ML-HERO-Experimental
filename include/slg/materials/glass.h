@@ -106,6 +106,22 @@ public:
 			const float nc, const float nt, const float cauchyB,
 			luxrays::Vector *localSampledDir);
 
+	// ML HERO phase 15au diagnostic: evaluate one GLASS lane at a specific
+	// wavelength for the already chosen specular event. This does not alter
+	// transport; it exposes IOR/Fresnel/eta and the wavelength-specific ideal
+	// multiplier/direction so BIDIR can validate the current HERO glass path.
+	bool EvaluateMLHeroDebugAtWaveLength(const HitPoint &hitPoint,
+			const luxrays::Vector &localFixedDir,
+			const luxrays::Vector &actualLocalSampledDir,
+			const BSDFEvent sampledEvent, const float samplePdfW,
+			const float waveLength,
+			float *exteriorIOR, float *interiorIORBase, float *interiorIORLambda,
+			float *fresnelR, float *eta, float *eta2, float *transportFactor,
+			float *directionDelta, luxrays::Spectrum *sampleMultiplier,
+			float *cosFixedOut = nullptr, float *sinI2Out = nullptr,
+			float *sinT2Out = nullptr, bool *tirOut = nullptr,
+			float *laneEventPdfWOut = nullptr) const;
+
 private:
 
 	TexRef Kr;

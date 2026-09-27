@@ -35,6 +35,11 @@ public:
 
 	virtual luxrays::Spectrum Evaluate(const HitPoint &hitPoint, const float cosi) const = 0;
 
+	// Optional explicit spectral n/k access for measured-data Fresnel textures.
+	// Multi-HERO can query companion wavelengths without changing the active lane.
+	virtual bool GetNKAtWaveLength(const HitPoint &hitPoint, const float waveLength,
+			luxrays::Spectrum *eta, luxrays::Spectrum *kk) const { return false; }
+
 	static float ApproxN(const float Fr);
 	static luxrays::Spectrum ApproxN(const luxrays::Spectrum &Fr);
 	static float ApproxK(const float Fr);

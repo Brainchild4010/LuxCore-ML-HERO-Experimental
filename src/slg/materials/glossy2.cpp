@@ -229,6 +229,73 @@ Spectrum Glossy2Material::Sample(const HitPoint &hitPoint,
 	return (coatingF + absorption * (Spectrum(1.f) - S) * baseF) / *pdfW;
 }
 
+
+bool Glossy2Material::EvaluateMLHeroDebugSampleComponents(const HitPoint &hitPoint,
+		const Vector &localFixedDir, const Vector &localSampledDir,
+		const float pdfW,
+		Spectrum *kdValue, Spectrum *ksValue,
+		Spectrum *schlickS, Spectrum *absorptionValue,
+		Spectrum *baseContribution, Spectrum *coatingContribution,
+		Spectrum *combinedResult) const {
+	if (!kdValue || !ksValue || !schlickS || !absorptionValue ||
+			!baseContribution || !coatingContribution || !combinedResult ||
+			(pdfW <= 0.f))
+		return false;
+
+	// Phase 15ac is aimed at the front-face Glossy2 path.
+	if ((!doublesided) && (localFixedDir.z <= 0.f))
+		return false;
+
+	const Spectrum kd = Kd->GetSpectrumValue(hitPoint).Clamp(0.f, 1.f);
+
+	Spectrum ks = Ks->GetSpectrumValue(hitPoint);
+	const float i = index->GetFloatValue(hitPoint);
+	if (i > 0.f) {
+		const float ti = (i - 1.f) / (i + 1.f);
+		ks *= ti * ti;
+	}
+	ks = ks.Clamp(0.f, 1.f);
+
+	const float u = Clamp(nu->GetFloatValue(hitPoint), 1e-9f, 1.f);
+	const float v = Clamp(nv->GetFloatValue(hitPoint), 1e-9f, 1.f);
+	const float u2 = u * u;
+	const float v2 = v * v;
+	const float anisotropy = (u2 < v2) ? (1.f - u2 / v2) :
+		u2 > 0.f ? (v2 / u2 - 1.f) : 0.f;
+	const float roughness = u * v;
+
+	const float absCosSampledDir = fabsf(localSampledDir.z);
+	const Spectrum baseF = kd * INV_PI *
+		fabsf(hitPoint.fromLight ? localFixedDir.z : absCosSampledDir);
+
+	const float cosi = fabsf(localSampledDir.z);
+	const float coso = fabsf(localFixedDir.z);
+	const Spectrum alpha = Ka->GetSpectrumValue(hitPoint).Clamp(0.f, 1.f);
+	const float d = depth->GetFloatValue(hitPoint);
+	const Spectrum absorption = CoatingAbsorption(cosi, coso, alpha, d);
+
+	const Vector H(Normalize(localFixedDir + localSampledDir));
+	const Spectrum S = FresnelTexture::SchlickEvaluate(
+		ks, AbsDot(localSampledDir, H));
+
+	const Spectrum coatingF = SchlickBSDF_CoatingF(
+		hitPoint.fromLight, ks, roughness, anisotropy, multibounce,
+		localFixedDir, localSampledDir);
+
+	const Spectrum coating = coatingF / pdfW;
+	const Spectrum base = absorption * (Spectrum(1.f) - S) * baseF / pdfW;
+
+	*kdValue = kd;
+	*ksValue = ks;
+	*schlickS = S;
+	*absorptionValue = absorption;
+	*baseContribution = base;
+	*coatingContribution = coating;
+	*combinedResult = coating + base;
+
+	return true;
+}
+
 void Glossy2Material::Pdf(const HitPoint &hitPoint,
 		const Vector &localLightDir, const Vector &localEyeDir,
 		float *directPdfW, float *reversePdfW) const {

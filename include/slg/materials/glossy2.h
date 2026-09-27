@@ -50,6 +50,17 @@ public:
 		const luxrays::Vector &localLightDir, const luxrays::Vector &localEyeDir,
 		float *directPdfW, float *reversePdfW) const;
 
+	// ML HERO phase 15ac diagnostic: split a sampled Glossy2 bounce into
+	// coating and base-layer contributions, using the already sampled direction
+	// and the same mixture PDF used by Sample().
+	bool EvaluateMLHeroDebugSampleComponents(const HitPoint &hitPoint,
+		const luxrays::Vector &localFixedDir, const luxrays::Vector &localSampledDir,
+		const float pdfW,
+		luxrays::Spectrum *kdValue, luxrays::Spectrum *ksValue,
+		luxrays::Spectrum *schlickS, luxrays::Spectrum *absorptionValue,
+		luxrays::Spectrum *baseContribution, luxrays::Spectrum *coatingContribution,
+		luxrays::Spectrum *combinedResult) const;
+
 	virtual void AddReferencedTextures(std::unordered_set<const Texture *>  &referencedTexsreferencedTexs) const;
 	virtual void UpdateTextureReferences(TextureConstRef oldTex, TextureRef newTex);
 

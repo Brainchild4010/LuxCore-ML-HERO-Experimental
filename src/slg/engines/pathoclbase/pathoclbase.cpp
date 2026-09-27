@@ -172,6 +172,11 @@ void PathOCLBaseRenderEngine::InitGPUTaskConfiguration() {
 		taskConfig.mlHeroSamplingMode = 1;
 	else if (taskConfig.mlHeroSamplingMode > 3)
 		taskConfig.mlHeroSamplingMode = 3;
+	taskConfig.mlHeroWavelengthCount = renderConfig.GetProperty("path.mlhero.wavelengthcount").Get<int>();
+	if (taskConfig.mlHeroWavelengthCount < 1)
+		taskConfig.mlHeroWavelengthCount = 1;
+	else if (taskConfig.mlHeroWavelengthCount > 8)
+		taskConfig.mlHeroWavelengthCount = 8;
 
 	// Pixel filter configuration
 	taskConfig.pixelFilter = *oclPixelFilter;
