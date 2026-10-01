@@ -33,6 +33,8 @@ namespace OCIO = OCIO_NAMESPACE;
 #include "slg/film/imagepipeline/plugins/tonemaps/linear.h"
 #include "slg/film/imagepipeline/plugins/tonemaps/luxlinear.h"
 #include "slg/film/imagepipeline/plugins/tonemaps/reinhard02.h"
+#include "slg/film/imagepipeline/plugins/tonemaps/reinhardheroclassic.h"
+#include "slg/film/imagepipeline/plugins/tonemaps/reinhardheroexposure.h"
 #include "slg/film/imagepipeline/plugins/tonemaps/opencolorio.h"
 
 #include "slg/film/imagepipeline/plugins/cameraresponse.h"
@@ -619,6 +621,14 @@ ImagePipeline *Film::CreateImagePipeline(const Properties &props, const string &
 					props.Get(Property(prefix + ".prescale")(1.0)).Get<double>(),
 					props.Get(Property(prefix + ".postscale")(1.2)).Get<double>(),
 					props.Get(Property(prefix + ".burn")(3.75)).Get<double>()));
+			} else if (type == "TONEMAP_REINHARD_HERO_CLASSIC") {
+				imagePipeline->AddPlugin(new ReinhardHeroClassicToneMap(
+					props.Get(Property(prefix + ".key")(0.18)).Get<double>(),
+					props.Get(Property(prefix + ".whitepoint")(4.0)).Get<double>()));
+			} else if ((type == "TONEMAP_REINHARD_HERO_EXPOSURE") || (type == "TONEMAP_REINHARD_HERO")) {
+				imagePipeline->AddPlugin(new ReinhardHeroExposureToneMap(
+					props.Get(Property(prefix + ".exposurebias")(0.0)).Get<double>(),
+					props.Get(Property(prefix + ".burn")(4.0)).Get<double>()));
 			} else if (type == "TONEMAP_AUTOLINEAR") {
 				imagePipeline->AddPlugin(new AutoLinearToneMap());
 			} else if (type == "TONEMAP_LUXLINEAR") {

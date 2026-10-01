@@ -153,6 +153,8 @@ extern std::string KernelSource_tonemap_autolinear_funcs;
 extern std::string KernelSource_tonemap_linear_funcs;
 extern std::string KernelSource_tonemap_luxlinear_funcs;
 extern std::string KernelSource_tonemap_reinhard02_funcs;
+extern std::string KernelSource_tonemap_reinhardhero_classic_funcs;
+extern std::string KernelSource_tonemap_reinhardhero_exposure_funcs;
 
 } }
 

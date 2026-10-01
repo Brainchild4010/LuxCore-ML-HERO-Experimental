@@ -365,6 +365,9 @@ Spectrum RoughGlassMaterial::Evaluate(const HitPoint &hitPoint,
 	if (localLightDir.z * localEyeDir.z < 0.f) {
 		// Transmit
 
+		// Keep LuxCore's original light/eye-side convention here. For transmission
+		// this eta is the inverse of the Sample() eta on an eye/radiance path;
+		// that is intentional and makes the reconstructed half-vector reciprocal.
 		const bool entering = (CosTheta(localLightDir) > 0.f);
 		const float eta = entering ? (nc / nt) : ntc;
 
@@ -398,9 +401,17 @@ Spectrum RoughGlassMaterial::Evaluate(const HitPoint &hitPoint,
 		if (reversePdfW)
 			*reversePdfW = roughWeight * threshold * reverseSpecPdf * (hitPoint.fromLight ? (fabsf(cosThetaOH) * eta * eta) : fabsf(cosThetaIH)) / lengthSquared;
 
-		const Spectrum result = roughWeight * (fabsf(cosThetaOH) * cosThetaIH * D *
+		Spectrum result = roughWeight * (fabsf(cosThetaOH) * cosThetaIH * D *
 			G / (cosThetaI * lengthSquared)) *
 			kt * (1.f - F);
+
+		// ML HERO phase 15cv: eye/radiance transport needs the reciprocal
+		// solid-angle compression factor at a refractive microfacet interface.
+		// Sample() already follows this radiance convention. Evaluate() did not,
+		// which made EYE_TRANSMIT disagree with Sample()/Pdf while LIGHT_TRANSMIT
+		// stayed consistent. Keep normal LuxCore untouched when HERO is disabled.
+		if (mlHeroEnabled && !hitPoint.fromLight)
+			result *= eta * eta;
 
 		*event = GLOSSY | TRANSMIT;
 
@@ -652,6 +663,9 @@ void RoughGlassMaterial::Pdf(const HitPoint &hitPoint,
 	if (localLightDir.z * localEyeDir.z < 0.f) {
 		// Transmit
 
+		// Keep LuxCore's original light/eye-side convention here. For transmission
+		// this eta is the inverse of the Sample() eta on an eye/radiance path;
+		// that is intentional and makes the reconstructed half-vector reciprocal.
 		const bool entering = (CosTheta(localLightDir) > 0.f);
 		const float eta = entering ? (nc / nt) : ntc;
 

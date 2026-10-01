@@ -127,6 +127,8 @@ set(SLG_KERNELS
   ${PROJECT_SOURCE_DIR}/include/slg/film/imagepipeline/plugins/tonemaps/tonemap_linear_funcs.cl
   ${PROJECT_SOURCE_DIR}/include/slg/film/imagepipeline/plugins/tonemaps/tonemap_luxlinear_funcs.cl
   ${PROJECT_SOURCE_DIR}/include/slg/film/imagepipeline/plugins/tonemaps/tonemap_reinhard02_funcs.cl
+  ${PROJECT_SOURCE_DIR}/include/slg/film/imagepipeline/plugins/tonemaps/tonemap_reinhardhero_classic_funcs.cl
+  ${PROJECT_SOURCE_DIR}/include/slg/film/imagepipeline/plugins/tonemaps/tonemap_reinhardhero_exposure_funcs.cl
   ${PROJECT_SOURCE_DIR}/include/slg/film/sampleresult_funcs.cl
   ${PROJECT_SOURCE_DIR}/include/slg/film/filters/filter_types.cl
   ${PROJECT_SOURCE_DIR}/include/slg/film/filters/filter_funcs.cl
@@ -556,6 +558,8 @@ set(SLG_KERNEL_SRCS
   ${generated_kernels_dir}/tonemap_linear_funcs_kernel.cpp
   ${generated_kernels_dir}/tonemap_luxlinear_funcs_kernel.cpp
   ${generated_kernels_dir}/tonemap_reinhard02_funcs_kernel.cpp
+  ${generated_kernels_dir}/tonemap_reinhardhero_classic_funcs_kernel.cpp
+  ${generated_kernels_dir}/tonemap_reinhardhero_exposure_funcs_kernel.cpp
   ${generated_kernels_dir}/sampleresult_funcs_kernel.cpp
   ${generated_kernels_dir}/filter_types_kernel.cpp
   ${generated_kernels_dir}/filter_funcs_kernel.cpp
@@ -718,6 +722,8 @@ set(SLG_FILM_SRCS
   ${PROJECT_SOURCE_DIR}/src/slg/film/imagepipeline/plugins/tonemaps/luxlinear.cpp
   ${PROJECT_SOURCE_DIR}/src/slg/film/imagepipeline/plugins/tonemaps/opencolorio.cpp
   ${PROJECT_SOURCE_DIR}/src/slg/film/imagepipeline/plugins/tonemaps/reinhard02.cpp
+  ${PROJECT_SOURCE_DIR}/src/slg/film/imagepipeline/plugins/tonemaps/reinhardheroclassic.cpp
+  ${PROJECT_SOURCE_DIR}/src/slg/film/imagepipeline/plugins/tonemaps/reinhardheroexposure.cpp
   ${PROJECT_SOURCE_DIR}/src/slg/film/imagepipeline/plugins/tonemaps/tonemap.cpp
   ${PROJECT_SOURCE_DIR}/src/slg/film/imagepipeline/plugins/intel_oidn.cpp
   ${PROJECT_SOURCE_DIR}/src/slg/film/imagepipeline/plugins/whitebalance.cpp

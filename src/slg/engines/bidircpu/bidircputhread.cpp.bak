@@ -45,11 +45,6 @@ void SetMLHeroWavelengthCount(const u_int count);
 void SetMLHeroWaveLengthAt(const u_int lane, const float waveLength, const float sampleWeight);
 luxrays::Spectrum GetMLDispersionSampleColor();
 
-// ML HERO phase 15db: temporary wavelength override used only while evaluating
-// the shared RoughGlass direction at each vertex-owned wavelength lane.
-extern thread_local float mlDispersionWaveLength;
-extern thread_local bool mlDispersionUsed;
-
 using namespace std;
 using namespace luxrays;
 using namespace slg;
@@ -87,485 +82,6 @@ static inline bool MLHeroCurrentHeavyDiagnosticsEnabled15cq() {
 static inline bool MLHeroLegacyHeavyDiagnosticsEnabled15cq() {
     return MLHeroLegacyDiagnosticsEnabled15cq() && mlHeroHeavyDiagnostics15cq.load(std::memory_order_relaxed);
 }
-
-// ML HERO phase 15ct: RoughGlass Sample/Evaluate/Pdf consistency diagnostics.
-// Diagnostic only: evaluates the already sampled direction at the current HERO
-// wavelength and never changes path throughput, direction, event or PDF.
-// Cases: 0=eye reflect, 1=eye transmit, 2=light reflect, 3=light transmit.
-static std::atomic<unsigned long long> mlHero15ctRoughGlassSamples[4];
-static std::atomic<unsigned long long> mlHero15ctRoughGlassEvalBlack[4];
-static std::atomic<unsigned long long> mlHero15ctRoughGlassEventMismatch[4];
-static std::atomic<double> mlHero15ctRoughGlassPdfRelErrSum[4];
-static std::atomic<double> mlHero15ctRoughGlassPdfRelErrMax[4];
-static std::atomic<double> mlHero15ctRoughGlassSampleRelErrSum[4];
-static std::atomic<double> mlHero15ctRoughGlassSampleRelErrMax[4];
-
-// ML HERO phase 15cw: RoughGlass 8-lane shared-direction support diagnostic.
-// For a direction sampled by the active HERO wavelength, evaluate the same
-// direction at every packet wavelength. This measures whether companion lanes
-// retain finite support and how their PDF / BSDF-over-PDF multipliers differ.
-// Diagnostic only; active lane and dispersion-used state are restored exactly.
-static const u_int MLHERO_15CW_CASE_COUNT = 4u;
-static const u_int MLHERO_15CW_MAX_LANES = 8u;
-static const unsigned long long MLHERO_15CW_EVENT_BUDGET_PER_CASE = 50000ull;
-static std::atomic<unsigned long long> mlHero15cwRoughGlassAttempts[MLHERO_15CW_CASE_COUNT];
-static std::atomic<unsigned long long> mlHero15cwRoughGlassEvents[MLHERO_15CW_CASE_COUNT];
-static std::atomic<unsigned long long> mlHero15cwLaneValid[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<unsigned long long> mlHero15cwLaneBlackOrZeroPdf[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<unsigned long long> mlHero15cwLaneEventMismatch[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<double> mlHero15cwLaneLambdaSum[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<double> mlHero15cwLanePdfRatioSum[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<double> mlHero15cwLanePdfRatioMax[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<double> mlHero15cwLaneMultiplierRatioSum[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<double> mlHero15cwLaneMultiplierRatioMax[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<unsigned long long> mlHero15cwLaneRatioCount[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-
-// ML HERO phase 15cx: capture the single worst multiplier-ratio outlier per
-// case/lane so Mode 2 tail explosions can be traced back to the underlying
-// hero/lane PDFs and BSDF filter values.
-struct MLHero15cxLaneExtreme {
-	bool valid = false;
-	double absMultiplierRatio = 0.0;
-	double multiplierRatio = 1.0;
-	double pdfRatio = 1.0;
-	float heroLambda = 0.f;
-	float laneLambda = 0.f;
-	float heroPdf = 0.f;
-	float lanePdf = 0.f;
-	float heroFilter = 0.f;
-	float laneFilter = 0.f;
-	double heroMultiplier = 0.0;
-	double laneMultiplier = 0.0;
-	float cosFixed = 0.f;
-	float cosSampled = 0.f;
-	unsigned long long eventIndex = 0ull;
-};
-static std::mutex mlHero15cxMutex;
-static MLHero15cxLaneExtreme mlHero15cxLaneExtremeOutlier[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-
-// ML HERO phase 15cy: counterfactual shared-direction spectral-mixture MIS
-// diagnostic for RoughGlass. Equal technique priors are assumed across the
-// active wavelength packet, so pMix = sum(p_i) / N and the balance-heuristic
-// correction applied to a lane sampled from its own technique is
-// N * p_i / sum(p_j). Diagnostic only: no renderer throughput/PDF changes.
-static std::atomic<unsigned long long> mlHero15cyCount[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<double> mlHero15cyRawMultiplierAbsSum[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<double> mlHero15cyRawMultiplierAbsMax[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<double> mlHero15cyMixMultiplierAbsSum[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<double> mlHero15cyMixMultiplierAbsMax[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<double> mlHero15cyMixOverRawSum[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<double> mlHero15cyMixOverRawMax[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<double> mlHero15cyBalanceWeightSum[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<double> mlHero15cyBalanceWeightMax[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-
-// ML HERO phase 15cz: counterfactual Power-Heuristic beta=2 using the same
-// shared RoughGlass direction and equal technique priors. Diagnostic only.
-// Contribution form: rawMultiplier * N * (p_i^2 / sum_j p_j^2).
-static std::atomic<double> mlHero15czPower2MultiplierAbsSum[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<double> mlHero15czPower2MultiplierAbsMax[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<double> mlHero15czPower2OverRawSum[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<double> mlHero15czPower2OverRawMax[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<double> mlHero15czPower2WeightSum[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<double> mlHero15czPower2WeightMax[MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-
-// ML HERO phase 15da: partial blend between the raw per-lane estimator and
-// the full Balance spectral-mixture correction. Diagnostic only.
-// ratio(alpha) = (1-alpha) + alpha * N * balanceWeight, alpha={.25,.50,.75}.
-static const u_int MLHERO_15DA_BLEND_COUNT = 3u;
-static const double mlHero15daBlendAlpha[MLHERO_15DA_BLEND_COUNT] = { .25, .50, .75 };
-static std::atomic<double> mlHero15daMultiplierAbsSum[MLHERO_15DA_BLEND_COUNT][MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<double> mlHero15daMultiplierAbsMax[MLHERO_15DA_BLEND_COUNT][MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<double> mlHero15daOverRawSum[MLHERO_15DA_BLEND_COUNT][MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-static std::atomic<double> mlHero15daOverRawMax[MLHERO_15DA_BLEND_COUNT][MLHERO_15CW_CASE_COUNT][MLHERO_15CW_MAX_LANES];
-
-// ML HERO phase 15db: actual render experiment counters.
-static std::atomic<unsigned long long> mlHero15dbAppliedEvents(0ull);
-static std::atomic<unsigned long long> mlHero15dbAppliedLanes(0ull);
-static std::atomic<unsigned long long> mlHero15dbFallbackLanes(0ull);
-static std::atomic<double> mlHero15dbAppliedMultiplierAbsSum(0.0);
-static std::atomic<double> mlHero15dbAppliedMultiplierAbsMax(0.0);
-static std::atomic<double> mlHero15dbAppliedOverRawSum(0.0);
-static std::atomic<double> mlHero15dbAppliedOverRawMax(0.0);
-
-// ML HERO phase 15dc: real-render tail diagnostics for the active 15db
-// RoughGlass Mode-2 Blend25 estimator. These counters observe the complete
-// render rather than the first 50k diagnostic events. No additional physics
-// changes are introduced in 15dc.
-static const u_int MLHERO_15DC_TRANSPORT_CASES = 2u; // 0=EYE, 1=LIGHT
-static const u_int MLHERO_15DC_TAIL_BINS = 3u;
-static const double mlHero15dcTailThreshold[MLHERO_15DC_TAIL_BINS] = { 10.0, 100.0, 1000.0 };
-static std::atomic<unsigned long long> mlHero15dcCaseLanes[MLHERO_15DC_TRANSPORT_CASES];
-static std::atomic<unsigned long long> mlHero15dcRawTailCount[MLHERO_15DC_TRANSPORT_CASES][MLHERO_15DC_TAIL_BINS];
-static std::atomic<unsigned long long> mlHero15dcAppliedTailCount[MLHERO_15DC_TRANSPORT_CASES][MLHERO_15DC_TAIL_BINS];
-static std::atomic<double> mlHero15dcRawMaxHint[MLHERO_15DC_TRANSPORT_CASES];
-static std::atomic<double> mlHero15dcAppliedMaxHint[MLHERO_15DC_TRANSPORT_CASES];
-
-struct MLHero15dcTailOutlier {
-	bool valid = false;
-	double absRaw = 0.0;
-	double absApplied = 0.0;
-	double rawMultiplier = 0.0;
-	double appliedMultiplier = 0.0;
-	double blendRatio = 1.0;
-	double balanceWeight = 0.0;
-	double mixPdf = 0.0;
-	float heroPdf = 0.f;
-	float lanePdf = 0.f;
-	double heroRawMultiplier = 0.0;
-	float heroLambda = 0.f;
-	float laneLambda = 0.f;
-	float cosFixed = 0.f;
-	float cosSampled = 0.f;
-	u_int lane = 0u;
-	u_int depth = 0u;
-	unsigned long long laneOrdinal = 0ull;
-};
-static std::mutex mlHero15dcTailMutex;
-static MLHero15dcTailOutlier mlHero15dcWorstRaw[MLHERO_15DC_TRANSPORT_CASES];
-static MLHero15dcTailOutlier mlHero15dcWorstApplied[MLHERO_15DC_TRANSPORT_CASES];
-
-// ML HERO phase 15dd: mode-independent full-render radiance fingerprint.
-// Diagnostic only. Accumulated immediately before variance clamping so a
-// Mode-0 and Mode-2 run of the unchanged scene can be compared numerically.
-// No random numbers are consumed here and renderer physics is unchanged.
-static std::atomic<unsigned long long> mlHero15ddSampleResultCount(0ull);
-static std::atomic<double> mlHero15ddRadianceRSum(0.0);
-static std::atomic<double> mlHero15ddRadianceGSum(0.0);
-static std::atomic<double> mlHero15ddRadianceBSum(0.0);
-static std::atomic<double> mlHero15ddRadianceYSum(0.0);
-static std::atomic<double> mlHero15ddRadianceYAbsSum(0.0);
-static std::atomic<double> mlHero15ddRadianceY2Sum(0.0);
-static std::atomic<double> mlHero15ddRadianceYMax(0.0);
-
-
-// ML HERO phase 15de: Glass/RoughGlass spectral packet color-weight audit.
-// Diagnostic only. Compare the classic RGB BSDF result with the reconstructed
-// HERO packet immediately after the current Glass/RoughGlass lane weighting.
-// Cases: 0=GLASS_REFLECT, 1=GLASS_TRANSMIT, 2=ROUGHGLASS_REFLECT, 3=ROUGHGLASS_TRANSMIT.
-// Lane buckets: 0=1 lane, 1=2 lanes, 2=4 lanes, 3=8 lanes (other counts ignored).
-static const u_int MLHERO_15DE_CASE_COUNT = 4u;
-static const u_int MLHERO_15DE_LANE_BUCKETS = 4u;
-static std::atomic<unsigned long long> mlHero15deCount[MLHERO_15DE_CASE_COUNT][MLHERO_15DE_LANE_BUCKETS];
-static std::atomic<double> mlHero15deClassicChromaSum[MLHERO_15DE_CASE_COUNT][MLHERO_15DE_LANE_BUCKETS];
-static std::atomic<double> mlHero15deHeroChromaSum[MLHERO_15DE_CASE_COUNT][MLHERO_15DE_LANE_BUCKETS];
-static std::atomic<double> mlHero15deChromaRatioSum[MLHERO_15DE_CASE_COUNT][MLHERO_15DE_LANE_BUCKETS];
-static std::atomic<double> mlHero15deNormColorL1Sum[MLHERO_15DE_CASE_COUNT][MLHERO_15DE_LANE_BUCKETS];
-static std::atomic<double> mlHero15deClassicYSum[MLHERO_15DE_CASE_COUNT][MLHERO_15DE_LANE_BUCKETS];
-static std::atomic<double> mlHero15deHeroYSum[MLHERO_15DE_CASE_COUNT][MLHERO_15DE_LANE_BUCKETS];
-static std::atomic<double> mlHero15deLuminanceRatioSum[MLHERO_15DE_CASE_COUNT][MLHERO_15DE_LANE_BUCKETS];
-static std::atomic<double> mlHero15deAppliedMultiplierMin[MLHERO_15DE_CASE_COUNT][MLHERO_15DE_LANE_BUCKETS];
-static std::atomic<double> mlHero15deAppliedMultiplierMax[MLHERO_15DE_CASE_COUNT][MLHERO_15DE_LANE_BUCKETS];
-static std::atomic<unsigned long long> mlHero15deDetailCount(0ull);
-
-// ML HERO phase 15dg: Mode-2 spectral energy balance audit.
-// Diagnostic only; no sampling or throughput decisions are changed. The audit
-// records same-direction lane energy immediately before and after the Mode-2
-// PDF/balance correction, grouped into broad wavelength bands.
-static const u_int MLHERO_15DG_CASE_COUNT = 6u;
-static const u_int MLHERO_15DG_BAND_COUNT = 3u;
-static std::atomic<unsigned long long> mlHero15dgCount[MLHERO_15DG_CASE_COUNT][MLHERO_15DG_BAND_COUNT];
-static std::atomic<unsigned long long> mlHero15dgSupportMismatch[MLHERO_15DG_CASE_COUNT][MLHERO_15DG_BAND_COUNT];
-static std::atomic<double> mlHero15dgBaseEnergy[MLHERO_15DG_CASE_COUNT][MLHERO_15DG_BAND_COUNT];
-static std::atomic<double> mlHero15dgAppliedEnergy[MLHERO_15DG_CASE_COUNT][MLHERO_15DG_BAND_COUNT];
-static std::atomic<double> mlHero15dgFactorSum[MLHERO_15DG_CASE_COUNT][MLHERO_15DG_BAND_COUNT];
-static std::atomic<double> mlHero15dgAbsFactorDeltaSum[MLHERO_15DG_CASE_COUNT][MLHERO_15DG_BAND_COUNT];
-static std::atomic<double> mlHero15dgFactorMin[MLHERO_15DG_CASE_COUNT][MLHERO_15DG_BAND_COUNT];
-static std::atomic<double> mlHero15dgFactorMax[MLHERO_15DG_CASE_COUNT][MLHERO_15DG_BAND_COUNT];
-
-static inline u_int MLHero15dgBand(const float lambda) {
-    if (lambda < 500.f) return 0u;
-    if (lambda < 600.f) return 1u;
-    return 2u;
-}
-
-static inline u_int MLHero15dgGlassCase(const bool fromLight, const BSDFEvent event) {
-    return (fromLight ? 2u : 0u) + ((event & TRANSMIT) ? 1u : 0u);
-}
-
-static inline u_int MLHero15dgRoughTransmitCase(const bool fromLight) {
-    return fromLight ? 5u : 4u;
-}
-
-static inline void MLHero15dgAtomicMin(std::atomic<double> &target, const double value) {
-    double current = target.load(std::memory_order_relaxed);
-    while (((current == 0.0) || (value < current)) &&
-            !target.compare_exchange_weak(current, value, std::memory_order_relaxed, std::memory_order_relaxed)) { }
-}
-
-static inline void MLHero15dgAtomicMax(std::atomic<double> &target, const double value) {
-    double current = target.load(std::memory_order_relaxed);
-    while (value > current &&
-            !target.compare_exchange_weak(current, value, std::memory_order_relaxed, std::memory_order_relaxed)) { }
-}
-
-static inline void MLHero15dgRecord(const u_int c, const float lambda,
-        const double preScalar, const double baseMultiplier,
-        const double appliedMultiplier, const bool supportMismatch) {
-    if (!MLHeroCurrentDiagnosticsEnabled15cq()) return;
-    const u_int b = MLHero15dgBand(lambda);
-    const double baseEnergy = fabs(preScalar * baseMultiplier);
-    const double appliedEnergy = fabs(preScalar * appliedMultiplier);
-    const double factor = (fabs(baseMultiplier) > 1e-30) ?
-        (appliedMultiplier / baseMultiplier) : 1.0;
-    mlHero15dgCount[c][b].fetch_add(1ull, std::memory_order_relaxed);
-    if (supportMismatch)
-        mlHero15dgSupportMismatch[c][b].fetch_add(1ull, std::memory_order_relaxed);
-    mlHero15dgBaseEnergy[c][b].fetch_add(baseEnergy, std::memory_order_relaxed);
-    mlHero15dgAppliedEnergy[c][b].fetch_add(appliedEnergy, std::memory_order_relaxed);
-    mlHero15dgFactorSum[c][b].fetch_add(factor, std::memory_order_relaxed);
-    mlHero15dgAbsFactorDeltaSum[c][b].fetch_add(fabs(factor - 1.0), std::memory_order_relaxed);
-    MLHero15dgAtomicMin(mlHero15dgFactorMin[c][b], factor);
-    MLHero15dgAtomicMax(mlHero15dgFactorMax[c][b], factor);
-}
-
-// ML HERO phase 15dh: Delta-Glass path-accounting audit.
-// Diagnostic only. This deliberately moves one level downstream from 15dg:
-//  (1) record the packet->single-HERO collapse ratio at the first dispersive
-//      SPECULAR|TRANSMIT Glass termination, grouped by broad wavelength band;
-//  (2) record the actual visible BIDIR contribution later emitted by each
-//      estimator from terminated eye/light subpaths, together with the
-//      explicitly propagated packet-reference throughput (15bu).
-// This lets Mode 0 and Mode 2 be compared without changing PDFs, MIS weights,
-// throughput, event selection, direction sampling or film contributions.
-static const u_int MLHERO_15DH_ESTIMATOR_COUNT = 4u;
-static const u_int MLHERO_15DH_SIDE_COUNT = 2u;
-static const u_int MLHERO_15DH_BAND_COUNT = 3u;
-static std::atomic<unsigned long long> mlHero15dhTerminationCount[MLHERO_15DH_SIDE_COUNT][MLHERO_15DH_BAND_COUNT];
-static std::atomic<double> mlHero15dhTerminationHeroOverPacketSum[MLHERO_15DH_SIDE_COUNT][MLHERO_15DH_BAND_COUNT];
-static std::atomic<double> mlHero15dhTerminationHeroScalarSum[MLHERO_15DH_SIDE_COUNT][MLHERO_15DH_BAND_COUNT];
-static std::atomic<double> mlHero15dhTerminationPacketAverageSum[MLHERO_15DH_SIDE_COUNT][MLHERO_15DH_BAND_COUNT];
-static std::atomic<unsigned long long> mlHero15dhVisibleCount[MLHERO_15DH_ESTIMATOR_COUNT][MLHERO_15DH_SIDE_COUNT][MLHERO_15DH_BAND_COUNT];
-static std::atomic<double> mlHero15dhVisibleY[MLHERO_15DH_ESTIMATOR_COUNT][MLHERO_15DH_SIDE_COUNT][MLHERO_15DH_BAND_COUNT];
-static std::atomic<double> mlHero15dhVisibleAbsY[MLHERO_15DH_ESTIMATOR_COUNT][MLHERO_15DH_SIDE_COUNT][MLHERO_15DH_BAND_COUNT];
-static std::atomic<double> mlHero15dhReferenceAbsY[MLHERO_15DH_ESTIMATOR_COUNT][MLHERO_15DH_SIDE_COUNT][MLHERO_15DH_BAND_COUNT];
-static std::atomic<double> mlHero15dhActualOverReferenceTimesAbsY[MLHERO_15DH_ESTIMATOR_COUNT][MLHERO_15DH_SIDE_COUNT][MLHERO_15DH_BAND_COUNT];
-static std::atomic<unsigned long long> mlHero15dhInvalidReference[MLHERO_15DH_ESTIMATOR_COUNT][MLHERO_15DH_SIDE_COUNT][MLHERO_15DH_BAND_COUNT];
-
-static inline void MLHero15dhRecordTermination(const bool fromLight, const float lambda,
-        const double heroScalar, const double packetAverage) {
-    if (!MLHeroCurrentDiagnosticsEnabled15cq()) return;
-    const u_int side = fromLight ? 1u : 0u;
-    const u_int band = MLHero15dgBand(lambda);
-    const double ratio = (fabs(packetAverage) > 1e-30) ? (heroScalar / packetAverage) : 0.0;
-    if (!std::isfinite(ratio) || !std::isfinite(heroScalar) || !std::isfinite(packetAverage)) return;
-    mlHero15dhTerminationCount[side][band].fetch_add(1ull, std::memory_order_relaxed);
-    mlHero15dhTerminationHeroOverPacketSum[side][band].fetch_add(ratio, std::memory_order_relaxed);
-    mlHero15dhTerminationHeroScalarSum[side][band].fetch_add(heroScalar, std::memory_order_relaxed);
-    mlHero15dhTerminationPacketAverageSum[side][band].fetch_add(packetAverage, std::memory_order_relaxed);
-}
-
-static inline void MLHero15dhRecordVisible(const u_int estimator, const u_int side,
-        const PathVertexVM &v, const Spectrum &c) {
-    if (!MLHeroCurrentDiagnosticsEnabled15cq() || (estimator >= MLHERO_15DH_ESTIMATOR_COUNT) ||
-            (side >= MLHERO_15DH_SIDE_COUNT) || !v.mlHeroSecondaryWavelengthsTerminated ||
-            (v.mlHeroLaneCount == 0u))
-        return;
-    const float lambda = v.mlHeroTerminationHeroLambda;
-    if (!std::isfinite(lambda)) return;
-    const u_int band = MLHero15dgBand(lambda);
-    const double y = (double)c.Y();
-    if (!std::isfinite(y)) return;
-    const double absY = fabs(y);
-    mlHero15dhVisibleCount[estimator][side][band].fetch_add(1ull, std::memory_order_relaxed);
-    mlHero15dhVisibleY[estimator][side][band].fetch_add(y, std::memory_order_relaxed);
-    mlHero15dhVisibleAbsY[estimator][side][band].fetch_add(absY, std::memory_order_relaxed);
-
-    const double actualTP = (double)v.mlHeroLaneThroughput[0].c[0];
-    const double referenceTP = v.mlHero15buReferenceThroughput;
-    if (std::isfinite(actualTP) && std::isfinite(referenceTP) &&
-            (fabs(actualTP) > 1e-30) && (fabs(referenceTP) > 1e-30)) {
-        const double actualOverReference = actualTP / referenceTP;
-        if (std::isfinite(actualOverReference) && (fabs(actualOverReference) > 1e-30)) {
-            const double referenceAbsY = absY / fabs(actualOverReference);
-            mlHero15dhReferenceAbsY[estimator][side][band].fetch_add(referenceAbsY, std::memory_order_relaxed);
-            mlHero15dhActualOverReferenceTimesAbsY[estimator][side][band].fetch_add(
-                actualOverReference * absY, std::memory_order_relaxed);
-            return;
-        }
-    }
-    mlHero15dhInvalidReference[estimator][side][band].fetch_add(1ull, std::memory_order_relaxed);
-}
-
-// ML HERO phase 15dj: forward declaration for the 15df helper used by the
-// diagnostic block below. The implementation remains at its original location.
-static inline float MLHeroGlassLaneColorSample15df(
-		const Spectrum &rgb, const float waveLength);
-luxrays::Spectrum GetMLHeroSampleColorAt(const u_int lane);
-
-// ML HERO phase 15dj: diagnostic-only Glass multiplier decomposition.
-// Runs for all Glass modes, including Mode 0/1 with per-lane weighting OFF.
-// It never writes renderer throughput, PDFs, event selection or sampled direction.
-static const u_int MLHERO_15DJ_CASE_COUNT = 4u;
-static const u_int MLHERO_15DJ_BAND_COUNT = 3u;
-static std::atomic<unsigned long long> mlHero15djCount[MLHERO_15DJ_CASE_COUNT][MLHERO_15DJ_BAND_COUNT];
-static std::atomic<unsigned long long> mlHero15djInvalid[MLHERO_15DJ_CASE_COUNT][MLHERO_15DJ_BAND_COUNT];
-static std::atomic<double> mlHero15djColorSampleSum[MLHERO_15DJ_CASE_COUNT][MLHERO_15DJ_BAND_COUNT];
-static std::atomic<double> mlHero15djFresnelSum[MLHERO_15DJ_CASE_COUNT][MLHERO_15DJ_BAND_COUNT];
-static std::atomic<double> mlHero15djTransportSum[MLHERO_15DJ_CASE_COUNT][MLHERO_15DJ_BAND_COUNT];
-static std::atomic<double> mlHero15djHeroPdfSum[MLHERO_15DJ_CASE_COUNT][MLHERO_15DJ_BAND_COUNT];
-static std::atomic<double> mlHero15djLanePdfSum[MLHERO_15DJ_CASE_COUNT][MLHERO_15DJ_BAND_COUNT];
-static std::atomic<double> mlHero15djMaterialLaneSum[MLHERO_15DJ_CASE_COUNT][MLHERO_15DJ_BAND_COUNT];
-static std::atomic<double> mlHero15djCallerAdjointSum[MLHERO_15DJ_CASE_COUNT][MLHERO_15DJ_BAND_COUNT];
-static std::atomic<double> mlHero15djWrappedLaneSum[MLHERO_15DJ_CASE_COUNT][MLHERO_15DJ_BAND_COUNT];
-static std::atomic<double> mlHero15djSharedLaneSum[MLHERO_15DJ_CASE_COUNT][MLHERO_15DJ_BAND_COUNT];
-static std::atomic<double> mlHero15djModeAppliedSum[MLHERO_15DJ_CASE_COUNT][MLHERO_15DJ_BAND_COUNT];
-static std::atomic<double> mlHero15djEtaSum[MLHERO_15DJ_CASE_COUNT][MLHERO_15DJ_BAND_COUNT];
-static std::atomic<double> mlHero15djNtLambdaSum[MLHERO_15DJ_CASE_COUNT][MLHERO_15DJ_BAND_COUNT];
-static std::atomic<double> mlHero15djDirDeltaSum[MLHERO_15DJ_CASE_COUNT][MLHERO_15DJ_BAND_COUNT];
-
-
-// ML HERO phase 15dk: diagnostic-only color-ownership/correlation audit.
-// Tests whether Mode 2 is effectively applying wavelength reconstruction to an
-// already chromatic Glass sample (double spectral ownership). Renderer physics
-// is never modified by this block.
-static const u_int MLHERO_15DK_CASE_COUNT = 4u;
-static const u_int MLHERO_15DK_BAND_COUNT = 3u;
-static std::atomic<unsigned long long> mlHero15dkLaneCount[MLHERO_15DK_CASE_COUNT][MLHERO_15DK_BAND_COUNT];
-static std::atomic<double> mlHero15dkXSum[MLHERO_15DK_CASE_COUNT][MLHERO_15DK_BAND_COUNT];
-static std::atomic<double> mlHero15dkMSum[MLHERO_15DK_CASE_COUNT][MLHERO_15DK_BAND_COUNT];
-static std::atomic<double> mlHero15dkXMSum[MLHERO_15DK_CASE_COUNT][MLHERO_15DK_BAND_COUNT];
-static std::atomic<double> mlHero15dkX2Sum[MLHERO_15DK_CASE_COUNT][MLHERO_15DK_BAND_COUNT];
-static std::atomic<double> mlHero15dkM2Sum[MLHERO_15DK_CASE_COUNT][MLHERO_15DK_BAND_COUNT];
-static std::atomic<unsigned long long> mlHero15dkEventCount[MLHERO_15DK_CASE_COUNT];
-static std::atomic<double> mlHero15dkSpectralizedRGB[MLHERO_15DK_CASE_COUNT][3];
-static std::atomic<double> mlHero15dkRgbOwnedRGB[MLHERO_15DK_CASE_COUNT][3];
-static std::atomic<double> mlHero15dkSharedScalarRGB[MLHERO_15DK_CASE_COUNT][3];
-static std::atomic<double> mlHero15dkSpectralizedY[MLHERO_15DK_CASE_COUNT];
-static std::atomic<double> mlHero15dkRgbOwnedY[MLHERO_15DK_CASE_COUNT];
-static std::atomic<double> mlHero15dkSharedScalarY[MLHERO_15DK_CASE_COUNT];
-
-static inline void MLHero15dkRecordEvent(const bool fromLight, const BSDFEvent event,
-        const PathVertexVM &v, const Spectrum &bsdfSample) {
-    if (!MLHeroCurrentDiagnosticsEnabled15cq() || (v.mlHeroLaneCount == 0u)) return;
-    const u_int c = MLHero15dgGlassCase(fromLight, event);
-    Spectrum spectralized(0.f), rgbOwned(0.f), sharedScalarOwned(0.f);
-    const float sharedScalar = (bsdfSample.c[0] + bsdfSample.c[1] + bsdfSample.c[2]) / 3.f;
-    const u_int laneCount = Min(v.mlHeroLaneCount, 8u);
-    for (u_int lane = 0u; lane < laneCount; ++lane) {
-        const float lambda = v.mlHeroLaneWaveLength[lane];
-        const Spectrum sampleColor = GetMLHeroSampleColorAt(lane);
-        const Spectrum pre = v.mlHeroLaneThroughput[lane];
-        const float m = MLHeroGlassLaneColorSample15df(bsdfSample, lambda);
-        spectralized += pre * Spectrum(m) * sampleColor;
-        rgbOwned += pre * bsdfSample * sampleColor;
-        sharedScalarOwned += pre * Spectrum(sharedScalar) * sampleColor;
-
-        const Spectrum preContribution15dk = pre * sampleColor;
-        const double x = (double)preContribution15dk.Y();
-        if (std::isfinite(x) && std::isfinite((double)m)) {
-            const u_int b = MLHero15dgBand(lambda);
-            mlHero15dkLaneCount[c][b].fetch_add(1ull, std::memory_order_relaxed);
-            mlHero15dkXSum[c][b].fetch_add(x, std::memory_order_relaxed);
-            mlHero15dkMSum[c][b].fetch_add((double)m, std::memory_order_relaxed);
-            mlHero15dkXMSum[c][b].fetch_add(x * (double)m, std::memory_order_relaxed);
-            mlHero15dkX2Sum[c][b].fetch_add(x * x, std::memory_order_relaxed);
-            mlHero15dkM2Sum[c][b].fetch_add((double)m * (double)m, std::memory_order_relaxed);
-        }
-    }
-    const float invN = 1.f / (float)laneCount;
-    spectralized *= invN;
-    rgbOwned *= invN;
-    sharedScalarOwned *= invN;
-    if (!std::isfinite((double)spectralized.Y()) || !std::isfinite((double)rgbOwned.Y()) ||
-            !std::isfinite((double)sharedScalarOwned.Y())) return;
-    mlHero15dkEventCount[c].fetch_add(1ull, std::memory_order_relaxed);
-    for (u_int ch = 0u; ch < 3u; ++ch) {
-        mlHero15dkSpectralizedRGB[c][ch].fetch_add((double)spectralized.c[ch], std::memory_order_relaxed);
-        mlHero15dkRgbOwnedRGB[c][ch].fetch_add((double)rgbOwned.c[ch], std::memory_order_relaxed);
-        mlHero15dkSharedScalarRGB[c][ch].fetch_add((double)sharedScalarOwned.c[ch], std::memory_order_relaxed);
-    }
-    mlHero15dkSpectralizedY[c].fetch_add((double)spectralized.Y(), std::memory_order_relaxed);
-    mlHero15dkRgbOwnedY[c].fetch_add((double)rgbOwned.Y(), std::memory_order_relaxed);
-    mlHero15dkSharedScalarY[c].fetch_add((double)sharedScalarOwned.Y(), std::memory_order_relaxed);
-}
-
-static inline void MLHero15djRecord(const bool fromLight, const BSDFEvent event,
-        const float lambda, const bool ok, const Spectrum &materialMultiplier,
-        const float fresnel, const float transport, const float heroPdf,
-        const float lanePdf, const float callerAdjoint, const float sharedLane,
-        const float modeApplied, const float eta, const float ntLambda,
-        const float dirDelta) {
-    if (!MLHeroCurrentDiagnosticsEnabled15cq()) return;
-    const u_int c = MLHero15dgGlassCase(fromLight, event);
-    const u_int b = MLHero15dgBand(lambda);
-    if (!ok || !std::isfinite(lambda) || !std::isfinite(fresnel) ||
-            !std::isfinite(transport) || !std::isfinite(heroPdf) ||
-            !std::isfinite(lanePdf) || !std::isfinite(callerAdjoint) ||
-            !std::isfinite(sharedLane) || !std::isfinite(modeApplied) ||
-            !std::isfinite(eta) || !std::isfinite(ntLambda) || !std::isfinite(dirDelta)) {
-        mlHero15djInvalid[c][b].fetch_add(1ull, std::memory_order_relaxed);
-        return;
-    }
-    const float materialLane = MLHeroGlassLaneColorSample15df(materialMultiplier, lambda);
-    const float wrappedLane = materialLane * callerAdjoint;
-    float colorSample = 0.f;
-    if ((fabsf(transport) > 1e-20f) && (heroPdf > 1e-20f))
-        colorSample = materialLane * heroPdf / transport;
-    if (!std::isfinite(materialLane) || !std::isfinite(wrappedLane) || !std::isfinite(colorSample)) {
-        mlHero15djInvalid[c][b].fetch_add(1ull, std::memory_order_relaxed);
-        return;
-    }
-    mlHero15djCount[c][b].fetch_add(1ull, std::memory_order_relaxed);
-    mlHero15djColorSampleSum[c][b].fetch_add(colorSample, std::memory_order_relaxed);
-    mlHero15djFresnelSum[c][b].fetch_add(fresnel, std::memory_order_relaxed);
-    mlHero15djTransportSum[c][b].fetch_add(transport, std::memory_order_relaxed);
-    mlHero15djHeroPdfSum[c][b].fetch_add(heroPdf, std::memory_order_relaxed);
-    mlHero15djLanePdfSum[c][b].fetch_add(lanePdf, std::memory_order_relaxed);
-    mlHero15djMaterialLaneSum[c][b].fetch_add(materialLane, std::memory_order_relaxed);
-    mlHero15djCallerAdjointSum[c][b].fetch_add(callerAdjoint, std::memory_order_relaxed);
-    mlHero15djWrappedLaneSum[c][b].fetch_add(wrappedLane, std::memory_order_relaxed);
-    mlHero15djSharedLaneSum[c][b].fetch_add(sharedLane, std::memory_order_relaxed);
-    mlHero15djModeAppliedSum[c][b].fetch_add(modeApplied, std::memory_order_relaxed);
-    mlHero15djEtaSum[c][b].fetch_add(eta, std::memory_order_relaxed);
-    mlHero15djNtLambdaSum[c][b].fetch_add(ntLambda, std::memory_order_relaxed);
-    mlHero15djDirDeltaSum[c][b].fetch_add(dirDelta, std::memory_order_relaxed);
-}
-
-static inline int MLHero15deLaneBucket(const u_int laneCount) {
-    switch (laneCount) {
-        case 1u: return 0;
-        case 2u: return 1;
-        case 4u: return 2;
-        case 8u: return 3;
-        default: return -1;
-    }
-}
-
-static inline double MLHero15deChromaMetric(const Spectrum &s) {
-    const double r = (double)s.c[0], g = (double)s.c[1], b = (double)s.c[2];
-    const double mx = Max(r, Max(g, b));
-    const double mn = Min(r, Min(g, b));
-    const double den = fabs(r) + fabs(g) + fabs(b);
-    return (den > 1e-30) ? fabs(mx - mn) / den : 0.0;
-}
-
-static inline double MLHero15deNormalizedColorL1(const Spectrum &a, const Spectrum &b) {
-    const double ar = (double)a.c[0], ag = (double)a.c[1], ab = (double)a.c[2];
-    const double br = (double)b.c[0], bg = (double)b.c[1], bb = (double)b.c[2];
-    const double ad = fabs(ar) + fabs(ag) + fabs(ab);
-    const double bd = fabs(br) + fabs(bg) + fabs(bb);
-    if ((ad <= 1e-30) || (bd <= 1e-30))
-        return 0.0;
-    return fabs(ar / ad - br / bd) + fabs(ag / ad - bg / bd) + fabs(ab / ad - bb / bd);
-}
-
-static inline void MLHero15deAtomicMin(std::atomic<double> &target, const double value) {
-    double current = target.load(std::memory_order_relaxed);
-    while (value < current && !target.compare_exchange_weak(current, value,
-            std::memory_order_relaxed, std::memory_order_relaxed)) { }
-}
-
-static inline bool MLHeroAtomicClaimMax15dc(std::atomic<double> &target, const double value) {
-	double current = target.load(std::memory_order_relaxed);
-	while (value > current) {
-		if (target.compare_exchange_weak(current, value, std::memory_order_relaxed, std::memory_order_relaxed))
-			return true;
-	}
-	return false;
-}
-
-static std::atomic<double> mlHero15cyMixPdfSum[MLHERO_15CW_CASE_COUNT];
-static std::atomic<double> mlHero15cyMixPdfMin[MLHERO_15CW_CASE_COUNT];
 
 // ML HERO phase 15bd: support-aware Glass estimator diagnostics extending 15bc.
 // Diagnostics only; these counters never modify path throughput or sampling.
@@ -894,9 +410,6 @@ static inline u_int MLHeroDepthBin15bs(const u_int depth) {
 
 static inline void MLHeroRecordWavelengthBias15bs(const u_int estimator,
         const u_int side, const PathVertexVM &v, const Spectrum &c) {
-    // 15dh is a lightweight current-diagnostic consumer of the exact same
-    // visible-contribution hook. It never changes the contribution.
-    MLHero15dhRecordVisible(estimator, side, v, c);
     if (!MLHeroLegacyHeavyDiagnosticsEnabled15cq()) return;
     if ((estimator >= 4u) || (side >= 2u) || !v.mlHeroSecondaryWavelengthsTerminated ||
             (v.mlHeroLaneCount == 0u))
@@ -1024,20 +537,9 @@ static inline const char *MLHeroMaterialTypeName15cl(const u_int t) {
 
 // ML HERO central diagnostics configuration. Change the phase in ONE place;
 // the log filename and banner follow automatically.
-#define ML_HERO_BUILD "HERO_106"
-#define ML_HERO_TEST_PHASE "15do"
-#define ML_HERO_FEATURE "Reinhard Hero Classic + Exposure tone mappers"
-// 15di A/B experiment: 1 = companion lanes keep the shared HERO event PDF
-// already owned by the sampled path; 0 = legacy Mode2 bsdfPdfW/laneEventPdfW
-// reweighting. HERO OFF and Glass Modes 0/1 are untouched.
-#define ML_HERO_MODE2_SHARED_HERO_PDF_15DI 1
-// 15dm regular path: for Mode 2 ideal-Glass TRANSMIT with PLW off, every
-// multi-lane packet keeps LuxCore's sampled Glass RGB multiplier owned as RGB.
-// This now applies both with and without dispersion. A dispersive Delta-Glass
-// packet still collapses to the HERO wavelength at the existing boundary; a
-// non-dispersive Glass packet continues as a packet. Reflection, RoughGlass,
-// Glass Modes 0/1 and HERO OFF are untouched.
-#define ML_HERO_MODE2_RGB_OWNERSHIP_15DM 1
+#define ML_HERO_BUILD "HERO_84"
+#define ML_HERO_TEST_PHASE "15cr"
+#define ML_HERO_FEATURE "Diagnostics UI/log cleanup; reflectance fixes unchanged; no renderer-physics changes"
 #define ML_HERO_LOG_FILE "C:\\LuxCoreCustom\\ML_HERO_debug_" ML_HERO_TEST_PHASE ".txt"
 
 static inline FILE *MLHeroOpenCurrentLog15cq(const char *mode) {
@@ -1487,10 +989,6 @@ static inline void MLHeroInsertGlassOutlier15ba(
 //     (same shared HERO geometry; NOT a full path-space spectral MIS solution)
 
 u_int GetMLHeroWavelengthCount();
-u_int GetMLHeroActiveLane();
-void SetMLHeroActiveLane(const u_int lane);
-bool GetMLDispersionUsed();
-void MarkMLDispersionUsed();
 float GetMLHeroWaveLengthAt(const u_int lane);
 float GetMLHeroSampleWeightAt(const u_int lane);
 luxrays::Spectrum GetMLHeroSampleColorAt(const u_int lane);
@@ -1725,21 +1223,6 @@ static inline float MLHeroGlossy2BasisCompensatedSample15cp(
 static bool MLHeroIsScalarSpectrum(const Spectrum &s, const float eps = 1e-6f) {
 	const float m = Max(1.f, Max(fabsf(s.c[0]), Max(fabsf(s.c[1]), fabsf(s.c[2]))));
 	return (fabsf(s.c[0] - s.c[1]) <= eps * m) && (fabsf(s.c[0] - s.c[2]) <= eps * m);
-}
-
-// ML HERO phase 15df: Glass packet branches used to collapse a chromatic RGB
-// BSDF multiplier with Spectrum::Filter()/RGB average before applying it to
-// every HERO lane. With more than one wavelength this destroys the material
-// chroma (Reflection Color and Transmission Color both drift toward gray).
-// Preserve exact scalar spectra, but spectrally reconstruct chromatic RGB at
-// the lane wavelength using the same compensated RGB-reflectance basis already
-// validated for the generic HERO reflectance path.
-static inline float MLHeroGlassLaneColorSample15df(
-		const Spectrum &rgb, const float waveLength) {
-	if (MLHeroIsScalarSpectrum(rgb))
-		return (rgb.c[0] + rgb.c[1] + rgb.c[2]) / 3.f;
-
-	return MLHeroGenericBasisCompensatedSample15cn(rgb, waveLength);
 }
 
 // ML HERO phase 15al:
@@ -3982,13 +3465,9 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 		(mlHero15buTerminatedAtBounceStart && (pathVertex->mlHeroLaneCount > 0u)) ?
 		(double)pathVertex->mlHeroLaneThroughput[0].c[0] : 0.0;
 
-	// ML HERO phase 15de: preserve classic RGB throughput before this bounce so
-	// the material's native RGB color can be compared with the HERO packet.
-	const Spectrum mlHero15deClassicBefore = pathVertex->throughput;
-
 	bool mlHeroBeforeScalar[8] = { true, true, true, true, true, true, true, true };
 	Spectrum mlHeroBeforeTP[8];
-	if (pathVertex->mlHeroLaneCount > 0u) {
+	if (GetMLHeroWavelengthCount() > 1u) {
 		for (u_int lane = 0; lane < pathVertex->mlHeroLaneCount; ++lane) {
 			mlHeroBeforeTP[lane] = pathVertex->mlHeroLaneThroughput[lane];
 			mlHeroBeforeScalar[lane] = MLHeroIsScalarSpectrum(mlHeroBeforeTP[lane]);
@@ -4004,225 +3483,6 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 			&bsdfPdfW, &cosSampledDir, &event);
 	if (bsdfSample.Black())
 		return false;
-
-	// ML HERO phase 15ct: validate continuous RoughGlass at the active HERO
-	// wavelength. For a non-delta BSDF sample, Sample() should match
-	// Evaluate(sampledDir) / Pdf(sampledDir), and the sampling PDF should match
-	// Evaluate()'s direct PDF. Skip the near-delta SPECULAR branch on purpose.
-	if (MLHeroCurrentDiagnosticsEnabled15cq() &&
-			(pathVertex->bsdf.GetMaterialType() == ROUGHGLASS) &&
-			(event & GLOSSY) && !(event & SPECULAR)) {
-		const bool fromLight15ct = pathVertex->bsdf.hitPoint.fromLight;
-		const bool transmit15ct = (event & TRANSMIT) != 0;
-		const u_int case15ct = (fromLight15ct ? 2u : 0u) + (transmit15ct ? 1u : 0u);
-		mlHero15ctRoughGlassSamples[case15ct].fetch_add(1ull, std::memory_order_relaxed);
-
-		BSDFEvent evalEvent15ct = NONE;
-		float evalPdf15ct = 0.f, evalRevPdf15ct = 0.f;
-		const Spectrum eval15ct = pathVertex->bsdf.Evaluate(sampledDir,
-				&evalEvent15ct, &evalPdf15ct, &evalRevPdf15ct);
-
-		if (eval15ct.Black() || !(evalPdf15ct > 0.f)) {
-			mlHero15ctRoughGlassEvalBlack[case15ct].fetch_add(1ull, std::memory_order_relaxed);
-		} else {
-			const bool eventMatches15ct =
-				((event & REFLECT) == (evalEvent15ct & REFLECT)) &&
-				((event & TRANSMIT) == (evalEvent15ct & TRANSMIT));
-			if (!eventMatches15ct)
-				mlHero15ctRoughGlassEventMismatch[case15ct].fetch_add(1ull, std::memory_order_relaxed);
-
-			const double pdfDen15ct = Max(1e-12, Max(fabs((double)bsdfPdfW), fabs((double)evalPdf15ct)));
-			const double pdfRelErr15ct = fabs((double)bsdfPdfW - (double)evalPdf15ct) / pdfDen15ct;
-			mlHero15ctRoughGlassPdfRelErrSum[case15ct].fetch_add(pdfRelErr15ct, std::memory_order_relaxed);
-			MLHeroAtomicMax15co(mlHero15ctRoughGlassPdfRelErrMax[case15ct], pdfRelErr15ct);
-
-			const Spectrum reconstructed15ct = eval15ct / evalPdf15ct;
-			const double sampleDen15ct = Max(1e-12,
-				Max(fabs((double)bsdfSample.c[0]),
-					Max(fabs((double)bsdfSample.c[1]), fabs((double)bsdfSample.c[2]))));
-			const double sampleRelErr15ct = Max(
-				fabs((double)bsdfSample.c[0] - (double)reconstructed15ct.c[0]),
-				Max(fabs((double)bsdfSample.c[1] - (double)reconstructed15ct.c[1]),
-					fabs((double)bsdfSample.c[2] - (double)reconstructed15ct.c[2]))) / sampleDen15ct;
-			mlHero15ctRoughGlassSampleRelErrSum[case15ct].fetch_add(sampleRelErr15ct, std::memory_order_relaxed);
-			MLHeroAtomicMax15co(mlHero15ctRoughGlassSampleRelErrMax[case15ct], sampleRelErr15ct);
-		}
-	}
-
-	// ML HERO phase 15cw: evaluate the already sampled continuous RoughGlass
-	// direction across every packet wavelength. Unlike ideal delta Glass, a
-	// rough microfacet lobe can retain finite support for companion wavelengths;
-	// this diagnostic quantifies that support without changing renderer physics.
-	if (MLHeroCurrentDiagnosticsEnabled15cq() &&
-			(pathVertex->bsdf.GetMaterialType() == ROUGHGLASS) &&
-			(event & GLOSSY) && !(event & SPECULAR) &&
-			(GetMLHeroWavelengthCount() > 1u)) {
-		const bool fromLight15cw = pathVertex->bsdf.hitPoint.fromLight;
-		const bool transmit15cw = (event & TRANSMIT) != 0;
-		const u_int case15cw = (fromLight15cw ? 2u : 0u) + (transmit15cw ? 1u : 0u);
-		const unsigned long long attempt15cw = mlHero15cwRoughGlassAttempts[case15cw].fetch_add(1ull, std::memory_order_relaxed);
-
-		if (attempt15cw < MLHERO_15CW_EVENT_BUDGET_PER_CASE) {
-			mlHero15cwRoughGlassEvents[case15cw].fetch_add(1ull, std::memory_order_relaxed);
-
-			const u_int savedLane15cw = GetMLHeroActiveLane();
-			const bool savedDispersionUsed15cw = GetMLDispersionUsed();
-			const u_int laneCount15cw = Min(GetMLHeroWavelengthCount(), MLHERO_15CW_MAX_LANES);
-			const Vector localFixed15cx = pathVertex->bsdf.GetFrame().ToLocal(pathVertex->bsdf.hitPoint.fixedDir);
-			const Vector localSampled15cx = pathVertex->bsdf.GetFrame().ToLocal(sampledDir);
-			float heroPdf15cw = 0.f;
-			float heroFilter15cx = 0.f;
-			double heroMultiplier15cw = 0.0;
-			bool heroValid15cw = false;
-			float lanePdf15cy[MLHERO_15CW_MAX_LANES] = { 0.f };
-			float laneFilter15cy[MLHERO_15CW_MAX_LANES] = { 0.f };
-			bool laneValid15cy[MLHERO_15CW_MAX_LANES] = { false };
-
-			for (u_int lane15cw = 0u; lane15cw < laneCount15cw; ++lane15cw) {
-				SetMLHeroActiveLane(lane15cw);
-
-				BSDFEvent laneEvent15cw = NONE;
-				float lanePdf15cw = 0.f, laneRevPdf15cw = 0.f;
-				const Spectrum laneEval15cw = pathVertex->bsdf.Evaluate(sampledDir,
-						&laneEvent15cw, &lanePdf15cw, &laneRevPdf15cw);
-
-				mlHero15cwLaneLambdaSum[case15cw][lane15cw].fetch_add(
-						(double)GetMLHeroWaveLengthAt(lane15cw), std::memory_order_relaxed);
-
-				const bool eventMatches15cw =
-						((event & REFLECT) == (laneEvent15cw & REFLECT)) &&
-						((event & TRANSMIT) == (laneEvent15cw & TRANSMIT));
-				const bool valid15cw = !laneEval15cw.Black() && (lanePdf15cw > 0.f) && eventMatches15cw;
-				lanePdf15cy[lane15cw] = lanePdf15cw;
-				laneFilter15cy[lane15cw] = laneEval15cw.Filter();
-				laneValid15cy[lane15cw] = valid15cw;
-
-				if (!eventMatches15cw)
-					mlHero15cwLaneEventMismatch[case15cw][lane15cw].fetch_add(1ull, std::memory_order_relaxed);
-
-				if (!valid15cw) {
-					mlHero15cwLaneBlackOrZeroPdf[case15cw][lane15cw].fetch_add(1ull, std::memory_order_relaxed);
-				} else {
-					mlHero15cwLaneValid[case15cw][lane15cw].fetch_add(1ull, std::memory_order_relaxed);
-					const double laneMultiplier15cw = (double)laneEval15cw.Filter() / (double)lanePdf15cw;
-
-					if (lane15cw == 0u) {
-						heroPdf15cw = lanePdf15cw;
-						heroFilter15cx = laneEval15cw.Filter();
-						heroMultiplier15cw = laneMultiplier15cw;
-						heroValid15cw = true;
-					} else if (heroValid15cw && (heroPdf15cw > 0.f) && (fabs(heroMultiplier15cw) > 1e-20)) {
-						const double pdfRatio15cw = (double)lanePdf15cw / (double)heroPdf15cw;
-						const double multiplierRatio15cw = laneMultiplier15cw / heroMultiplier15cw;
-						mlHero15cwLanePdfRatioSum[case15cw][lane15cw].fetch_add(pdfRatio15cw, std::memory_order_relaxed);
-						MLHeroAtomicMax15co(mlHero15cwLanePdfRatioMax[case15cw][lane15cw], fabs(pdfRatio15cw));
-						mlHero15cwLaneMultiplierRatioSum[case15cw][lane15cw].fetch_add(multiplierRatio15cw, std::memory_order_relaxed);
-						mlHero15cwLaneRatioCount[case15cw][lane15cw].fetch_add(1ull, std::memory_order_relaxed);
-						const double absMultiplierRatio15cx = fabs(multiplierRatio15cw);
-						MLHeroAtomicMax15co(mlHero15cwLaneMultiplierRatioMax[case15cw][lane15cw], absMultiplierRatio15cx);
-						{
-							// 15db cleanup: compare and update under the same lock; the previous
-							// unlocked pre-check was a diagnostics-only C++ data race.
-							std::lock_guard<std::mutex> lock15cx(mlHero15cxMutex);
-							if (absMultiplierRatio15cx > mlHero15cxLaneExtremeOutlier[case15cw][lane15cw].absMultiplierRatio) {
-								auto &out15cx = mlHero15cxLaneExtremeOutlier[case15cw][lane15cw];
-								out15cx.valid = true;
-								out15cx.absMultiplierRatio = absMultiplierRatio15cx;
-								out15cx.multiplierRatio = multiplierRatio15cw;
-								out15cx.pdfRatio = pdfRatio15cw;
-								out15cx.heroLambda = GetMLHeroWaveLengthAt(0u);
-								out15cx.laneLambda = GetMLHeroWaveLengthAt(lane15cw);
-								out15cx.heroPdf = heroPdf15cw;
-								out15cx.lanePdf = lanePdf15cw;
-								out15cx.heroFilter = heroFilter15cx;
-								out15cx.laneFilter = laneEval15cw.Filter();
-								out15cx.heroMultiplier = heroMultiplier15cw;
-								out15cx.laneMultiplier = laneMultiplier15cw;
-								out15cx.cosFixed = localFixed15cx.z;
-								out15cx.cosSampled = localSampled15cx.z;
-								out15cx.eventIndex = attempt15cw + 1ull;
-							}
-						}
-					}
-				}
-			}
-
-			// ML HERO phase 15cy: counterfactual equal-prior spectral mixture.
-			// This is intentionally diagnostic-only until the matching sampling/MIS
-			// construction has been validated.
-			double sumPdf15cy = 0.0;
-			double sumPdfSq15cz = 0.0;
-			u_int validTechniqueCount15cy = 0u;
-			for (u_int lane15cy = 0u; lane15cy < laneCount15cw; ++lane15cy) {
-				if (laneValid15cy[lane15cy]) {
-					const double p15cz = (double)lanePdf15cy[lane15cy];
-					sumPdf15cy += p15cz;
-					sumPdfSq15cz += p15cz * p15cz;
-					++validTechniqueCount15cy;
-				}
-			}
-			if ((validTechniqueCount15cy > 0u) && (sumPdf15cy > 1e-30)) {
-				const double mixPdf15cy = sumPdf15cy / (double)validTechniqueCount15cy;
-				mlHero15cyMixPdfSum[case15cw].fetch_add(mixPdf15cy, std::memory_order_relaxed);
-				// Atomic min via compare/exchange because std::atomic<double> has no fetch_min.
-				double oldMin15cy = mlHero15cyMixPdfMin[case15cw].load(std::memory_order_relaxed);
-				while ((mixPdf15cy < oldMin15cy) && !mlHero15cyMixPdfMin[case15cw].compare_exchange_weak(
-						oldMin15cy, mixPdf15cy, std::memory_order_relaxed, std::memory_order_relaxed)) { }
-				for (u_int lane15cy = 0u; lane15cy < laneCount15cw; ++lane15cy) {
-					if (!laneValid15cy[lane15cy])
-						continue;
-					const double rawMultiplier15cy = (double)laneFilter15cy[lane15cy] / (double)lanePdf15cy[lane15cy];
-					const double mixMultiplier15cy = (double)laneFilter15cy[lane15cy] / mixPdf15cy;
-					const double rawAbs15cy = fabs(rawMultiplier15cy);
-					const double mixAbs15cy = fabs(mixMultiplier15cy);
-					const double balanceWeight15cy = (double)lanePdf15cy[lane15cy] / sumPdf15cy;
-					const double mixOverRaw15cy = (rawAbs15cy > 1e-30) ? (mixAbs15cy / rawAbs15cy) : 0.0;
-					const double lanePdfD15cz = (double)lanePdf15cy[lane15cy];
-					const double power2Weight15cz = (sumPdfSq15cz > 1e-30) ?
-						(lanePdfD15cz * lanePdfD15cz / sumPdfSq15cz) : 0.0;
-					const double power2Multiplier15cz = rawMultiplier15cy *
-						(double)validTechniqueCount15cy * power2Weight15cz;
-					const double power2Abs15cz = fabs(power2Multiplier15cz);
-					const double power2OverRaw15cz = (rawAbs15cy > 1e-30) ?
-						(power2Abs15cz / rawAbs15cy) : 0.0;
-					mlHero15cyCount[case15cw][lane15cy].fetch_add(1ull, std::memory_order_relaxed);
-					mlHero15cyRawMultiplierAbsSum[case15cw][lane15cy].fetch_add(rawAbs15cy, std::memory_order_relaxed);
-					MLHeroAtomicMax15co(mlHero15cyRawMultiplierAbsMax[case15cw][lane15cy], rawAbs15cy);
-					mlHero15cyMixMultiplierAbsSum[case15cw][lane15cy].fetch_add(mixAbs15cy, std::memory_order_relaxed);
-					MLHeroAtomicMax15co(mlHero15cyMixMultiplierAbsMax[case15cw][lane15cy], mixAbs15cy);
-					mlHero15cyMixOverRawSum[case15cw][lane15cy].fetch_add(mixOverRaw15cy, std::memory_order_relaxed);
-					MLHeroAtomicMax15co(mlHero15cyMixOverRawMax[case15cw][lane15cy], mixOverRaw15cy);
-					mlHero15cyBalanceWeightSum[case15cw][lane15cy].fetch_add(balanceWeight15cy, std::memory_order_relaxed);
-					MLHeroAtomicMax15co(mlHero15cyBalanceWeightMax[case15cw][lane15cy], balanceWeight15cy);
-					mlHero15czPower2MultiplierAbsSum[case15cw][lane15cy].fetch_add(power2Abs15cz, std::memory_order_relaxed);
-					MLHeroAtomicMax15co(mlHero15czPower2MultiplierAbsMax[case15cw][lane15cy], power2Abs15cz);
-					mlHero15czPower2OverRawSum[case15cw][lane15cy].fetch_add(power2OverRaw15cz, std::memory_order_relaxed);
-					MLHeroAtomicMax15co(mlHero15czPower2OverRawMax[case15cw][lane15cy], power2OverRaw15cz);
-					mlHero15czPower2WeightSum[case15cw][lane15cy].fetch_add(power2Weight15cz, std::memory_order_relaxed);
-					MLHeroAtomicMax15co(mlHero15czPower2WeightMax[case15cw][lane15cy], power2Weight15cz);
-					// 15da: keep the raw estimator as one endpoint and move only part-way
-					// toward the full Balance correction. Because sum(N*w_i)=N, each
-					// alpha preserves the packet-average correction by construction.
-					const double fullBalanceRatio15da = (double)validTechniqueCount15cy * balanceWeight15cy;
-					for (u_int b15da = 0u; b15da < MLHERO_15DA_BLEND_COUNT; ++b15da) {
-						const double alpha15da = mlHero15daBlendAlpha[b15da];
-						const double blendRatio15da = (1.0 - alpha15da) + alpha15da * fullBalanceRatio15da;
-						const double blendAbs15da = rawAbs15cy * fabs(blendRatio15da);
-						mlHero15daMultiplierAbsSum[b15da][case15cw][lane15cy].fetch_add(blendAbs15da, std::memory_order_relaxed);
-						MLHeroAtomicMax15co(mlHero15daMultiplierAbsMax[b15da][case15cw][lane15cy], blendAbs15da);
-						mlHero15daOverRawSum[b15da][case15cw][lane15cy].fetch_add(fabs(blendRatio15da), std::memory_order_relaxed);
-						MLHeroAtomicMax15co(mlHero15daOverRawMax[b15da][case15cw][lane15cy], fabs(blendRatio15da));
-					}
-				}
-			}
-
-			// Restore the renderer's HERO state exactly. SetMLHeroActiveLane() resets
-			// the dispersion-used flag, so restore that flag explicitly as well.
-			SetMLHeroActiveLane(savedLane15cw);
-			if (savedDispersionUsed15cw)
-				MarkMLDispersionUsed();
-		}
-	}
 
 	float bsdfRevPdfW;
 	if ((GetMLHeroWavelengthCount() > 1u) && (event & SPECULAR)) {
@@ -5118,14 +4378,12 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 			(engine->mlHeroGlassMode == 2) && glassSpecularCandidate15bx;
 		const bool glassLaneEvalActive15ca =
 			glassPerLaneWeightActive15ay || mode2LanePdfActive15ca;
-		// ML HERO phase 15cs: all Glass modes must collapse to the sampled HERO
-		// wavelength after a truly dispersive perfect-specular transmission.
-		// If no per-lane Glass evaluation is active (notably Mode 0 with PLW off),
-		// perform a lightweight wavelength scan only for dispersion detection.
-		// This does not alter throughput, PDF, sampled direction or event.
-		const bool glassNeedsIndependentDispersionDetection15cs =
-			glassSpecularCandidate15bx && (event & TRANSMIT) &&
-			!glassLaneEvalActive15ca;
+		// HERO_64 / 15bx: Mode 1 must still detect a dispersive Glass transmit
+		// when per-lane weighting is disabled.  This detection is deliberately
+		// separate from the throughput-weighting switch.
+		const bool mode1NeedsIndependentDispersionDetection15bx =
+			(engine->mlHeroGlassMode == 1) && glassSpecularCandidate15bx &&
+			(event & TRANSMIT) && !glassPerLaneWeightActive15ay;
 		float glassAdjointCorrection15ay = 1.f;
 		if (glassPerLaneWeightActive15ay && pathVertex->bsdf.hitPoint.fromLight) {
 			const float absDotFixedNG15ay = AbsDot(pathVertex->bsdf.hitPoint.fixedDir,
@@ -5181,7 +4439,7 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 		bool heroTir15bb = false;
 		Spectrum heroMultiplier15bb;
 		bool heroGlassEvalOk15bx = false;
-		if ((glassLaneEvalActive15ca || glassNeedsIndependentDispersionDetection15cs) &&
+		if ((glassLaneEvalActive15ca || mode1NeedsIndependentDispersionDetection15bx) &&
 				(heroLambda15ba > 0.f))
 			heroGlassEvalOk15bx = pathVertex->bsdf.EvaluateMLHeroGlassDebugAtWaveLength(
 				sampledDir, event, bsdfPdfW, heroLambda15ba,
@@ -5193,49 +4451,6 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 
 		const Vector localFixed15bb = pathVertex->bsdf.GetFrame().ToLocal(pathVertex->bsdf.hitPoint.fixedDir);
 		const Vector localSampled15bb = pathVertex->bsdf.GetFrame().ToLocal(sampledDir);
-
-		// ML HERO phase 15dk: compare three ownership models at the exact same Glass
-		// event before any lane throughput is changed. Diagnostic only.
-		if (glassSpecularCandidate15bx && MLHeroCurrentDiagnosticsEnabled15cq())
-			MLHero15dkRecordEvent(pathVertex->bsdf.hitPoint.fromLight, event, *pathVertex, bsdfSample);
-
-		// ML HERO phase 15dj: evaluate the same wavelength-specific ideal-Glass helper
-		// for every Glass mode without changing renderer state.
-		if (glassSpecularCandidate15bx && (pathVertex->mlHeroLaneCount > 0u) &&
-				MLHeroCurrentDiagnosticsEnabled15cq()) {
-			const float fixedNg15dj = AbsDot(pathVertex->bsdf.hitPoint.fixedDir, pathVertex->bsdf.hitPoint.geometryN);
-			const float diagCallerAdjoint15dj = (pathVertex->bsdf.hitPoint.fromLight && (fixedNg15dj > 1e-20f)) ?
-				(AbsDot(sampledDir, pathVertex->bsdf.hitPoint.geometryN) / fixedNg15dj) : 1.f;
-			for (u_int lane15dj = 0u; lane15dj < pathVertex->mlHeroLaneCount; ++lane15dj) {
-				float nc15dj = 0.f, ntBase15dj = 0.f, ntLambda15dj = 0.f;
-				float fresnel15dj = 0.f, eta15dj = 0.f, eta2_15dj = 0.f;
-				float transport15dj = 0.f, dirDelta15dj = 0.f;
-				float cosFixed15dj = 0.f, sinI2_15dj = 0.f, sinT2_15dj = 0.f;
-				float lanePdf15dj = 0.f;
-				bool tir15dj = false;
-				Spectrum materialMultiplier15dj;
-				const float lambda15dj = pathVertex->mlHeroLaneWaveLength[lane15dj];
-				const bool ok15dj = pathVertex->bsdf.EvaluateMLHeroGlassDebugAtWaveLength(
-					sampledDir, event, bsdfPdfW, lambda15dj,
-					&nc15dj, &ntBase15dj, &ntLambda15dj,
-					&fresnel15dj, &eta15dj, &eta2_15dj, &transport15dj,
-					&dirDelta15dj, &materialMultiplier15dj,
-					&cosFixed15dj, &sinI2_15dj, &sinT2_15dj, &tir15dj,
-					&lanePdf15dj);
-				const float sharedLane15dj = MLHeroGlassLaneColorSample15df(bsdfSample, lambda15dj);
-				float modeApplied15dj = sharedLane15dj;
-				if (engine->mlHeroGlassPerLaneWeight && ok15dj)
-					modeApplied15dj = MLHeroGlassLaneColorSample15df(materialMultiplier15dj * diagCallerAdjoint15dj, lambda15dj);
-#if !ML_HERO_MODE2_SHARED_HERO_PDF_15DI
-				if ((engine->mlHeroGlassMode == 2) && ok15dj && (lanePdf15dj > 1e-20f))
-					modeApplied15dj *= bsdfPdfW / lanePdf15dj;
-#endif
-				MLHero15djRecord(pathVertex->bsdf.hitPoint.fromLight, event, lambda15dj,
-					ok15dj, materialMultiplier15dj, fresnel15dj, transport15dj,
-					bsdfPdfW, lanePdf15dj, diagCallerAdjoint15dj, sharedLane15dj,
-					modeApplied15dj, eta15dj, ntLambda15dj, dirDelta15dj);
-			}
-		}
 
 		// ML HERO phase 15bc: counterfactual equal-weight spectral mixture density.
 		// This is diagnostic only. The renderer still samples the event with the HERO
@@ -5264,9 +4479,10 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 		}
 
 		bool dispersiveSpecularTransmit15be = false;
-		// ML HERO phase 15cs: when no per-lane Glass evaluation is active, do the
-		// lightweight scan here so Mode 0/1/2 all detect the same physical boundary.
-		if (glassNeedsIndependentDispersionDetection15cs && heroGlassEvalOk15bx &&
+		// HERO_64 / 15bx: when per-lane Glass weighting is OFF, do a lightweight
+		// wavelength scan only to decide whether Mode 1 must terminate the packet.
+		// The scan does not alter throughput, PDF, sampled direction or event.
+		if (mode1NeedsIndependentDispersionDetection15bx && heroGlassEvalOk15bx &&
 				(event & TRANSMIT) && (pathVertex->mlHeroLaneCount > 1u)) {
 			for (u_int lane15bx = 1u; lane15bx < pathVertex->mlHeroLaneCount; ++lane15bx) {
 				float nc15bx = 0.f, ntBase15bx = 0.f, ntLambda15bx = 0.f;
@@ -5294,57 +4510,11 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 		// applied to each lane.  This is diagnostic-only and lets us reconstruct a
 		// shared-weight counterfactual at the same bounce without a second render.
 		float lanePreGlassScalar15br[8] = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
-		Spectrum lanePreGlassSpectrum15dm[8];
 		float laneAppliedGlassMultiplier15br[8] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f };
 		const float sharedGlassMultiplier15br =
 			(bsdfSample.c[0] + bsdfSample.c[1] + bsdfSample.c[2]) / 3.f;
-
-		// ML HERO phase 15db: first real RoughGlass Mode-2 render experiment.
-		// Sample() keeps one shared HERO direction. Continuous RoughGlass TRANSMIT
-		// evaluates that direction at each vertex-owned wavelength and uses the
-		// 25% partial Balance correction selected by the 15da diagnostic.
-		const bool roughGlassMode2Transmit15db =
-			(engine->mlHeroGlassMode == 2) &&
-			(pathVertex->bsdf.GetMaterialType() == ROUGHGLASS) &&
-			(event & TRANSMIT) && (event & GLOSSY) && !(event & SPECULAR) &&
-			(pathVertex->mlHeroLaneCount > 1u);
-		Spectrum roughGlassLaneEval15db[8];
-		float roughGlassLanePdf15db[8] = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
-		bool roughGlassLaneValid15db[8] = { false, false, false, false, false, false, false, false };
-		double roughGlassPdfSum15db = 0.0;
-		u_int roughGlassValidCount15db = 0u;
-		if (roughGlassMode2Transmit15db) {
-			const float savedWaveLength15db = mlDispersionWaveLength;
-			const bool savedDispersionUsed15db = mlDispersionUsed;
-			const u_int laneCount15db = Min(pathVertex->mlHeroLaneCount, 8u);
-			for (u_int lane15db = 0u; lane15db < laneCount15db; ++lane15db) {
-				mlDispersionWaveLength = pathVertex->mlHeroLaneWaveLength[lane15db];
-				mlDispersionUsed = false;
-				BSDFEvent laneEvent15db = NONE;
-				float lanePdf15db = 0.f, laneRevPdf15db = 0.f;
-				const Spectrum laneEval15db = pathVertex->bsdf.Evaluate(sampledDir,
-					&laneEvent15db, &lanePdf15db, &laneRevPdf15db);
-				const bool eventMatches15db =
-					((event & TRANSMIT) == (laneEvent15db & TRANSMIT)) &&
-					((event & REFLECT) == (laneEvent15db & REFLECT));
-				const bool valid15db = !laneEval15db.Black() && (lanePdf15db > 1e-20f) && eventMatches15db;
-				roughGlassLaneEval15db[lane15db] = laneEval15db;
-				roughGlassLanePdf15db[lane15db] = lanePdf15db;
-				roughGlassLaneValid15db[lane15db] = valid15db;
-				if (valid15db) {
-					roughGlassPdfSum15db += (double)lanePdf15db;
-					++roughGlassValidCount15db;
-				}
-			}
-			mlDispersionWaveLength = savedWaveLength15db;
-			mlDispersionUsed = savedDispersionUsed15db;
-			if ((roughGlassValidCount15db > 0u) && (roughGlassPdfSum15db > 1e-30))
-				mlHero15dbAppliedEvents.fetch_add(1ull, std::memory_order_relaxed);
-		}
-
 		for (u_int lane = 0; lane < pathVertex->mlHeroLaneCount; ++lane) {
 			lanePreGlassScalar15br[lane] = pathVertex->mlHeroLaneThroughput[lane].c[0];
-			if (lane < 8u) lanePreGlassSpectrum15dm[lane] = pathVertex->mlHeroLaneThroughput[lane];
 			Spectrum laneSample;
 			if (glassLaneEvalActive15ca) {
 				float nc15ay = 0.f, ntBase15ay = 0.f, ntLambda15ay = 0.f;
@@ -5430,11 +4600,8 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 				if (ok15ay) {
 					const Spectrum wrappedIdealMultiplier15ay =
 						materialIdealMultiplier15ay * glassAdjointCorrection15ay;
-					// ML HERO phase 15df: do not collapse chromatic Glass RGB to a
-					// single gray scalar. Sample the RGB multiplier at this lane's
-					// wavelength so Reflection/Transmission Color survives packet mode.
 					const float laneGlassMultiplier15ay =
-						MLHeroGlassLaneColorSample15df(wrappedIdealMultiplier15ay, laneLambda15ba);
+						(wrappedIdealMultiplier15ay.c[0] + wrappedIdealMultiplier15ay.c[1] + wrappedIdealMultiplier15ay.c[2]) / 3.f;
 
 					const float sharedGlassMultiplier15az =
 						(bsdfSample.c[0] + bsdfSample.c[1] + bsdfSample.c[2]) / 3.f;
@@ -5544,142 +4711,34 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 						}
 					}
 
-					// 15di: PLW controls only the base Glass multiplier. Mode 2 keeps its
-					// experiment independent; this build tests shared HERO-PDF ownership.
-					const float sharedGlassLaneMultiplier15df =
-						MLHeroGlassLaneColorSample15df(bsdfSample, laneLambda15ba);
-					const float baseGlassMultiplier15dg = engine->mlHeroGlassPerLaneWeight ?
-						laneGlassMultiplier15ay : sharedGlassLaneMultiplier15df;
-					float appliedGlassMultiplier15be = baseGlassMultiplier15dg;
-					bool supportMismatch15dg = false;
+					// 15ca: PLW controls only the base Glass multiplier. Mode 2 controls
+					// the lane-event-PDF correction independently.
+					float appliedGlassMultiplier15be = engine->mlHeroGlassPerLaneWeight ?
+						laneGlassMultiplier15ay : sharedGlassMultiplier15br;
 					if (engine->mlHeroGlassMode == 2) {
+						// Experimental approximation: correct only the discrete Glass event
+						// probability for this wavelength while retaining the shared HERO ray.
+						// This is intentionally not presented as full spectral path-space MIS.
 						const bool sameEventSupport15be = !(event & TRANSMIT) ||
 							(heroTir15bb == tir15ba);
-
-#if ML_HERO_MODE2_SHARED_HERO_PDF_15DI
-						// 15di candidate: the path direction/event was sampled with the HERO
-						// PDF (bsdfPdfW). The wavelength-specific Glass helper already returns
-						// f(lambda_i) / p_HERO for the shared sampled event, so companion lanes
-						// must not be divided a second time by p_i. This intentionally removes
-						// the legacy bsdfPdfW/laneEventPdfW reweighting for Mode 2 only.
-						// Event-support mismatches still use the established 15df fallback.
-						if (!sameEventSupport15be) {
-							appliedGlassMultiplier15be = sharedGlassLaneMultiplier15df;
-							supportMismatch15dg = true;
-						}
-#else
-						// Legacy Mode 2 experimental approximation retained for A/B builds.
 						if (sameEventSupport15be && (laneEventPdfW15ba > 1e-20f))
 							appliedGlassMultiplier15be *= bsdfPdfW / laneEventPdfW15ba;
 						else {
-							appliedGlassMultiplier15be = sharedGlassLaneMultiplier15df;
-							supportMismatch15dg = true;
+							const float sharedGlassMultiplier15be =
+								(bsdfSample.c[0] + bsdfSample.c[1] + bsdfSample.c[2]) / 3.f;
+							appliedGlassMultiplier15be = sharedGlassMultiplier15be;
 						}
-#endif
 					}
-
-					// ML HERO phase 15dg: diagnostic-only same-direction control.
-					MLHero15dgRecord(MLHero15dgGlassCase(pathVertex->bsdf.hitPoint.fromLight, event),
-						laneLambda15ba, (double)pathVertex->mlHeroLaneThroughput[lane].Filter(),
-						(double)baseGlassMultiplier15dg, (double)appliedGlassMultiplier15be, supportMismatch15dg);
 
 					laneAppliedGlassMultiplier15br[lane] = appliedGlassMultiplier15be;
 					pathVertex->mlHeroLaneThroughput[lane] *= Spectrum(appliedGlassMultiplier15be);
 				} else {
-					// ML HERO phase 15df safety fallback: keep the shared HERO Glass
-					// result, but do not destroy chroma by reducing it to RGB average.
-					const float scalarBsdf15df = MLHeroGlassLaneColorSample15df(
-						bsdfSample, pathVertex->mlHeroLaneWaveLength[lane]);
-					laneAppliedGlassMultiplier15br[lane] = scalarBsdf15df;
-					pathVertex->mlHeroLaneThroughput[lane] *= Spectrum(scalarBsdf15df);
+					// Safety fallback: preserve the previous shared-HERO behavior.
+					const float scalarBsdf15ay =
+						(bsdfSample.c[0] + bsdfSample.c[1] + bsdfSample.c[2]) / 3.f;
+					laneAppliedGlassMultiplier15br[lane] = scalarBsdf15ay;
+					pathVertex->mlHeroLaneThroughput[lane] *= Spectrum(scalarBsdf15ay);
 				}
-			} else if (roughGlassMode2Transmit15db && (lane < 8u) &&
-					(roughGlassValidCount15db > 0u) && (roughGlassPdfSum15db > 1e-30) &&
-					roughGlassLaneValid15db[lane]) {
-				const double lanePdf15db = (double)roughGlassLanePdf15db[lane];
-				const double balanceWeight15db = lanePdf15db / roughGlassPdfSum15db;
-				const double fullBalanceRatio15db =
-					(double)roughGlassValidCount15db * balanceWeight15db;
-				const double blendRatio15db = .75 + .25 * fullBalanceRatio15db;
-				// ML HERO phase 15df: RoughGlass Mode 2 had the same chroma-loss
-				// pattern as ideal Glass because Filter() reduced a chromatic lane
-				// evaluation to one gray scalar. Reconstruct the lane evaluation at
-				// its own wavelength before the existing PDF/blend logic.
-				const double rawMultiplier15db =
-					(double)MLHeroGlassLaneColorSample15df(roughGlassLaneEval15db[lane],
-						pathVertex->mlHeroLaneWaveLength[lane]) / lanePdf15db;
-				const double appliedMultiplier15db = rawMultiplier15db * blendRatio15db;
-
-				// ML HERO phase 15dg: same-direction raw-vs-Blend25 energy audit.
-				MLHero15dgRecord(MLHero15dgRoughTransmitCase(pathVertex->bsdf.hitPoint.fromLight),
-					pathVertex->mlHeroLaneWaveLength[lane],
-					(double)pathVertex->mlHeroLaneThroughput[lane].Filter(),
-					rawMultiplier15db, appliedMultiplier15db, false);
-
-				// ML HERO phase 15dc: observe full-render tails before throughput update.
-				const u_int transportCase15dc = pathVertex->bsdf.hitPoint.fromLight ? 1u : 0u;
-				const double absRaw15dc = fabs(rawMultiplier15db);
-				const double absApplied15dc = fabs(appliedMultiplier15db);
-				const unsigned long long laneOrdinal15dc =
-					mlHero15dcCaseLanes[transportCase15dc].fetch_add(1ull, std::memory_order_relaxed) + 1ull;
-				for (u_int bin15dc = 0u; bin15dc < MLHERO_15DC_TAIL_BINS; ++bin15dc) {
-					if (absRaw15dc > mlHero15dcTailThreshold[bin15dc])
-						mlHero15dcRawTailCount[transportCase15dc][bin15dc].fetch_add(1ull, std::memory_order_relaxed);
-					if (absApplied15dc > mlHero15dcTailThreshold[bin15dc])
-						mlHero15dcAppliedTailCount[transportCase15dc][bin15dc].fetch_add(1ull, std::memory_order_relaxed);
-				}
-
-				const double mixPdf15dc = roughGlassPdfSum15db / (double)roughGlassValidCount15db;
-				const float heroPdf15dc = roughGlassLanePdf15db[0];
-				const double heroRaw15dc = (roughGlassLaneValid15db[0] && (heroPdf15dc > 1e-20f)) ?
-					((double)MLHeroGlassLaneColorSample15df(roughGlassLaneEval15db[0],
-						pathVertex->mlHeroLaneWaveLength[0]) / (double)heroPdf15dc) : 0.0;
-				auto fillTail15dc = [&](MLHero15dcTailOutlier &out15dc) {
-					out15dc.valid = true;
-					out15dc.absRaw = absRaw15dc;
-					out15dc.absApplied = absApplied15dc;
-					out15dc.rawMultiplier = rawMultiplier15db;
-					out15dc.appliedMultiplier = appliedMultiplier15db;
-					out15dc.blendRatio = blendRatio15db;
-					out15dc.balanceWeight = balanceWeight15db;
-					out15dc.mixPdf = mixPdf15dc;
-					out15dc.heroPdf = heroPdf15dc;
-					out15dc.lanePdf = roughGlassLanePdf15db[lane];
-					out15dc.heroRawMultiplier = heroRaw15dc;
-					out15dc.heroLambda = pathVertex->mlHeroLaneWaveLength[0];
-					out15dc.laneLambda = pathVertex->mlHeroLaneWaveLength[lane];
-					out15dc.cosFixed = localFixed15bb.z;
-					out15dc.cosSampled = localSampled15bb.z;
-					out15dc.lane = lane;
-					out15dc.depth = pathVertex->depth;
-					out15dc.laneOrdinal = laneOrdinal15dc;
-				};
-				if (MLHeroAtomicClaimMax15dc(mlHero15dcRawMaxHint[transportCase15dc], absRaw15dc)) {
-					std::lock_guard<std::mutex> lock15dc(mlHero15dcTailMutex);
-					if (!mlHero15dcWorstRaw[transportCase15dc].valid ||
-							absRaw15dc > mlHero15dcWorstRaw[transportCase15dc].absRaw)
-						fillTail15dc(mlHero15dcWorstRaw[transportCase15dc]);
-				}
-				if (MLHeroAtomicClaimMax15dc(mlHero15dcAppliedMaxHint[transportCase15dc], absApplied15dc)) {
-					std::lock_guard<std::mutex> lock15dc(mlHero15dcTailMutex);
-					if (!mlHero15dcWorstApplied[transportCase15dc].valid ||
-							absApplied15dc > mlHero15dcWorstApplied[transportCase15dc].absApplied)
-						fillTail15dc(mlHero15dcWorstApplied[transportCase15dc]);
-				}
-
-				pathVertex->mlHeroLaneThroughput[lane] *= Spectrum((float)appliedMultiplier15db);
-				mlHero15dbAppliedLanes.fetch_add(1ull, std::memory_order_relaxed);
-				mlHero15dbAppliedMultiplierAbsSum.fetch_add(fabs(appliedMultiplier15db), std::memory_order_relaxed);
-				MLHeroAtomicMax15co(mlHero15dbAppliedMultiplierAbsMax, fabs(appliedMultiplier15db));
-				mlHero15dbAppliedOverRawSum.fetch_add(fabs(blendRatio15db), std::memory_order_relaxed);
-				MLHeroAtomicMax15co(mlHero15dbAppliedOverRawMax, fabs(blendRatio15db));
-			} else if (roughGlassMode2Transmit15db) {
-				// ML HERO phase 15df: conservative shared-physics fallback, now with
-				// wavelength-domain color preservation instead of RGB averaging.
-				const float scalarBsdf15db = MLHeroGlassLaneColorSample15df(
-					bsdfSample, pathVertex->mlHeroLaneWaveLength[lane]);
-				pathVertex->mlHeroLaneThroughput[lane] *= Spectrum(scalarBsdf15db);
-				mlHero15dbFallbackLanes.fetch_add(1ull, std::memory_order_relaxed);
 			} else if (pathVertex->bsdf.EvaluateMLHeroMetal2SampleAtWaveLength(sampledDir,
 					pathVertex->mlHeroLaneWaveLength[lane], &laneSample)) {
 				pathVertex->mlHeroLaneThroughput[lane] *= laneSample;
@@ -5736,117 +4795,12 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 				(materialType15cl < MLHERO_MATERIAL_TYPE_COUNT_15CL))
 			mlHero15cnGenericCompensated[materialType15cl].fetch_add(1ull, std::memory_order_relaxed);
 
-
-        // ML HERO phase 15de: diagnostic-only packet color audit.  This runs
-        // after the current per-lane weighting but before any HERO-only Glass
-        // termination can zero companion lanes.  It consumes no random numbers
-        // and never changes path throughput, event, PDF, direction or sampling.
-        if (MLHeroCurrentDiagnosticsEnabled15cq()) {
-            const MaterialType material15de = pathVertex->bsdf.GetMaterialType();
-            const bool glassFamily15de = (material15de == GLASS) || (material15de == ROUGHGLASS);
-            const int bucket15de = MLHero15deLaneBucket(pathVertex->mlHeroLaneCount);
-            if (glassFamily15de && (bucket15de >= 0) && ((event & REFLECT) || (event & TRANSMIT))) {
-                const bool rough15de = (material15de == ROUGHGLASS);
-                const bool transmit15de = (event & TRANSMIT) != 0;
-                const u_int case15de = (rough15de ? 2u : 0u) + (transmit15de ? 1u : 0u);
-                const u_int laneCount15de = pathVertex->mlHeroLaneCount;
-
-                Spectrum beforePacket15de(0.f), afterPacket15de(0.f);
-                double minApplied15de = 1e300, maxApplied15de = -1e300;
-                for (u_int lane15de = 0u; lane15de < laneCount15de; ++lane15de) {
-                    const Spectrum sampleColor15de = GetMLHeroSampleColorAt(lane15de);
-                    beforePacket15de += mlHeroBeforeTP[lane15de] * sampleColor15de;
-                    afterPacket15de += pathVertex->mlHeroLaneThroughput[lane15de] * sampleColor15de;
-                    const double pre15de = (double)mlHeroBeforeTP[lane15de].c[0];
-                    const double post15de = (double)pathVertex->mlHeroLaneThroughput[lane15de].c[0];
-                    if (fabs(pre15de) > 1e-30) {
-                        const double applied15de = post15de / pre15de;
-                        minApplied15de = Min(minApplied15de, applied15de);
-                        maxApplied15de = Max(maxApplied15de, applied15de);
-                    }
-                }
-                beforePacket15de /= (float)laneCount15de;
-                afterPacket15de /= (float)laneCount15de;
-                const Spectrum classicAfter15de = mlHero15deClassicBefore * bsdfSample;
-
-                const double classicChroma15de = MLHero15deChromaMetric(classicAfter15de);
-                const double heroChroma15de = MLHero15deChromaMetric(afterPacket15de);
-                const double chromaRatio15de = (classicChroma15de > 1e-12) ?
-                    (heroChroma15de / classicChroma15de) : 1.0;
-                const double normColorL115de = MLHero15deNormalizedColorL1(classicAfter15de, afterPacket15de);
-                const double classicY15de = (double)classicAfter15de.Y();
-                const double heroY15de = (double)afterPacket15de.Y();
-                const double luminanceRatio15de = (fabs(classicY15de) > 1e-20) ?
-                    (heroY15de / classicY15de) : 1.0;
-
-                mlHero15deCount[case15de][bucket15de].fetch_add(1ull, std::memory_order_relaxed);
-                mlHero15deClassicChromaSum[case15de][bucket15de].fetch_add(classicChroma15de, std::memory_order_relaxed);
-                mlHero15deHeroChromaSum[case15de][bucket15de].fetch_add(heroChroma15de, std::memory_order_relaxed);
-                mlHero15deChromaRatioSum[case15de][bucket15de].fetch_add(chromaRatio15de, std::memory_order_relaxed);
-                mlHero15deNormColorL1Sum[case15de][bucket15de].fetch_add(normColorL115de, std::memory_order_relaxed);
-                mlHero15deClassicYSum[case15de][bucket15de].fetch_add(classicY15de, std::memory_order_relaxed);
-                mlHero15deHeroYSum[case15de][bucket15de].fetch_add(heroY15de, std::memory_order_relaxed);
-                mlHero15deLuminanceRatioSum[case15de][bucket15de].fetch_add(luminanceRatio15de, std::memory_order_relaxed);
-                if (minApplied15de < 1e299)
-                    MLHero15deAtomicMin(mlHero15deAppliedMultiplierMin[case15de][bucket15de], minApplied15de);
-                if (maxApplied15de > -1e299)
-                    MLHeroAtomicMax15co(mlHero15deAppliedMultiplierMax[case15de][bucket15de], maxApplied15de);
-
-                const unsigned long long detail15de = mlHero15deDetailCount.fetch_add(1ull, std::memory_order_relaxed);
-                if (detail15de < 16ull) {
-                    std::lock_guard<std::recursive_mutex> lock15de(mlHeroDebugLogMutex);
-                    FILE *f15de = MLHeroOpenCurrentLog15cq("a");
-                    if (f15de) {
-                        fprintf(f15de, "ML HERO phase 15de PACKET COLOR DETAIL sample=%llu material=%s event=%s laneCount=%u glassMode=%u perLaneWeight=%u depth=%u fromLight=%u bsdfRGB=(%.9g, %.9g, %.9g) classicAfterRGB=(%.9g, %.9g, %.9g) packetBeforeRGB=(%.9g, %.9g, %.9g) packetAfterRGB=(%.9g, %.9g, %.9g) classicChroma=%.12g heroChroma=%.12g chromaRatio=%.12g normColorL1=%.12g luminanceRatio=%.12g\n",
-                            detail15de, rough15de ? "ROUGHGLASS" : "GLASS", transmit15de ? "TRANSMIT" : "REFLECT",
-                            laneCount15de, engine->mlHeroGlassMode, engine->mlHeroGlassPerLaneWeight ? 1u : 0u,
-                            pathVertex->depth, pathVertex->bsdf.hitPoint.fromLight ? 1u : 0u,
-                            bsdfSample.c[0], bsdfSample.c[1], bsdfSample.c[2],
-                            classicAfter15de.c[0], classicAfter15de.c[1], classicAfter15de.c[2],
-                            beforePacket15de.c[0], beforePacket15de.c[1], beforePacket15de.c[2],
-                            afterPacket15de.c[0], afterPacket15de.c[1], afterPacket15de.c[2],
-                            classicChroma15de, heroChroma15de, chromaRatio15de, normColorL115de, luminanceRatio15de);
-                        for (u_int lane15de = 0u; lane15de < laneCount15de; ++lane15de) {
-                            const double pre15de = (double)mlHeroBeforeTP[lane15de].c[0];
-                            const double post15de = (double)pathVertex->mlHeroLaneThroughput[lane15de].c[0];
-                            const double applied15de = (fabs(pre15de) > 1e-30) ? (post15de / pre15de) : 0.0;
-                            fprintf(f15de, "phase15de lane=%u lambda=%.9g preScalar=%.12g postScalar=%.12g appliedMultiplier=%.12g sampleColorRGB=(%.9g, %.9g, %.9g)\n",
-                                lane15de, pathVertex->mlHeroLaneWaveLength[lane15de], pre15de, post15de, applied15de,
-                                GetMLHeroSampleColorAt(lane15de).c[0], GetMLHeroSampleColorAt(lane15de).c[1], GetMLHeroSampleColorAt(lane15de).c[2]);
-                        }
-                        fclose(f15de);
-                    }
-                }
-            }
-        }
-
-		// ML HERO phase 15cs: after a truly dispersive, perfectly-specular
-		// transmission bounce, Mode 0/1/2 all keep only the sampled HERO wavelength
-		// (lane 0). Before this boundary each mode retains its own packet weighting
-		// and PDF logic. Since packet radiance is reconstructed as 1/N, scale the
-		// surviving lane by N once before zeroing the secondary lanes.
-
-#if ML_HERO_MODE2_RGB_OWNERSHIP_15DM
-		// ML HERO phase 15dm: regular Mode-2 ideal-Glass RGB-ownership path.
-		// LuxCore Glass Sample() already returns the RGB multiplier for the sampled
-		// HERO event/direction. Keep that RGB result owned as RGB instead of
-		// reconstructing the same chromatic multiplier again per companion wavelength.
-		// This applies to every multi-lane ideal-Glass SPECULAR TRANSMIT with PLW off,
-		// including ordinary non-dispersive Glass. For dispersive Delta Glass the
-		// existing packet-to-single-HERO collapse below is unchanged; without
-		// dispersion the RGB-owned packet simply continues with all lanes.
-		const bool mode2RgbOwnership15dm =
-			(engine->mlHeroGlassMode == 2) && glassSpecularCandidate15bx &&
-			(event & TRANSMIT) && !engine->mlHeroGlassPerLaneWeight &&
-			(pathVertex->mlHeroLaneCount > 1u);
-		if (mode2RgbOwnership15dm) {
-			const u_int laneCount15dm = Min(pathVertex->mlHeroLaneCount, 8u);
-			for (u_int lane15dm = 0u; lane15dm < laneCount15dm; ++lane15dm)
-				pathVertex->mlHeroLaneThroughput[lane15dm] = lanePreGlassSpectrum15dm[lane15dm] * bsdfSample;
-		}
-#endif
-
-		if ((event & TRANSMIT) && dispersiveSpecularTransmit15be &&
+		// ML HERO phase 15be mode 1: after a truly dispersive, perfectly-specular
+		// transmission bounce, keep only the HERO wavelength (lane 0).  Since the
+		// rest of this experimental renderer reconstructs packet radiance as 1/N,
+		// scale the surviving lane by N before zeroing the secondary lanes.
+		if ((engine->mlHeroGlassMode == 1) &&
+				(event & TRANSMIT) && dispersiveSpecularTransmit15be &&
 				(pathVertex->mlHeroLaneCount > 1u)) {
 			const u_int packetCount15be = pathVertex->mlHeroLaneCount;
 			bool hadLiveSecondary15be = false;
@@ -6001,12 +4955,6 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 				pathVertex->mlHeroTerminationCurrentScale = (float)packetCount15be;
 				pathVertex->mlHero15buReferenceThroughput = (double)packetAverage15bf * (double)packetCount15be;
 
-				// ML HERO phase 15dh: capture the local packet->HERO collapse before the
-				// xN throughput scale is applied. Diagnostic only.
-				MLHero15dhRecordTermination(pathVertex->bsdf.hitPoint.fromLight,
-					pathVertex->mlHeroTerminationHeroLambda, (double)heroScalar15bf,
-					(double)packetAverage15bf);
-
 				// Phase 15bt: first-termination metadata, binned before any later visible
 				// contribution can duplicate this vertex.
 				{
@@ -6087,10 +5035,10 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 				FILE *f15be = MLHeroOpenLegacyLog15cq("a");
 				if (f15be) {
 					fprintf(f15be,
-						"ML HERO phase 15cs HERO_ONLY_ACTIVE: glassMode=%d depth=%u fromLight=%u "
+						"ML HERO phase 15bh HERO_ONLY_ACTIVE: depth=%u fromLight=%u "
 						"event=%u heroLambda=%.9g packetCount=%u packetScalarSum=%.9g heroScalar=%.9g packetAverage=%.9g brightnessRatio=%.9g idealScale=%.9g "
 						"heroPdfBefore=%.9g heroPdfAfterTerminate=%.9g pdfEstimatorScale=%.9g currentThroughputScale=%u\n",
-						engine->mlHeroGlassMode, pathVertex->depth, pathVertex->bsdf.hitPoint.fromLight ? 1u : 0u,
+						pathVertex->depth, pathVertex->bsdf.hitPoint.fromLight ? 1u : 0u,
 						(u_int)event, pathVertex->mlHeroLaneWaveLength[0], packetCount15be,
 						packetScalarSum15bf, heroScalar15bf, packetAverage15bf,
 						heroOnlyBrightnessRatio15bf, idealPacketScale15bf,
@@ -7184,101 +6132,6 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 			mlHero15cqGlossy2FullErrAfterSum.store(0.0, std::memory_order_relaxed);
 			mlHero15cqGlossy2FullErrBeforeMax.store(0.0, std::memory_order_relaxed);
 			mlHero15cqGlossy2FullErrAfterMax.store(0.0, std::memory_order_relaxed);
-			for (u_int c15ct = 0u; c15ct < 4u; ++c15ct) {
-				mlHero15ctRoughGlassSamples[c15ct].store(0ull, std::memory_order_relaxed);
-				mlHero15ctRoughGlassEvalBlack[c15ct].store(0ull, std::memory_order_relaxed);
-				mlHero15ctRoughGlassEventMismatch[c15ct].store(0ull, std::memory_order_relaxed);
-				mlHero15ctRoughGlassPdfRelErrSum[c15ct].store(0.0, std::memory_order_relaxed);
-				mlHero15ctRoughGlassPdfRelErrMax[c15ct].store(0.0, std::memory_order_relaxed);
-				mlHero15ctRoughGlassSampleRelErrSum[c15ct].store(0.0, std::memory_order_relaxed);
-				mlHero15ctRoughGlassSampleRelErrMax[c15ct].store(0.0, std::memory_order_relaxed);
-			}
-			for (u_int c15cw = 0u; c15cw < MLHERO_15CW_CASE_COUNT; ++c15cw) {
-				mlHero15cwRoughGlassAttempts[c15cw].store(0ull, std::memory_order_relaxed);
-				mlHero15cwRoughGlassEvents[c15cw].store(0ull, std::memory_order_relaxed);
-				for (u_int lane15cw = 0u; lane15cw < MLHERO_15CW_MAX_LANES; ++lane15cw) {
-					mlHero15cwLaneValid[c15cw][lane15cw].store(0ull, std::memory_order_relaxed);
-					mlHero15cwLaneBlackOrZeroPdf[c15cw][lane15cw].store(0ull, std::memory_order_relaxed);
-					mlHero15cwLaneEventMismatch[c15cw][lane15cw].store(0ull, std::memory_order_relaxed);
-					mlHero15cwLaneLambdaSum[c15cw][lane15cw].store(0.0, std::memory_order_relaxed);
-					mlHero15cwLanePdfRatioSum[c15cw][lane15cw].store(0.0, std::memory_order_relaxed);
-					mlHero15cwLanePdfRatioMax[c15cw][lane15cw].store(0.0, std::memory_order_relaxed);
-					mlHero15cwLaneMultiplierRatioSum[c15cw][lane15cw].store(0.0, std::memory_order_relaxed);
-					mlHero15cwLaneMultiplierRatioMax[c15cw][lane15cw].store(0.0, std::memory_order_relaxed);
-					mlHero15cwLaneRatioCount[c15cw][lane15cw].store(0ull, std::memory_order_relaxed);
-					mlHero15cxLaneExtremeOutlier[c15cw][lane15cw] = MLHero15cxLaneExtreme();
-					mlHero15cyCount[c15cw][lane15cw].store(0ull, std::memory_order_relaxed);
-					mlHero15cyRawMultiplierAbsSum[c15cw][lane15cw].store(0.0, std::memory_order_relaxed);
-					mlHero15cyRawMultiplierAbsMax[c15cw][lane15cw].store(0.0, std::memory_order_relaxed);
-					mlHero15cyMixMultiplierAbsSum[c15cw][lane15cw].store(0.0, std::memory_order_relaxed);
-					mlHero15cyMixMultiplierAbsMax[c15cw][lane15cw].store(0.0, std::memory_order_relaxed);
-					mlHero15cyMixOverRawSum[c15cw][lane15cw].store(0.0, std::memory_order_relaxed);
-					mlHero15cyMixOverRawMax[c15cw][lane15cw].store(0.0, std::memory_order_relaxed);
-					mlHero15cyBalanceWeightSum[c15cw][lane15cw].store(0.0, std::memory_order_relaxed);
-					mlHero15cyBalanceWeightMax[c15cw][lane15cw].store(0.0, std::memory_order_relaxed);
-					mlHero15czPower2MultiplierAbsSum[c15cw][lane15cw].store(0.0, std::memory_order_relaxed);
-					mlHero15czPower2MultiplierAbsMax[c15cw][lane15cw].store(0.0, std::memory_order_relaxed);
-					mlHero15czPower2OverRawSum[c15cw][lane15cw].store(0.0, std::memory_order_relaxed);
-					mlHero15czPower2OverRawMax[c15cw][lane15cw].store(0.0, std::memory_order_relaxed);
-					mlHero15czPower2WeightSum[c15cw][lane15cw].store(0.0, std::memory_order_relaxed);
-					mlHero15czPower2WeightMax[c15cw][lane15cw].store(0.0, std::memory_order_relaxed);
-					for (u_int b15da = 0u; b15da < MLHERO_15DA_BLEND_COUNT; ++b15da) {
-						mlHero15daMultiplierAbsSum[b15da][c15cw][lane15cw].store(0.0, std::memory_order_relaxed);
-						mlHero15daMultiplierAbsMax[b15da][c15cw][lane15cw].store(0.0, std::memory_order_relaxed);
-						mlHero15daOverRawSum[b15da][c15cw][lane15cw].store(0.0, std::memory_order_relaxed);
-						mlHero15daOverRawMax[b15da][c15cw][lane15cw].store(0.0, std::memory_order_relaxed);
-					}
-				}
-				mlHero15cyMixPdfSum[c15cw].store(0.0, std::memory_order_relaxed);
-				mlHero15cyMixPdfMin[c15cw].store(1e300, std::memory_order_relaxed);
-			}
-			mlHero15dbAppliedEvents.store(0ull, std::memory_order_relaxed);
-			mlHero15dbAppliedLanes.store(0ull, std::memory_order_relaxed);
-			mlHero15dbFallbackLanes.store(0ull, std::memory_order_relaxed);
-			mlHero15dbAppliedMultiplierAbsSum.store(0.0, std::memory_order_relaxed);
-			mlHero15dbAppliedMultiplierAbsMax.store(0.0, std::memory_order_relaxed);
-			mlHero15dbAppliedOverRawSum.store(0.0, std::memory_order_relaxed);
-			mlHero15dbAppliedOverRawMax.store(0.0, std::memory_order_relaxed);
-			mlHero15ddSampleResultCount.store(0ull, std::memory_order_relaxed);
-			mlHero15ddRadianceRSum.store(0.0, std::memory_order_relaxed);
-			mlHero15ddRadianceGSum.store(0.0, std::memory_order_relaxed);
-			mlHero15ddRadianceBSum.store(0.0, std::memory_order_relaxed);
-			mlHero15ddRadianceYSum.store(0.0, std::memory_order_relaxed);
-			mlHero15ddRadianceYAbsSum.store(0.0, std::memory_order_relaxed);
-			mlHero15ddRadianceY2Sum.store(0.0, std::memory_order_relaxed);
-			mlHero15ddRadianceYMax.store(0.0, std::memory_order_relaxed);
-
-            mlHero15deDetailCount.store(0ull, std::memory_order_relaxed);
-            for (u_int c15de = 0u; c15de < MLHERO_15DE_CASE_COUNT; ++c15de) {
-                for (u_int b15de = 0u; b15de < MLHERO_15DE_LANE_BUCKETS; ++b15de) {
-                    mlHero15deCount[c15de][b15de].store(0ull, std::memory_order_relaxed);
-                    mlHero15deClassicChromaSum[c15de][b15de].store(0.0, std::memory_order_relaxed);
-                    mlHero15deHeroChromaSum[c15de][b15de].store(0.0, std::memory_order_relaxed);
-                    mlHero15deChromaRatioSum[c15de][b15de].store(0.0, std::memory_order_relaxed);
-                    mlHero15deNormColorL1Sum[c15de][b15de].store(0.0, std::memory_order_relaxed);
-                    mlHero15deClassicYSum[c15de][b15de].store(0.0, std::memory_order_relaxed);
-                    mlHero15deHeroYSum[c15de][b15de].store(0.0, std::memory_order_relaxed);
-                    mlHero15deLuminanceRatioSum[c15de][b15de].store(0.0, std::memory_order_relaxed);
-                    mlHero15deAppliedMultiplierMin[c15de][b15de].store(1e300, std::memory_order_relaxed);
-                    mlHero15deAppliedMultiplierMax[c15de][b15de].store(-1e300, std::memory_order_relaxed);
-                }
-            }
-			for (u_int c15dc = 0u; c15dc < MLHERO_15DC_TRANSPORT_CASES; ++c15dc) {
-				mlHero15dcCaseLanes[c15dc].store(0ull, std::memory_order_relaxed);
-				mlHero15dcRawMaxHint[c15dc].store(0.0, std::memory_order_relaxed);
-				mlHero15dcAppliedMaxHint[c15dc].store(0.0, std::memory_order_relaxed);
-				for (u_int b15dc = 0u; b15dc < MLHERO_15DC_TAIL_BINS; ++b15dc) {
-					mlHero15dcRawTailCount[c15dc][b15dc].store(0ull, std::memory_order_relaxed);
-					mlHero15dcAppliedTailCount[c15dc][b15dc].store(0ull, std::memory_order_relaxed);
-				}
-			}
-			{
-				std::lock_guard<std::mutex> lock15dc(mlHero15dcTailMutex);
-				for (u_int c15dc = 0u; c15dc < MLHERO_15DC_TRANSPORT_CASES; ++c15dc) {
-					mlHero15dcWorstRaw[c15dc] = MLHero15dcTailOutlier();
-					mlHero15dcWorstApplied[c15dc] = MLHero15dcTailOutlier();
-				}
-			}
 		}
 
 		// ML-HERO phase 11: always start a fresh diagnostic log with an
@@ -7288,7 +6141,7 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 		FILE *f = engine->mlHeroDiagnostics ? fopen(ML_HERO_LOG_FILE, "w") : nullptr;
 		if (f) {
 			fprintf(f, "ML HERO v2.11.2 | Test phase: %s | Feature: %s\n", ML_HERO_TEST_PHASE, ML_HERO_FEATURE);
-			fprintf(f, "ML HERO phase 15cs CONFIG: path.mlhero.glassmode=%d (0=packet weighting -> HERO-only at dispersive delta transmit, 1=HERO-only reference, 2=lane-PDF -> HERO-only at dispersive delta transmit)\n", engine->mlHeroGlassMode);
+			fprintf(f, "ML HERO phase 15bl CONFIG: path.mlhero.glassmode=%d (0=current per-lane, 1=HERO-only after dispersive transmit, 2=experimental lane-PDF)\n", engine->mlHeroGlassMode);
 			fprintf(f, "ML HERO phase 15bz CONFIG: path.mlhero.glassperlaneweight=%u\n", engine->mlHeroGlassPerLaneWeight ? 1u : 0u);
 			fprintf(f, "ML HERO phase 15bz CONFIG: path.mlhero.quartercycling=%u\n", engine->mlHeroQuarterCycling ? 1u : 0u);
 			fprintf(f, "ML HERO phase 15bz CONFIG: path.mlhero.dualterminationcompensation=%u\n", engine->mlHeroDualTerminationCompensation ? 1u : 0u);
@@ -7303,13 +6156,7 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 			fprintf(f, "ML HERO phase 15ca CONFIG: mode2LanePdfIndependentOfPerLaneWeight=1\n");
 			fprintf(f, "Build date/time: %s %s\n", __DATE__, __TIME__);
 			fprintf(f, "Wavelength count: %u\n", (u_int)engine->mlHeroWavelengthCount);
-			fprintf(f, "ML HERO phase 15dh CONFIG: diagnosticsOnly=1 deltaGlassPathAccountingAudit=1 terminationBands=380-500,500-600,600-780 visibleEstimatorAudit=1 packetReference15bu=1 retained15dg=1 glassLaneColorPreservationFix15df=1\n");
-		fprintf(f, "ML HERO phase 15di CONFIG: mode2SharedHeroPdf=%d legacyLanePdfReweight=%d heroOffUntouched=1 modes0and1Untouched=1\n",
-			ML_HERO_MODE2_SHARED_HERO_PDF_15DI, ML_HERO_MODE2_SHARED_HERO_PDF_15DI ? 0 : 1);
-			fprintf(f, "ML HERO phase 15dj CONFIG: diagnosticOnly=1 decompose=colorSample,transport,fresnel,heroPdf,lanePdf,adjoint,materialLane,wrappedLane,sharedLane,modeApplied heroOffUntouched=1\n");
-			fprintf(f, "ML HERO phase 15dk CONFIG: diagnosticOnly=1 audit=mode2_color_ownership_correlation models=spectralized_lane_vs_rgb_owned_vs_shared_scalar heroOffUntouched=1 rendererPhysicsChanged=0\n");
-			fprintf(f, "ML HERO phase 15dm CONFIG: mode2RgbOwnership=%d scope=Mode2_IdealGlass_SPECULAR_TRANSMIT_PLWoff_multilane dispersionIndependent=1 dispersiveCollapseUnchanged=1 rendererPhysicsChanged=1 heroOffUntouched=1 modes0and1Untouched=1 reflectionUntouched=1 roughGlassUntouched=1\n",
-				ML_HERO_MODE2_RGB_OWNERSHIP_15DM ? 1 : 0);
+			fprintf(f, "ML HERO phase 15cr CONFIG: diagnostics_runtime_gated=1 masterOff_fast_path=1 rendererPhysicsUnchanged=1\n");
 			fprintf(f, "------------------------------------------------------------\n");
 			fclose(f);
 		}
@@ -7727,25 +6574,6 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 
 		assert (SampleResult::IsAllValid(sampleResults));
 
-		// ML HERO phase 15dd: capture a mode-independent radiance fingerprint
-		// before variance clamping. This is diagnostic only and consumes no RNG.
-		if (MLHeroCurrentDiagnosticsEnabled15cq()) {
-			for (u_int i15dd = 0u; i15dd < sampleResults.size(); ++i15dd) {
-				Spectrum total15dd(0.f);
-				for (u_int g15dd = 0u; g15dd < engine->GetFilm().GetRadianceGroupCount(); ++g15dd)
-					total15dd += sampleResults[i15dd].radiance[g15dd];
-				const double y15dd = (double)total15dd.Y();
-				mlHero15ddSampleResultCount.fetch_add(1ull, std::memory_order_relaxed);
-				mlHero15ddRadianceRSum.fetch_add((double)total15dd.c[0], std::memory_order_relaxed);
-				mlHero15ddRadianceGSum.fetch_add((double)total15dd.c[1], std::memory_order_relaxed);
-				mlHero15ddRadianceBSum.fetch_add((double)total15dd.c[2], std::memory_order_relaxed);
-				mlHero15ddRadianceYSum.fetch_add(y15dd, std::memory_order_relaxed);
-				mlHero15ddRadianceYAbsSum.fetch_add(fabs(y15dd), std::memory_order_relaxed);
-				mlHero15ddRadianceY2Sum.fetch_add(y15dd * y15dd, std::memory_order_relaxed);
-				MLHeroAtomicMax15co(mlHero15ddRadianceYMax, fabs(y15dd));
-			}
-		}
-
 		// Variance clamping
 		if (varianceClamping.hasClamping()) {
 			for(u_int i = 0; i < sampleResults.size(); ++i)
@@ -7775,7 +6603,7 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 		FILE *f15cq = MLHeroOpenCurrentLog15cq("a");
 		if (f15cq) {
 			fprintf(f15cq, "------------------------------------------------------------\n");
-			fprintf(f15cq, "ML HERO phase 15ct CURRENT DIAGNOSTICS SUMMARY heavy=%u\n", mlHeroHeavyDiagnostics15cq.load(std::memory_order_relaxed) ? 1u : 0u);
+			fprintf(f15cq, "ML HERO phase 15cr CURRENT DIAGNOSTICS SUMMARY heavy=%u\n", mlHeroHeavyDiagnostics15cq.load(std::memory_order_relaxed) ? 1u : 0u);
 			fprintf(f15cq, "phase15cr columns: materialType candidate genericRGBReflSPD matteCompensated glossy2Split genericCompensated\n");
 			for (u_int t15cq = 0u; t15cq < MLHERO_MATERIAL_TYPE_COUNT_15CL; ++t15cq) {
 				const unsigned long long c = mlHero15clReflectCandidate[t15cq].load(std::memory_order_relaxed);
@@ -7787,94 +6615,6 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 					fprintf(f15cq, "phase15cr material=%s id=%u candidate=%llu genericRGBReflSPD=%llu matteCompensated=%llu glossy2Split=%llu genericCompensated=%llu\n", MLHeroMaterialTypeName15cl(t15cq), t15cq, c, g, m, s2, gc);
 			}
 			fprintf(f15cq, "phase15cr glossy2FullRenderCompensated=%llu\n", mlHero15cqGlossy2Events.load(std::memory_order_relaxed));
-			fprintf(f15cq, "ML HERO phase 15ct ROUGHGLASS SAMPLE/EVALUATE/PDF CONSISTENCY SUMMARY\n");
-			static const char *caseName15ct[4] = { "EYE_REFLECT", "EYE_TRANSMIT", "LIGHT_REFLECT", "LIGHT_TRANSMIT" };
-			for (u_int c15ct = 0u; c15ct < 4u; ++c15ct) {
-				const unsigned long long n15ct = mlHero15ctRoughGlassSamples[c15ct].load(std::memory_order_relaxed);
-				const unsigned long long b15ct = mlHero15ctRoughGlassEvalBlack[c15ct].load(std::memory_order_relaxed);
-				const unsigned long long e15ct = mlHero15ctRoughGlassEventMismatch[c15ct].load(std::memory_order_relaxed);
-				const unsigned long long valid15ct = (n15ct > b15ct) ? (n15ct - b15ct) : 0ull;
-				const double meanPdf15ct = valid15ct ? mlHero15ctRoughGlassPdfRelErrSum[c15ct].load(std::memory_order_relaxed) / (double)valid15ct : 0.0;
-				const double meanSample15ct = valid15ct ? mlHero15ctRoughGlassSampleRelErrSum[c15ct].load(std::memory_order_relaxed) / (double)valid15ct : 0.0;
-				fprintf(f15cq, "phase15ct case=%s samples=%llu evalBlackOrZeroPdf=%llu eventMismatch=%llu meanPdfRelErr=%.9g worstPdfRelErr=%.9g meanSampleVsEvalOverPdfRelErr=%.9g worstSampleVsEvalOverPdfRelErr=%.9g\n",
-					caseName15ct[c15ct], n15ct, b15ct, e15ct, meanPdf15ct,
-					mlHero15ctRoughGlassPdfRelErrMax[c15ct].load(std::memory_order_relaxed),
-					meanSample15ct, mlHero15ctRoughGlassSampleRelErrMax[c15ct].load(std::memory_order_relaxed));
-			}
-			fprintf(f15cq, "ML HERO phase 15cw ROUGHGLASS 8-LANE SHARED-DIRECTION SUPPORT SUMMARY budgetPerCase=%llu glassMode=%d\n",
-				MLHERO_15CW_EVENT_BUDGET_PER_CASE, engine->mlHeroGlassMode);
-			static const char *caseName15cw[4] = { "EYE_REFLECT", "EYE_TRANSMIT", "LIGHT_REFLECT", "LIGHT_TRANSMIT" };
-			for (u_int c15cw = 0u; c15cw < MLHERO_15CW_CASE_COUNT; ++c15cw) {
-				const unsigned long long events15cw = mlHero15cwRoughGlassEvents[c15cw].load(std::memory_order_relaxed);
-				fprintf(f15cq, "phase15cw case=%s sampledEvents=%llu\n", caseName15cw[c15cw], events15cw);
-				for (u_int lane15cw = 0u; lane15cw < Min(GetMLHeroWavelengthCount(), MLHERO_15CW_MAX_LANES); ++lane15cw) {
-					const unsigned long long valid15cw = mlHero15cwLaneValid[c15cw][lane15cw].load(std::memory_order_relaxed);
-					const unsigned long long invalid15cw = mlHero15cwLaneBlackOrZeroPdf[c15cw][lane15cw].load(std::memory_order_relaxed);
-					const unsigned long long mismatch15cw = mlHero15cwLaneEventMismatch[c15cw][lane15cw].load(std::memory_order_relaxed);
-					const double denom15cw = events15cw ? (double)events15cw : 1.0;
-					const double lambdaMean15cw = mlHero15cwLaneLambdaSum[c15cw][lane15cw].load(std::memory_order_relaxed) / denom15cw;
-					const double validFraction15cw = (double)valid15cw / denom15cw;
-					const unsigned long long ratioCount15cw = mlHero15cwLaneRatioCount[c15cw][lane15cw].load(std::memory_order_relaxed);
-					const double ratioDen15cw = ratioCount15cw ? (double)ratioCount15cw : 1.0;
-					const double meanPdfRatio15cw = (lane15cw == 0u) ? 1.0 : mlHero15cwLanePdfRatioSum[c15cw][lane15cw].load(std::memory_order_relaxed) / ratioDen15cw;
-					const double meanMultiplierRatio15cw = (lane15cw == 0u) ? 1.0 : mlHero15cwLaneMultiplierRatioSum[c15cw][lane15cw].load(std::memory_order_relaxed) / ratioDen15cw;
-					fprintf(f15cq, "phase15cw case=%s lane=%u meanLambda=%.6f valid=%llu invalid=%llu eventMismatch=%llu validFraction=%.9g meanPdfOverHero=%.9g maxAbsPdfOverHero=%.9g meanMultiplierOverHero=%.9g maxAbsMultiplierOverHero=%.9g\n",
-						caseName15cw[c15cw], lane15cw, lambdaMean15cw, valid15cw, invalid15cw, mismatch15cw, validFraction15cw,
-						meanPdfRatio15cw, (lane15cw == 0u) ? 1.0 : mlHero15cwLanePdfRatioMax[c15cw][lane15cw].load(std::memory_order_relaxed),
-						meanMultiplierRatio15cw, (lane15cw == 0u) ? 1.0 : mlHero15cwLaneMultiplierRatioMax[c15cw][lane15cw].load(std::memory_order_relaxed));
-					if (lane15cw > 0u) {
-						const MLHero15cxLaneExtreme &out15cx = mlHero15cxLaneExtremeOutlier[c15cw][lane15cw];
-						if (out15cx.valid) {
-							fprintf(f15cq, "phase15cx case=%s lane=%u extremeMultiplier eventIndex=%llu heroLambda=%.9g laneLambda=%.9g heroPdf=%.9g lanePdf=%.9g pdfRatioLaneOverHero=%.9g heroFilter=%.9g laneFilter=%.9g heroMultiplier=%.9g laneMultiplier=%.9g multiplierRatioLaneOverHero=%.9g absMultiplierRatio=%.9g cosFixed=%.9g cosSampled=%.9g\n",
-								caseName15cw[c15cw], lane15cw, out15cx.eventIndex, out15cx.heroLambda, out15cx.laneLambda,
-								out15cx.heroPdf, out15cx.lanePdf, out15cx.pdfRatio,
-								out15cx.heroFilter, out15cx.laneFilter,
-								out15cx.heroMultiplier, out15cx.laneMultiplier,
-								out15cx.multiplierRatio, out15cx.absMultiplierRatio,
-								out15cx.cosFixed, out15cx.cosSampled);
-						}
-					}
-				}
-			}
-			fprintf(f15cq, "ML HERO phase 15da ROUGHGLASS PARTIAL SPECTRAL-MIS BLEND DIAGNOSTIC raw_vs_balance25_50_75_vs_fullBalance_vs_power2 equalTechniquePriors=1 rendererPhysicsChanged=0\n");
-			for (u_int c15cy = 0u; c15cy < MLHERO_15CW_CASE_COUNT; ++c15cy) {
-				const unsigned long long events15cy = mlHero15cwRoughGlassEvents[c15cy].load(std::memory_order_relaxed);
-				const double meanMixPdf15cy = events15cy ? mlHero15cyMixPdfSum[c15cy].load(std::memory_order_relaxed) / (double)events15cy : 0.0;
-				const double minMixPdf15cy = mlHero15cyMixPdfMin[c15cy].load(std::memory_order_relaxed);
-				fprintf(f15cq, "phase15da case=%s events=%llu meanBalanceMixPdf=%.9g minBalanceMixPdf=%.9g\n", caseName15cw[c15cy], events15cy, meanMixPdf15cy, (minMixPdf15cy < 1e299) ? minMixPdf15cy : 0.0);
-				for (u_int lane15cy = 0u; lane15cy < Min(GetMLHeroWavelengthCount(), MLHERO_15CW_MAX_LANES); ++lane15cy) {
-					const unsigned long long n15cy = mlHero15cyCount[c15cy][lane15cy].load(std::memory_order_relaxed);
-					const double den15cy = n15cy ? (double)n15cy : 1.0;
-					fprintf(f15cq, "phase15da case=%s lane=%u count=%llu meanRawAbsMultiplier=%.9g maxRawAbsMultiplier=%.9g meanBlend25AbsMultiplier=%.9g maxBlend25AbsMultiplier=%.9g meanBlend25OverRaw=%.9g maxBlend25OverRaw=%.9g meanBlend50AbsMultiplier=%.9g maxBlend50AbsMultiplier=%.9g meanBlend50OverRaw=%.9g maxBlend50OverRaw=%.9g meanBlend75AbsMultiplier=%.9g maxBlend75AbsMultiplier=%.9g meanBlend75OverRaw=%.9g maxBlend75OverRaw=%.9g meanBalanceAbsMultiplier=%.9g maxBalanceAbsMultiplier=%.9g meanBalanceOverRaw=%.9g maxBalanceOverRaw=%.9g meanBalanceWeight=%.9g maxBalanceWeight=%.9g meanPower2AbsMultiplier=%.9g maxPower2AbsMultiplier=%.9g meanPower2OverRaw=%.9g maxPower2OverRaw=%.9g meanPower2Weight=%.9g maxPower2Weight=%.9g\n",
-						caseName15cw[c15cy], lane15cy, n15cy,
-						mlHero15cyRawMultiplierAbsSum[c15cy][lane15cy].load(std::memory_order_relaxed) / den15cy,
-						mlHero15cyRawMultiplierAbsMax[c15cy][lane15cy].load(std::memory_order_relaxed),
-						mlHero15daMultiplierAbsSum[0][c15cy][lane15cy].load(std::memory_order_relaxed) / den15cy,
-						mlHero15daMultiplierAbsMax[0][c15cy][lane15cy].load(std::memory_order_relaxed),
-						mlHero15daOverRawSum[0][c15cy][lane15cy].load(std::memory_order_relaxed) / den15cy,
-						mlHero15daOverRawMax[0][c15cy][lane15cy].load(std::memory_order_relaxed),
-						mlHero15daMultiplierAbsSum[1][c15cy][lane15cy].load(std::memory_order_relaxed) / den15cy,
-						mlHero15daMultiplierAbsMax[1][c15cy][lane15cy].load(std::memory_order_relaxed),
-						mlHero15daOverRawSum[1][c15cy][lane15cy].load(std::memory_order_relaxed) / den15cy,
-						mlHero15daOverRawMax[1][c15cy][lane15cy].load(std::memory_order_relaxed),
-						mlHero15daMultiplierAbsSum[2][c15cy][lane15cy].load(std::memory_order_relaxed) / den15cy,
-						mlHero15daMultiplierAbsMax[2][c15cy][lane15cy].load(std::memory_order_relaxed),
-						mlHero15daOverRawSum[2][c15cy][lane15cy].load(std::memory_order_relaxed) / den15cy,
-						mlHero15daOverRawMax[2][c15cy][lane15cy].load(std::memory_order_relaxed),
-						mlHero15cyMixMultiplierAbsSum[c15cy][lane15cy].load(std::memory_order_relaxed) / den15cy,
-						mlHero15cyMixMultiplierAbsMax[c15cy][lane15cy].load(std::memory_order_relaxed),
-						mlHero15cyMixOverRawSum[c15cy][lane15cy].load(std::memory_order_relaxed) / den15cy,
-						mlHero15cyMixOverRawMax[c15cy][lane15cy].load(std::memory_order_relaxed),
-						mlHero15cyBalanceWeightSum[c15cy][lane15cy].load(std::memory_order_relaxed) / den15cy,
-						mlHero15cyBalanceWeightMax[c15cy][lane15cy].load(std::memory_order_relaxed),
-						mlHero15czPower2MultiplierAbsSum[c15cy][lane15cy].load(std::memory_order_relaxed) / den15cy,
-						mlHero15czPower2MultiplierAbsMax[c15cy][lane15cy].load(std::memory_order_relaxed),
-						mlHero15czPower2OverRawSum[c15cy][lane15cy].load(std::memory_order_relaxed) / den15cy,
-						mlHero15czPower2OverRawMax[c15cy][lane15cy].load(std::memory_order_relaxed),
-						mlHero15czPower2WeightSum[c15cy][lane15cy].load(std::memory_order_relaxed) / den15cy,
-						mlHero15czPower2WeightMax[c15cy][lane15cy].load(std::memory_order_relaxed));
-				}
-			}
 			if (MLHeroCurrentHeavyDiagnosticsEnabled15cq()) {
 				const unsigned long long gn15cq = mlHero15cqGlossy2SampleCount.load(std::memory_order_relaxed);
 				if (gn15cq) {
@@ -7899,235 +6639,8 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 			} else {
 				fprintf(f15cq, "phase15cr heavyDiagnostics=0 expensive_dense_and_multi_trial_diagnostics_skipped\n");
 			}
-			const unsigned long long appliedEvents15db = mlHero15dbAppliedEvents.load(std::memory_order_relaxed);
-			const unsigned long long appliedLanes15db = mlHero15dbAppliedLanes.load(std::memory_order_relaxed);
-			const unsigned long long fallbackLanes15db = mlHero15dbFallbackLanes.load(std::memory_order_relaxed);
-			const double appliedLaneDen15db = appliedLanes15db ? (double)appliedLanes15db : 1.0;
-			fprintf(f15cq, "ML HERO phase 15db ROUGHGLASS MODE2 RENDER EXPERIMENT alpha=0.25 events=%llu appliedLanes=%llu fallbackLanes=%llu meanAppliedAbsMultiplier=%.9g maxAppliedAbsMultiplier=%.9g meanAppliedOverRaw=%.9g maxAppliedOverRaw=%.9g\n",
-				appliedEvents15db, appliedLanes15db, fallbackLanes15db,
-				mlHero15dbAppliedMultiplierAbsSum.load(std::memory_order_relaxed) / appliedLaneDen15db,
-				mlHero15dbAppliedMultiplierAbsMax.load(std::memory_order_relaxed),
-				mlHero15dbAppliedOverRawSum.load(std::memory_order_relaxed) / appliedLaneDen15db,
-				mlHero15dbAppliedOverRawMax.load(std::memory_order_relaxed));
-			static const char *transportName15dc[MLHERO_15DC_TRANSPORT_CASES] = { "EYE_TRANSMIT", "LIGHT_TRANSMIT" };
-			MLHero15dcTailOutlier worstRawCopy15dc[MLHERO_15DC_TRANSPORT_CASES];
-			MLHero15dcTailOutlier worstAppliedCopy15dc[MLHERO_15DC_TRANSPORT_CASES];
-			{
-				std::lock_guard<std::mutex> lock15dc(mlHero15dcTailMutex);
-				for (u_int c15dc = 0u; c15dc < MLHERO_15DC_TRANSPORT_CASES; ++c15dc) {
-					worstRawCopy15dc[c15dc] = mlHero15dcWorstRaw[c15dc];
-					worstAppliedCopy15dc[c15dc] = mlHero15dcWorstApplied[c15dc];
-				}
-			}
-			fprintf(f15cq, "ML HERO phase 15dc ROUGHGLASS MODE2 REAL-RENDER TAIL SUMMARY glassMode=%u thresholds=10,100,1000 physicsChangedSince15db=1 glassLaneColorPreservationFix15df=1\n", engine->mlHeroGlassMode);
-			for (u_int c15dc = 0u; c15dc < MLHERO_15DC_TRANSPORT_CASES; ++c15dc) {
-				const unsigned long long lanes15dc = mlHero15dcCaseLanes[c15dc].load(std::memory_order_relaxed);
-				const double den15dc = lanes15dc ? (double)lanes15dc : 1.0;
-				fprintf(f15cq, "phase15dc case=%s lanes=%llu", transportName15dc[c15dc], lanes15dc);
-				for (u_int b15dc = 0u; b15dc < MLHERO_15DC_TAIL_BINS; ++b15dc) {
-					const unsigned long long rawCount15dc = mlHero15dcRawTailCount[c15dc][b15dc].load(std::memory_order_relaxed);
-					const unsigned long long appliedCount15dc = mlHero15dcAppliedTailCount[c15dc][b15dc].load(std::memory_order_relaxed);
-					fprintf(f15cq, " rawGT%.0f=%llu rawPPM=%.9g appliedGT%.0f=%llu appliedPPM=%.9g",
-						mlHero15dcTailThreshold[b15dc], rawCount15dc, 1e6 * (double)rawCount15dc / den15dc,
-						mlHero15dcTailThreshold[b15dc], appliedCount15dc, 1e6 * (double)appliedCount15dc / den15dc);
-				}
-				fprintf(f15cq, "\n");
-
-				auto printOutlier15dc = [&](const char *kind15dc, const MLHero15dcTailOutlier &o15dc) {
-					if (!o15dc.valid)
-						return;
-					fprintf(f15cq, "phase15dc case=%s worst=%s laneOrdinal=%llu depth=%u lane=%u heroLambda=%.9g laneLambda=%.9g heroPdf=%.9g lanePdf=%.9g mixPdf=%.9g balanceWeight=%.9g heroRaw=%.9g raw=%.9g absRaw=%.9g blendRatio=%.9g applied=%.9g absApplied=%.9g cosFixed=%.9g cosSampled=%.9g\n",
-						transportName15dc[c15dc], kind15dc, o15dc.laneOrdinal, o15dc.depth, o15dc.lane,
-						o15dc.heroLambda, o15dc.laneLambda, o15dc.heroPdf, o15dc.lanePdf, o15dc.mixPdf,
-						o15dc.balanceWeight, o15dc.heroRawMultiplier, o15dc.rawMultiplier, o15dc.absRaw,
-						o15dc.blendRatio, o15dc.appliedMultiplier, o15dc.absApplied, o15dc.cosFixed, o15dc.cosSampled);
-				};
-				printOutlier15dc("RAW", worstRawCopy15dc[c15dc]);
-				printOutlier15dc("APPLIED", worstAppliedCopy15dc[c15dc]);
-			}
-
-            fprintf(f15cq, "ML HERO phase 15de SPECTRAL PACKET COLOR-WEIGHT AUDIT glassMode=%u perLaneWeight=%u rendererPhysicsChangedSince15db=1 glassLaneColorPreservationFix15df=1\n",
-                engine->mlHeroGlassMode, engine->mlHeroGlassPerLaneWeight ? 1u : 0u);
-            const char *caseName15de[MLHERO_15DE_CASE_COUNT] = { "GLASS_REFLECT", "GLASS_TRANSMIT", "ROUGHGLASS_REFLECT", "ROUGHGLASS_TRANSMIT" };
-            const u_int laneName15de[MLHERO_15DE_LANE_BUCKETS] = { 1u, 2u, 4u, 8u };
-            for (u_int c15de = 0u; c15de < MLHERO_15DE_CASE_COUNT; ++c15de) {
-                for (u_int b15de = 0u; b15de < MLHERO_15DE_LANE_BUCKETS; ++b15de) {
-                    const unsigned long long n15de = mlHero15deCount[c15de][b15de].load(std::memory_order_relaxed);
-                    if (!n15de)
-                        continue;
-                    const double d15de = (double)n15de;
-                    const double minMul15de = mlHero15deAppliedMultiplierMin[c15de][b15de].load(std::memory_order_relaxed);
-                    const double maxMul15de = mlHero15deAppliedMultiplierMax[c15de][b15de].load(std::memory_order_relaxed);
-                    fprintf(f15cq, "phase15de case=%s lanes=%u events=%llu meanClassicChroma=%.12g meanHeroChroma=%.12g meanChromaRatio=%.12g meanNormColorL1=%.12g meanClassicY=%.12g meanHeroY=%.12g meanLuminanceRatio=%.12g minAppliedMultiplier=%.12g maxAppliedMultiplier=%.12g\n",
-                        caseName15de[c15de], laneName15de[b15de], n15de,
-                        mlHero15deClassicChromaSum[c15de][b15de].load(std::memory_order_relaxed) / d15de,
-                        mlHero15deHeroChromaSum[c15de][b15de].load(std::memory_order_relaxed) / d15de,
-                        mlHero15deChromaRatioSum[c15de][b15de].load(std::memory_order_relaxed) / d15de,
-                        mlHero15deNormColorL1Sum[c15de][b15de].load(std::memory_order_relaxed) / d15de,
-                        mlHero15deClassicYSum[c15de][b15de].load(std::memory_order_relaxed) / d15de,
-                        mlHero15deHeroYSum[c15de][b15de].load(std::memory_order_relaxed) / d15de,
-                        mlHero15deLuminanceRatioSum[c15de][b15de].load(std::memory_order_relaxed) / d15de,
-                        minMul15de, maxMul15de);
-                }
-            }
-            fprintf(f15cq, "phase15de interpretation=chromaRatio_near1_preserves_classic_color; below1_indicates_desaturation; normColorL1_near0_matches_classic_normalized_RGB; compare_1_2_4_8_lanes_and_perLaneWeight_off_on_or_Mode2\n");
-            fprintf(f15cq, "ML HERO phase 15dg MODE2 SPECTRAL ENERGY BALANCE AUDIT glassMode=%u perLaneWeight=%u diagnosticOnly=1\n",
-                engine->mlHeroGlassMode, engine->mlHeroGlassPerLaneWeight ? 1u : 0u);
-            const char *caseName15dg[MLHERO_15DG_CASE_COUNT] = {
-                "GLASS_EYE_REFLECT", "GLASS_EYE_TRANSMIT",
-                "GLASS_LIGHT_REFLECT", "GLASS_LIGHT_TRANSMIT",
-                "ROUGHGLASS_EYE_TRANSMIT", "ROUGHGLASS_LIGHT_TRANSMIT" };
-            const char *bandName15dg[MLHERO_15DG_BAND_COUNT] = { "BLUE_380_500", "GREEN_500_600", "RED_600_780" };
-            for (u_int c15dg = 0u; c15dg < MLHERO_15DG_CASE_COUNT; ++c15dg) {
-                double totalBase15dg = 0.0, totalApplied15dg = 0.0;
-                for (u_int b15dg = 0u; b15dg < MLHERO_15DG_BAND_COUNT; ++b15dg) {
-                    const unsigned long long n15dg = mlHero15dgCount[c15dg][b15dg].load(std::memory_order_relaxed);
-                    if (!n15dg) continue;
-                    const double base15dg = mlHero15dgBaseEnergy[c15dg][b15dg].load(std::memory_order_relaxed);
-                    const double applied15dg = mlHero15dgAppliedEnergy[c15dg][b15dg].load(std::memory_order_relaxed);
-                    const double ratio15dg = (base15dg > 1e-300) ? applied15dg / base15dg : 0.0;
-                    const double dn15dg = (double)n15dg;
-                    const unsigned long long mismatch15dg = mlHero15dgSupportMismatch[c15dg][b15dg].load(std::memory_order_relaxed);
-                    fprintf(f15cq, "phase15dg case=%s band=%s lanes=%llu baseEnergy=%.12g appliedEnergy=%.12g appliedOverBase=%.12g meanModeFactor=%.12g meanAbsFactorDelta=%.12g minModeFactor=%.12g maxModeFactor=%.12g supportMismatch=%llu supportMismatchPPM=%.9g\n",
-                        caseName15dg[c15dg], bandName15dg[b15dg], n15dg, base15dg, applied15dg, ratio15dg,
-                        mlHero15dgFactorSum[c15dg][b15dg].load(std::memory_order_relaxed) / dn15dg,
-                        mlHero15dgAbsFactorDeltaSum[c15dg][b15dg].load(std::memory_order_relaxed) / dn15dg,
-                        mlHero15dgFactorMin[c15dg][b15dg].load(std::memory_order_relaxed),
-                        mlHero15dgFactorMax[c15dg][b15dg].load(std::memory_order_relaxed),
-                        mismatch15dg, 1e6 * (double)mismatch15dg / dn15dg);
-                    totalBase15dg += base15dg;
-                    totalApplied15dg += applied15dg;
-                }
-                if (totalBase15dg > 1e-300)
-                    fprintf(f15cq, "phase15dg case=%s TOTAL appliedOverBase=%.12g baseEnergy=%.12g appliedEnergy=%.12g\n",
-                        caseName15dg[c15dg], totalApplied15dg / totalBase15dg, totalBase15dg, totalApplied15dg);
-            }
-            fprintf(f15cq, "phase15dg interpretation=Mode0_or_Mode1_should_be_near1_by_construction; Mode2_red_below1_with_blue_green_near1_indicates_systematic_red_energy_loss; broad_band_energy_is_measured_before_RGB_reconstruction; tails_are_reported_separately_by_15dc\n");
-
-            // ML HERO phase 15dh: downstream Delta-Glass path-accounting summary.
-            fprintf(f15cq, "ML HERO phase 15dh DELTA GLASS PATH-ACCOUNTING AUDIT glassMode=%u perLaneWeight=%u diagnosticOnly=1\n",
-                engine->mlHeroGlassMode, engine->mlHeroGlassPerLaneWeight ? 1u : 0u);
-            const char *sideNames15dh[2] = { "EYE", "LIGHT" };
-            const char *bandNames15dh[3] = { "BLUE_380_500", "GREEN_500_600", "RED_600_780" };
-            const char *estNames15dh[4] = { "ConnectVertices", "DirectLightSampling", "ConnectToEye", "DirectHitLight" };
-            for (u_int side15dh = 0u; side15dh < 2u; ++side15dh) {
-                for (u_int band15dh = 0u; band15dh < 3u; ++band15dh) {
-                    const unsigned long long n15dh = mlHero15dhTerminationCount[side15dh][band15dh].load(std::memory_order_relaxed);
-                    const double heroSum15dh = mlHero15dhTerminationHeroScalarSum[side15dh][band15dh].load(std::memory_order_relaxed);
-                    const double packetSum15dh = mlHero15dhTerminationPacketAverageSum[side15dh][band15dh].load(std::memory_order_relaxed);
-                    const double ratioSum15dh = mlHero15dhTerminationHeroOverPacketSum[side15dh][band15dh].load(std::memory_order_relaxed);
-                    fprintf(f15cq, "phase15dh termination side=%s band=%s count=%llu meanHeroOverPacket=%.12g sumHero=%.12g sumPacketAverage=%.12g sumHeroOverSumPacket=%.12g\n",
-                        sideNames15dh[side15dh], bandNames15dh[band15dh], n15dh,
-                        n15dh ? ratioSum15dh / (double)n15dh : 0.0, heroSum15dh, packetSum15dh,
-                        fabs(packetSum15dh) > 1e-30 ? heroSum15dh / packetSum15dh : 0.0);
-                }
-            }
-            for (u_int est15dh = 0u; est15dh < 4u; ++est15dh) {
-                for (u_int side15dh = 0u; side15dh < 2u; ++side15dh) {
-                    for (u_int band15dh = 0u; band15dh < 3u; ++band15dh) {
-                        const unsigned long long n15dh = mlHero15dhVisibleCount[est15dh][side15dh][band15dh].load(std::memory_order_relaxed);
-                        const unsigned long long invalid15dh = mlHero15dhInvalidReference[est15dh][side15dh][band15dh].load(std::memory_order_relaxed);
-                        const double y15dh = mlHero15dhVisibleY[est15dh][side15dh][band15dh].load(std::memory_order_relaxed);
-                        const double absY15dh = mlHero15dhVisibleAbsY[est15dh][side15dh][band15dh].load(std::memory_order_relaxed);
-                        const double refAbsY15dh = mlHero15dhReferenceAbsY[est15dh][side15dh][band15dh].load(std::memory_order_relaxed);
-                        const double weightedRatioNumer15dh = mlHero15dhActualOverReferenceTimesAbsY[est15dh][side15dh][band15dh].load(std::memory_order_relaxed);
-                        fprintf(f15cq, "phase15dh visible estimator=%s side=%s band=%s count=%llu signedY=%.12g absY=%.12g referenceAbsY=%.12g actualOverReferenceAbsY=%.12g absYWeightedActualOverReference=%.12g invalidReference=%llu\n",
-                            estNames15dh[est15dh], sideNames15dh[side15dh], bandNames15dh[band15dh], n15dh,
-                            y15dh, absY15dh, refAbsY15dh,
-                            refAbsY15dh > 1e-30 ? absY15dh / refAbsY15dh : 0.0,
-                            absY15dh > 1e-30 ? weightedRatioNumer15dh / absY15dh : 0.0, invalid15dh);
-                    }
-                }
-            }
-            fprintf(f15cq, "phase15dh interpretation=compare_Mode0_vs_Mode2_same_scene; if_RED termination meanHeroOverPacket_or visible actualOverReferenceAbsY is systematically lower only_in_Mode2, loss_is_after_material_lane_color_and_before_or_at_visible_path_accounting; if all_bands_match, investigate film/sample accumulation or scene-level stochastic variance instead; no renderer values are modified by 15dh\n");
-            // ML HERO phase 15dj: multiplier decomposition summary for the active Glass mode.
-            fprintf(f15cq, "ML HERO phase 15dj GLASS MULTIPLIER DECOMPOSITION glassMode=%u perLaneWeight=%u diagnosticOnly=1 sharedHeroPdf15di=%u\n",
-                engine->mlHeroGlassMode, engine->mlHeroGlassPerLaneWeight ? 1u : 0u,
-                ML_HERO_MODE2_SHARED_HERO_PDF_15DI ? 1u : 0u);
-            const char *caseNames15dj[4] = { "EYE_REFLECT", "EYE_TRANSMIT", "LIGHT_REFLECT", "LIGHT_TRANSMIT" };
-            const char *bandNames15dj[3] = { "BLUE_380_500", "GREEN_500_600", "RED_600_780" };
-            for (u_int c15dj = 0u; c15dj < 4u; ++c15dj) {
-                for (u_int b15dj = 0u; b15dj < 3u; ++b15dj) {
-                    const unsigned long long n15dj = mlHero15djCount[c15dj][b15dj].load(std::memory_order_relaxed);
-                    const unsigned long long bad15dj = mlHero15djInvalid[c15dj][b15dj].load(std::memory_order_relaxed);
-                    const double d15dj = n15dj ? (double)n15dj : 1.0;
-                    fprintf(f15cq, "phase15dj case=%s band=%s count=%llu invalid=%llu meanColorSample=%.12g meanFresnel=%.12g meanTransport=%.12g meanHeroPdf=%.12g meanLanePdf=%.12g meanMaterialLane=%.12g meanCallerAdjoint=%.12g meanWrappedLane=%.12g meanSharedLane=%.12g meanModeApplied=%.12g meanEta=%.12g meanNtLambda=%.12g meanDirDelta=%.12g\n",
-                        caseNames15dj[c15dj], bandNames15dj[b15dj], n15dj, bad15dj,
-                        mlHero15djColorSampleSum[c15dj][b15dj].load(std::memory_order_relaxed) / d15dj,
-                        mlHero15djFresnelSum[c15dj][b15dj].load(std::memory_order_relaxed) / d15dj,
-                        mlHero15djTransportSum[c15dj][b15dj].load(std::memory_order_relaxed) / d15dj,
-                        mlHero15djHeroPdfSum[c15dj][b15dj].load(std::memory_order_relaxed) / d15dj,
-                        mlHero15djLanePdfSum[c15dj][b15dj].load(std::memory_order_relaxed) / d15dj,
-                        mlHero15djMaterialLaneSum[c15dj][b15dj].load(std::memory_order_relaxed) / d15dj,
-                        mlHero15djCallerAdjointSum[c15dj][b15dj].load(std::memory_order_relaxed) / d15dj,
-                        mlHero15djWrappedLaneSum[c15dj][b15dj].load(std::memory_order_relaxed) / d15dj,
-                        mlHero15djSharedLaneSum[c15dj][b15dj].load(std::memory_order_relaxed) / d15dj,
-                        mlHero15djModeAppliedSum[c15dj][b15dj].load(std::memory_order_relaxed) / d15dj,
-                        mlHero15djEtaSum[c15dj][b15dj].load(std::memory_order_relaxed) / d15dj,
-                        mlHero15djNtLambdaSum[c15dj][b15dj].load(std::memory_order_relaxed) / d15dj,
-                        mlHero15djDirDeltaSum[c15dj][b15dj].load(std::memory_order_relaxed) / d15dj);
-                }
-            }
-            fprintf(f15cq, "phase15dj interpretation=compare_Mode0_Mode1_Mode2_same_scene_PLWoff; sharedLane_should_match_if_only_mode_selection_differs; materialLane_transport_and_dirDelta_are_counterfactual_wavelength_specific_Glass_response; meanColorSample_is_factor_decomposition_not_energy_estimator; no_renderer_values_modified_by_15dj\n");
-            fprintf(f15cq, "ML HERO phase 15dk MODE2 COLOR-OWNERSHIP CORRELATION AUDIT glassMode=%u perLaneWeight=%u diagnosticOnly=1 rendererPhysicsChanged=0\n",
-                engine->mlHeroGlassMode, engine->mlHeroGlassPerLaneWeight ? 1u : 0u);
-            for (u_int c15dk = 0u; c15dk < MLHERO_15DK_CASE_COUNT; ++c15dk) {
-                const unsigned long long ec15dk = mlHero15dkEventCount[c15dk].load(std::memory_order_relaxed);
-                const double sY15dk = mlHero15dkSpectralizedY[c15dk].load(std::memory_order_relaxed);
-                const double rY15dk = mlHero15dkRgbOwnedY[c15dk].load(std::memory_order_relaxed);
-                const double gY15dk = mlHero15dkSharedScalarY[c15dk].load(std::memory_order_relaxed);
-                const double invE15dk = ec15dk ? (1.0 / (double)ec15dk) : 0.0;
-                fprintf(f15cq, "phase15dk case=%s events=%llu meanSpectralizedRGB=(%.12g,%.12g,%.12g) meanRgbOwnedRGB=(%.12g,%.12g,%.12g) meanSharedScalarRGB=(%.12g,%.12g,%.12g) meanSpectralizedY=%.12g meanRgbOwnedY=%.12g meanSharedScalarY=%.12g spectralizedOverRgbOwnedY=%.12g sharedScalarOverRgbOwnedY=%.12g\n",
-                    caseNames15dj[c15dk], ec15dk,
-                    mlHero15dkSpectralizedRGB[c15dk][0].load(std::memory_order_relaxed) * invE15dk,
-                    mlHero15dkSpectralizedRGB[c15dk][1].load(std::memory_order_relaxed) * invE15dk,
-                    mlHero15dkSpectralizedRGB[c15dk][2].load(std::memory_order_relaxed) * invE15dk,
-                    mlHero15dkRgbOwnedRGB[c15dk][0].load(std::memory_order_relaxed) * invE15dk,
-                    mlHero15dkRgbOwnedRGB[c15dk][1].load(std::memory_order_relaxed) * invE15dk,
-                    mlHero15dkRgbOwnedRGB[c15dk][2].load(std::memory_order_relaxed) * invE15dk,
-                    mlHero15dkSharedScalarRGB[c15dk][0].load(std::memory_order_relaxed) * invE15dk,
-                    mlHero15dkSharedScalarRGB[c15dk][1].load(std::memory_order_relaxed) * invE15dk,
-                    mlHero15dkSharedScalarRGB[c15dk][2].load(std::memory_order_relaxed) * invE15dk,
-                    sY15dk * invE15dk, rY15dk * invE15dk, gY15dk * invE15dk,
-                    (fabs(rY15dk) > 1e-30) ? (sY15dk / rY15dk) : 0.0,
-                    (fabs(rY15dk) > 1e-30) ? (gY15dk / rY15dk) : 0.0);
-                for (u_int b15dk = 0u; b15dk < MLHERO_15DK_BAND_COUNT; ++b15dk) {
-                    const unsigned long long n15dk = mlHero15dkLaneCount[c15dk][b15dk].load(std::memory_order_relaxed);
-                    const double sx = mlHero15dkXSum[c15dk][b15dk].load(std::memory_order_relaxed);
-                    const double sm = mlHero15dkMSum[c15dk][b15dk].load(std::memory_order_relaxed);
-                    const double sxm = mlHero15dkXMSum[c15dk][b15dk].load(std::memory_order_relaxed);
-                    const double sx2 = mlHero15dkX2Sum[c15dk][b15dk].load(std::memory_order_relaxed);
-                    const double sm2 = mlHero15dkM2Sum[c15dk][b15dk].load(std::memory_order_relaxed);
-                    double corr = 0.0, cov = 0.0;
-                    if (n15dk > 1ull) {
-                        const double dn = (double)n15dk;
-                        cov = sxm / dn - (sx / dn) * (sm / dn);
-                        const double vx = Max(0.0, sx2 / dn - (sx / dn) * (sx / dn));
-                        const double vm = Max(0.0, sm2 / dn - (sm / dn) * (sm / dn));
-                        if ((vx > 1e-30) && (vm > 1e-30)) corr = cov / sqrt(vx * vm);
-                    }
-                    fprintf(f15cq, "phase15dk correlation case=%s band=%s lanes=%llu meanPreContribution=%.12g meanSpectralizedMultiplier=%.12g covariance=%.12g correlation=%.12g\n",
-                        caseNames15dj[c15dk], bandNames15dj[b15dk], n15dk,
-                        n15dk ? sx / (double)n15dk : 0.0,
-                        n15dk ? sm / (double)n15dk : 0.0, cov, corr);
-                }
-            }
-            fprintf(f15cq, "phase15dk interpretation=if_spectralizedOverRgbOwnedY_or_RGB_balance_differs_systematically_while_Mode0_Mode1_match_render_then_Mode2_is_reconstructing_an_already_chromatic_Glass_sample_per_wavelength; correlation_reports_whether_lane_energy_and_that_multiplier_are_coupled; diagnostic_only_no_throughput_change\n");
-			const unsigned long long samples15dd = mlHero15ddSampleResultCount.load(std::memory_order_relaxed);
-			const double den15dd = samples15dd ? (double)samples15dd : 1.0;
-			const double meanY15dd = mlHero15ddRadianceYSum.load(std::memory_order_relaxed) / den15dd;
-			const double meanAbsY15dd = mlHero15ddRadianceYAbsSum.load(std::memory_order_relaxed) / den15dd;
-			const double rmsY15dd = sqrt(Max(0.0, mlHero15ddRadianceY2Sum.load(std::memory_order_relaxed) / den15dd));
-			fprintf(f15cq, "ML HERO phase 15dd ROUGHGLASS MODE A/B RADIANCE FINGERPRINT glassMode=%u samples=%llu preVarianceClamp=1 physicsChangedSince15db=1 glassLaneColorPreservationFix15df=1\n", engine->mlHeroGlassMode, samples15dd);
-			fprintf(f15cq, "phase15dd glassMode=%u meanRGB=(%.12g, %.12g, %.12g) meanY=%.12g meanAbsY=%.12g rmsY=%.12g maxAbsY=%.12g\n",
-				engine->mlHeroGlassMode,
-				mlHero15ddRadianceRSum.load(std::memory_order_relaxed) / den15dd,
-				mlHero15ddRadianceGSum.load(std::memory_order_relaxed) / den15dd,
-				mlHero15ddRadianceBSum.load(std::memory_order_relaxed) / den15dd,
-				meanY15dd, meanAbsY15dd, rmsY15dd, mlHero15ddRadianceYMax.load(std::memory_order_relaxed));
-			fprintf(f15cq, "phase15dd comparisonProtocol=render_same_scene_twice_same_settings_first_glassMode0_then_glassMode2_save_each_log; compare_meanRGB_meanY_meanAbsY_rmsY_maxAbsY_and_phase15dc_tails\n");
-			fprintf(f15cq, "phase15cw note=RoughGlass_8lane_shared_direction_support_diagnostic; phase15cx_extreme_multiplier_trace_enabled; phase15cy_spectral_mixture_diagnostic_enabled; phase15cz_power2_diagnostic_enabled; phase15da_partial_balance_blend_diagnostic_enabled; phase15db_roughglass_mode2_blend25_render_enabled; phase15dc_real_render_tail_diagnostic_enabled; phase15dd_mode_ab_radiance_fingerprint_enabled; phase15de_packet_color_weight_audit_enabled; phase15dg_mode2_spectral_energy_balance_audit_enabled; phase15dh_delta_glass_path_accounting_audit_enabled; phase15dj_glass_multiplier_decomposition_enabled; phase15dk_mode2_color_ownership_correlation_enabled; phase15dl_mode2_rgb_ownership_candidate_validated; phase15dm_mode2_glass_rgb_ownership_regular_path_enabled; 15cv_radiance_fix_retained\n");
-			fprintf(f15cq, "ML HERO phase 15dh DIAGNOSTIC STATUS: mode=current master=1 current=1 legacy=%u heavy=%u glassMode=%u physicsChanges=ROUGHGLASS_MODE2_TRANSMIT_BLEND25+GLASS_LANE_COLOR_15DF physicsChangedSince15db=1\n", mlHeroLegacyDiagnostics15cq.load(std::memory_order_relaxed) ? 1u : 0u, mlHeroHeavyDiagnostics15cq.load(std::memory_order_relaxed) ? 1u : 0u, engine->mlHeroGlassMode);
+			fprintf(f15cq, "phase15cr note=reflectance_fixes_unchanged; Glossy2_coating_Fresnel_residual_unchanged; diagnostics_cleanup_only\n");
+			fprintf(f15cq, "ML HERO phase 15cr DIAGNOSTIC STATUS: mode=current master=1 current=1 legacy=%u heavy=%u physicsChanges=0\n", mlHeroLegacyDiagnostics15cq.load(std::memory_order_relaxed) ? 1u : 0u, mlHeroHeavyDiagnostics15cq.load(std::memory_order_relaxed) ? 1u : 0u);
 			fclose(f15cq);
 		}
 	}
