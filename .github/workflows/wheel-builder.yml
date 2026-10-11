@@ -341,13 +341,13 @@ jobs:
             fi
 
             # Install dependencies
-            pip install "conan==2.21" && pip install wheel && make deps
+            pip install "conan==2.21" && pip install wheel && python -u -m build-system.luxmake deps
 
           CIBW_BEFORE_ALL_MACOS: |
-            pip install "conan==2.21" && pip install wheel && make deps
+            pip install "conan==2.21" && pip install wheel && python -u -m build-system.luxmake deps
 
           CIBW_BEFORE_ALL_WINDOWS: |
-            pip install "conan==2.21" && pip install wheel && make deps
+            pip install "conan==2.21" && pip install wheel && python -u -m build-system.luxmake deps
 
 
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: |

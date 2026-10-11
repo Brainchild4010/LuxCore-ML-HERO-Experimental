@@ -43,5 +43,5 @@ files=$(ls -1 ${dest_dir2}/*.whl)
 # There should be only one wheel, but strictly speaking, we need a loop
 for filename in $files;
 do
-  make win-recompose $filename
+  python -u -m build-system.luxmake win-recompose "$filename"
 done
