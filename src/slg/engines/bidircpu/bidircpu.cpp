@@ -83,7 +83,7 @@ void BiDirCPURenderEngine::StartLockLess() {
 
 	mlHeroSamplingMode = Clamp(cfg.Get(GetDefaultProps()->Get("path.mlhero.samplingmode")).Get<int>(), 1, 3);
 	mlHeroWavelengthCount = Clamp(cfg.Get(GetDefaultProps()->Get("path.mlhero.wavelengthcount")).Get<int>(), 1, 8);
-	mlHeroGlassMode = Clamp(cfg.Get(GetDefaultProps()->Get("path.mlhero.glassmode")).Get<int>(), 0, 2);
+	mlHeroGlassMode = (cfg.Get(GetDefaultProps()->Get("path.mlhero.glassmode")).Get<int>() == 1) ? 1 : 0; // 15gj: unsupported/legacy mode 2 -> Standard (0)
 	mlHeroGlassPerLaneWeight = cfg.Get(GetDefaultProps()->Get("path.mlhero.glassperlaneweight")).Get<bool>();
 	mlHeroQuarterCycling = cfg.Get(GetDefaultProps()->Get("path.mlhero.quartercycling")).Get<bool>();
 	mlHeroDualTerminationCompensation = cfg.Get(GetDefaultProps()->Get("path.mlhero.dualterminationcompensation")).Get<bool>();

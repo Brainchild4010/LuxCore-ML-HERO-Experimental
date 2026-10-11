@@ -104,6 +104,13 @@ static std::atomic<bool> mlHeroHeavyDiagnostics15cq(false);
 static inline bool MLHeroDiagnosticsEnabled15cq() {
     return mlHeroDiagnostics15cq.load(std::memory_order_relaxed);
 }
+// 15gj: all HERO file IO must respect the master diagnostics switch.
+// This is deliberately independent of the current/legacy subfilters.
+static inline FILE *MLHeroOpenAnyLog15gj(const char *mode) {
+    return mlHeroDiagnostics15cq.load(std::memory_order_relaxed) ?
+        fopen(slg::mlhero15gb::FilePath(), mode) : nullptr;
+}
+
 static inline bool MLHeroCurrentDiagnosticsEnabled15cq() {
     return MLHeroDiagnosticsEnabled15cq() && mlHeroCurrentDiagnostics15cq.load(std::memory_order_relaxed);
 }
@@ -1255,7 +1262,7 @@ static void MLHeroRecordConnection15fa(const bool spectral, const u_int mask,
     const unsigned long long ticket = mlHero15faDetails[reason].fetch_add(1ull, std::memory_order_relaxed);
     if (ticket >= MLHERO_15FA_DETAIL_LIMIT) return;
     std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
-    FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+    FILE *f = MLHeroOpenAnyLog15gj("a");
     if (!f) return;
     fprintf(f, "phase15fa RGB_DETAIL reason=%s mask=%u detail=%llu eyeType=%s eyeTypeID=%u lightType=%s lightTypeID=%u eyeMaterialID=%u eyeName=\"%s\" lightMaterialID=%u lightName=\"%s\" eyeDepth=%u lightDepth=%u eyeLanes=%u lightLanes=%u eyeActive=%u lightActive=%u eyeGlassHistory=%u lightGlassHistory=%u endpointCheckedLanes=%u firstFailedLane=%u\n",
         MLHeroReason15fa(reason), mask, ticket, MLHeroMaterialTypeName15cl(e), (u_int)eye.bsdf.GetMaterialType(),
@@ -1338,7 +1345,7 @@ static void MLHeroRecordMatte15fb(const PathVertexVM &eye, const PathVertexVM &l
     const unsigned long long ticket = mlHero15fbDetailTicket.fetch_add(1ull, std::memory_order_relaxed);
     if (ticket >= 12ull) return;
     std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
-    FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+    FILE *f = MLHeroOpenAnyLog15gj("a");
     if (!f) return;
     fprintf(f, "phase15fb MATTE_CONNECTION detail=%llu eyeDepth=%u lightDepth=%u lanes=%u eyeActive=%u lightActive=%u eyeMaterialID=%u lightMaterialID=%u eyeGlassHistory=%u lightGlassHistory=%u actualSpectralRGB=(%.9g,%.9g,%.9g) classicCounterfactualRGB=(%.9g,%.9g,%.9g) classicNotAdded=1\n",
         ticket, eye.depth, light.depth, eye.mlHeroLaneCount, eye.mlHeroActiveWavelengthCount,
@@ -1394,7 +1401,7 @@ static void MLHeroRecordTranslucent15fc(const PathVertexVM &eye, const PathVerte
     const unsigned long long ticket = mlHero15fcDetailTicket.fetch_add(1ull, std::memory_order_relaxed);
     if (ticket >= 12ull) return;
     std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
-    FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+    FILE *f = MLHeroOpenAnyLog15gj("a");
     if (!f) return;
     fprintf(f, "phase15fc TRANSLUCENT_CONNECTION detail=%llu eyeDepth=%u lightDepth=%u lanes=%u eyeActive=%u lightActive=%u eyeMaterialID=%u lightMaterialID=%u eyeMaterialType=%u lightMaterialType=%u eyeGlassHistory=%u lightGlassHistory=%u actualSpectralRGB=(%.9g,%.9g,%.9g) classicCounterfactualRGB=(%.9g,%.9g,%.9g) classicNotAdded=1\n",
         ticket, eye.depth, light.depth, eye.mlHeroLaneCount, eye.mlHeroActiveWavelengthCount,
@@ -1471,7 +1478,7 @@ static void MLHeroFiniteAudit15fw(const u_int stage, const char *role, const Spe
         const auto ticket=mlHero15fwDetails[stage][kind].fetch_add(1ull,std::memory_order_relaxed);
         if (ticket>=32ull) continue;
         std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
-        FILE *f=fopen(ML_HERO_LOG_FILE,"a"); if (!f) continue;
+        FILE *f=MLHeroOpenAnyLog15gj("a"); if (!f) continue;
         fprintf(f,"phase15fw FINITE_TAIL stage=%s role=%s kind=%s detail=%llu thread=%u step=%u filmX=%.9g filmY=%.9g group=%u rgb=(%.9g,%.9g,%.9g) Y=%.12g maxAbsChannel=%.12g factor=%.9g pdf=%.9g geometry=%.9g contributionRetained=1\n",
             MLHeroStage15ew(stage),role,kind==0u?"ABS64":"COLOR16_RATIO8",ticket,
             mlHeroThread15fw,mlHeroStep15fw,filmX>=0.f?filmX:mlHeroFilmX15fw,
@@ -1491,7 +1498,7 @@ static void MLHeroFiniteConnection15fw(const Spectrum &v, const Spectrum &before
     const auto ticket=mlHero15fwConnectionDetails.fetch_add(1ull,std::memory_order_relaxed);
     if (ticket>=64ull) return;
     std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
-    FILE *f=fopen(ML_HERO_LOG_FILE,"a"); if (!f) return;
+    FILE *f=MLHeroOpenAnyLog15gj("a"); if (!f) return;
     fprintf(f,"phase15fw CONNECTION detail=%llu thread=%u step=%u filmX=%.9g filmY=%.9g eyeDepth=%u lightDepth=%u eyePdfW=%.9g lightPdfW=%.9g mis=%.9g geometry=%.9g connection=%.9g beforeDualRGB=(%.9g,%.9g,%.9g) actualRGB=(%.9g,%.9g,%.9g)\n",
         ticket,mlHeroThread15fw,mlHeroStep15fw,mlHeroFilmX15fw,mlHeroFilmY15fw,
         eye.depth,light.depth,eyePdf,lightPdf,mis,geometry,connection,
@@ -1526,7 +1533,7 @@ static void MLHeroAudit15ew(const u_int stage, const char *role, const Spectrum 
     const unsigned long long ticket = mlHero15ewDetails[stage].fetch_add(1ull, std::memory_order_relaxed);
     if (ticket >= 16ull) return;
     std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
-    FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+    FILE *f = MLHeroOpenAnyLog15gj("a");
     if (!f) return;
     fprintf(f, "phase15ew NONFINITE stage=%s role=%s index=%llu rgb=(%.9g,%.9g,%.9g) hasNaN=%u hasInf=%u factor=%.9g pdf=%.9g geometry=%.9g filmX=%.9g filmY=%.9g group=%u rendererContributionRetained=1\n",
         MLHeroStage15ew(stage), role, ticket, v.c[0], v.c[1], v.c[2], nan ? 1u : 0u, inf ? 1u : 0u,
@@ -1631,7 +1638,7 @@ static void MLHeroLogDLSMIS15ex(const PathVertexVM &eye, const u_int lightID,
     const unsigned long long ticket = mlHero15exDetails[probe.reason].fetch_add(1ull, std::memory_order_relaxed);
     if (ticket >= 16ull) return;
     std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
-    FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+    FILE *f = MLHeroOpenAnyLog15gj("a");
     if (!f) return;
     fprintf(f, "phase15ex DLS_MIS_INPUT index=%llu reason=%s lightID=%u lightType=%u depth=%u materialID=%u name=\"%s\" emissionPdfW=%.9g directPdfW=%.9g lightPickPdf=%.9g directLightSamplingPdfW=%.9g bsdfPdfW=%.9g bsdfRevPdfW=%.9g cosThetaToLight=%.9g cosThetaAtLight=%.9g cameraNumerator=%.9g cameraDenominator=%.9g cameraRatio=%.9g cameraRatioSquared=%.9g reversePdfSquared=%.9g misVmWeightFactor=%.9g dVCM=%.9g dVC=%.9g cameraHistory=%.9g weightLight=%.9g weightCamera=%.9g actualMis=%.9g radianceFactor=%.9g shadowTransparent=%u filmX=%.9g filmY=%.9g candidateApplicable=%u candidateCamera=%.9g candidateMis=%.9g candidateApplied=0 auditDiagnosticOnly=1 liveZeroHistoryFix=15ey\n",
         ticket, MLHeroMISReason15ex(probe.reason), lightID, lightType, eye.depth,
@@ -1683,7 +1690,7 @@ static void MLHeroRecordMISFix15ey(const PathVertexVM &eye, const u_int lightID,
     const unsigned long long ticket = mlHero15eyDetails.fetch_add(1ull, std::memory_order_relaxed);
     if (ticket >= 16ull) return;
     std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
-    FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+    FILE *f = MLHeroOpenAnyLog15gj("a");
     if (!f) return;
     fprintf(f, "phase15ey DLS_MIS_FIX index=%llu lightID=%u lightType=%u depth=%u materialID=%u name=\"%s\" emissionPdfW=%.9g directPdfW=%.9g lightPickPdf=%.9g bsdfPdfW=%.9g bsdfRevPdfW=%.9g cosThetaToLight=%.9g cosThetaAtLight=%.9g cameraRatio=%.9g cameraHistory=%.9g weightLight=%.9g legacyWeightCamera=%.9g legacyMis=%.9g actualWeightCamera=0 actualMis=%.9g radianceFactor=%.9g recovered=%u shadowTransparent=%u filmX=%.9g filmY=%.9g applied=1 policy=EXACT_ZERO_HISTORY_ONLY\n",
         ticket, lightID, lightType, eye.depth, eye.bsdf.GetMaterialID(), eye.bsdf.GetMaterialName().c_str(),
@@ -1716,7 +1723,7 @@ void MLHeroRoughGlass15gfReport(bool fromLight, bool transmit,
     if (ticket >= 96u) return;
     const float ratio = evaluateWeight != 0.f ? sampleWeight / evaluateWeight : 0.f;
     std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
-    FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+    FILE *f = MLHeroOpenAnyLog15gj("a");
     if (!f) return;
     fprintf(f, "phase15gf ROUGH_CONSISTENCY ticket=%u side=%s event=%s nc=%.9g nt=%.9g etaInOut=%.9g samplePdf=%.9g evalDirectPdf=%.9g pdfFunction=%.9g sampleWeight=%.9g evalOverPdf=%.9g sampleVsEvalRatio=%.9g cosFixed=%.9g cosSampled=%.9g diagnosticOnly=1\n",
         ticket, fromLight ? "LIGHT" : "EYE", transmit ? "TRANSMIT" : "REFLECT",
@@ -1726,10 +1733,10 @@ void MLHeroRoughGlass15gfReport(bool fromLight, bool transmit,
 }
 
 static inline FILE *MLHeroOpenCurrentLog15cq(const char *mode) {
-    return MLHeroCurrentDiagnosticsEnabled15cq() ? fopen(ML_HERO_LOG_FILE, mode) : nullptr;
+    return MLHeroCurrentDiagnosticsEnabled15cq() ? MLHeroOpenAnyLog15gj(mode) : nullptr;
 }
 static inline FILE *MLHeroOpenLegacyLog15cq(const char *mode) {
-    return MLHeroLegacyDiagnosticsEnabled15cq() ? fopen(ML_HERO_LOG_FILE, mode) : nullptr;
+    return MLHeroLegacyDiagnosticsEnabled15cq() ? MLHeroOpenAnyLog15gj(mode) : nullptr;
 }
 
 // ML HERO phase 15ce: full-render Matte packet convergence diagnostic.
@@ -2620,7 +2627,7 @@ static void MLHeroAuditBounce15fd(const PathVertexVM &v, BSDFEvent event,
         else mlHero15fdRejected[c].fetch_add(1ull, std::memory_order_relaxed);
     }
     std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
-    FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+    FILE *f = MLHeroOpenAnyLog15gj("a");
     if (!f) return;
     mlHero15fdDetails[c].fetch_add(1ull, std::memory_order_relaxed);
     fprintf(f, "phase15fd BOUNCE_DETAIL case=%s ticket=%llu materialID=%u depth=%u event=%u lanes=%u active=%u genericSPD=%u explicitMetal2=%u rawRGB=%u introducedRGB=%u inheritedRGB=%u weakScalarOnly=%u pdf=%.9g rr=%.9g sampleRGB=(%.9g,%.9g,%.9g) inputsOK=%u fitOK=%u factor=%.12g fitRelativeError=%.12g candidateApplied=0\n",
@@ -2766,7 +2773,7 @@ static bool MLHeroPrepareTranslucent15fe(const BSDF &bsdf, const Vector &dir,
         if (!ok) mlHero15feReject[index].fetch_add(1ull, std::memory_order_relaxed);
         if (mlHero15feTickets[index].fetch_add(1ull, std::memory_order_relaxed) < 12ull) {
             std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
-            FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+            FILE *f = MLHeroOpenAnyLog15gj("a");
             if (f) {
                 fprintf(f, "phase15fe TRANSLUCENT_FACTORS stage=%u transmit=%u materialID=%u fromLight=%u sampleMultiplier=%u helperOK=%u wrapper=%.9g Kr=(%.9g,%.9g,%.9g) Kt=(%.9g,%.9g,%.9g) compensation=%u applicationCount=SUMMARY_only\n",
                     stage, out->transmit ? 1u : 0u, bsdf.GetMaterialID(), bsdf.hitPoint.fromLight ? 1u : 0u,
@@ -2850,7 +2857,7 @@ static bool MLHeroRoughValue15et(const BSDF &bsdf, const Vector &dir,
     if (MLHeroCurrentDiagnosticsEnabled15cq() &&
             mlHero15etLogTickets[stage].fetch_add(1ull, std::memory_order_relaxed) < 64ull) {
         std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
-        FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+        FILE *f = MLHeroOpenAnyLog15gj("a");
         if (f) {
             fprintf(f, "phase15et ROUGHGLASS_VALUE stage=%u materialID=%u name=\"%s\" fromLight=%u event=%u dispersion=%u lambda=%.9g helperOK=%u rgb=(%.9g,%.9g,%.9g) spectral=%.9g\n",
                 stage, bsdf.GetMaterialID(), bsdf.GetMaterialName().c_str(),
@@ -7103,7 +7110,7 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
             const unsigned long long ticket = mlHero15etApplied[roughStage15et].fetch_add(1ull, std::memory_order_relaxed);
             if (MLHeroCurrentDiagnosticsEnabled15cq() && ticket < 64ull) {
                 std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
-                FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+                FILE *f = MLHeroOpenAnyLog15gj("a");
                 if (f) {
                     fprintf(f, "phase15et ROUGHGLASS_BOUNCE stage=%u materialID=%u name=\"%s\" event=%u dispersion=%u collapsed=%u activeCount=%u rrProb=%.9g helperFactor0=%.9g preRR0=%.9g postRRBefore0=%.9g after0=%.9g packetScale=%u colorTransport=SPECTRAL\n",
                         roughStage15et, pathVertex->bsdf.GetMaterialID(), pathVertex->bsdf.GetMaterialName().c_str(),
@@ -7123,7 +7130,7 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
             const unsigned long long ticket = mlHero15evEvents[glassSide15ev].fetch_add(1ull, std::memory_order_relaxed);
             if (MLHeroCurrentDiagnosticsEnabled15cq() && ticket < 64ull) {
                 std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
-                FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+                FILE *f = MLHeroOpenAnyLog15gj("a");
                 if (f) {
                     fprintf(f, "phase15ev GLASS_BOUNCE side=%u materialID=%u name=\"%s\" glassMode=%u event=%u dispersion=%u helperRejected=%u firstCollapse=%u collapsed=%u activeCount=%u rrProb=%.9g factor0=%.9g preRR0=%.9g postRRBefore0=%.9g after0=%.9g heroDirectionDelta=%.9g packetScale=%u colorTransport=SPECTRAL\n",
                         glassSide15ev, pathVertex->bsdf.GetMaterialID(), pathVertex->bsdf.GetMaterialName().c_str(),
@@ -8394,8 +8401,9 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
             mlHero15euCandidateY[category].store(0.0, std::memory_order_relaxed);
         }
         // 15gb: always create a compact baseline for BIDIR, even with HERO OFF.
-        const bool logReady15gb = slg::mlhero15gb::Begin("BIDIR", engine->mlHeroEnabled, ML_HERO_BUILD, ML_HERO_TEST_PHASE);
-        FILE *f = logReady15gb ? fopen(ML_HERO_LOG_FILE, "w") : nullptr;
+        const bool logReady15gb = engine->mlHeroDiagnostics &&
+            slg::mlhero15gb::Begin("BIDIR", engine->mlHeroEnabled, ML_HERO_BUILD, ML_HERO_TEST_PHASE);
+        FILE *f = logReady15gb ? MLHeroOpenAnyLog15gj("w") : nullptr;
         if (f) {
             fprintf(f, "ML HERO 15gb RUN: engine=BIDIR heroEnabled=%u diagnostics=%u current=%u legacy=%u heavy=%u wavelengths=%u seed=%u\n",
                 engine->mlHeroEnabled ? 1u : 0u, engine->mlHeroDiagnostics ? 1u : 0u,
@@ -10494,7 +10502,7 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 // 15fh BEGIN diagnostic-only
     if(MLHeroCurrentDiagnosticsEnabled15cq()) {
         std::lock_guard<std::recursive_mutex> lock15fh(mlHeroDebugLogMutex);
-        FILE*f15fh=fopen(ML_HERO_LOG_FILE,"a");
+        FILE*f15fh=MLHeroOpenAnyLog15gj("a");
         if(f15fh){
             fprintf(f15fh,"phase15fi DEPTH_CONFIG engine=BIDIRCPU thread=%u eyeMax=%u lightMax=%u rrStart=%u rrLimit=%.9g rrCounter=subpathVertexDepth rrBeforeDepthIncrement=1 rrSkipSpecular=0 independentSubpathLimits=1 rendererPhysicsChanged=0\n",threadIndex,engine->maxEyePathDepth,engine->maxLightPathDepth,engine->rrDepth,engine->rrImportanceCap);
             fprintf(f15fh,"phase15fo BIDIR_MIS_CONFIG engine=BIDIRCPU thread=%u rendererPhysicsChanged=1 liveEndpointPDF=RAW_DIRECTIONAL rawBounceHistoryRetained=1 rrCompensation=THROUGHPUT_ONLY localRRPDFRemoved=ConnectVerticesBothSides,ConnectToEye,DLS independentOfHeroAndDiagnostics=1 BIDIRVMCPU_BaselineRetained=1 fullRuntimePathClosure=0\n",threadIndex);

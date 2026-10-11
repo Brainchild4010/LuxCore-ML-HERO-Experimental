@@ -91,6 +91,12 @@ static unsigned MLHeroTerminalLightGuard15fl(LightSourceConstRef light,const flo
 #define ML_HERO_FEATURE "Central CPU diagnostic log filenames; renderer physics unchanged from 15ga"
 #define ML_HERO_PATH_LOG_FILE slg::mlhero15gb::FilePath()
 
+// 15gj: diagnostic master gate for ALL CPU PATH HERO log files.
+static std::atomic<bool> mlHeroPathLogEnabled15gj(false);
+static inline FILE *MLHeroPathOpenLog15gj(const char *mode) {
+    return mlHeroPathLogEnabled15gj.load(std::memory_order_relaxed) ?
+        fopen(slg::mlhero15gb::FilePath(), mode) : nullptr;
+}
 static std::mutex mlHeroPathDebugMutex15ev;
 static std::atomic<unsigned long long> mlHeroPathEyeSamples15ev(0ull);
 static std::atomic<unsigned long long> mlHeroPathPacketSamples15ev(0ull);
@@ -174,9 +180,11 @@ static void MLHeroPathResetDiagnostics15ev(const bool enabled, const int samplin
 // 15fg END
 
 
+    mlHeroPathLogEnabled15gj.store(diagnostics15fg, std::memory_order_relaxed);
+    if (!diagnostics15fg) return;
     std::lock_guard<std::mutex> lock(mlHeroPathDebugMutex15ev);
     if (!slg::mlhero15gb::Begin("PATH", enabled, ML_HERO_BUILD, ML_HERO_TEST_PHASE)) return;
-    FILE *f = fopen(ML_HERO_PATH_LOG_FILE, "w");
+    FILE *f = MLHeroPathOpenLog15gj("w");
     if (!f)
         return;
 
@@ -210,7 +218,7 @@ static void MLHeroPathLogPacket15ev(const unsigned long long sampleOrdinal,
         return;
 
     std::lock_guard<std::mutex> lock(mlHeroPathDebugMutex15ev);
-    FILE *f = fopen(ML_HERO_PATH_LOG_FILE, "a");
+    FILE *f = MLHeroPathOpenLog15gj("a");
     if (!f)
         return;
 
@@ -298,7 +306,7 @@ static bool MLHeroPathTranslucentLanes15fg(const BSDF &bsdf, const Vector &dir,
         if (!ok) mlHero15fgRejected[index].fetch_add(1ull, std::memory_order_relaxed);
         if (mlHero15fgDetails[index].fetch_add(1ull, std::memory_order_relaxed) < 12ull) {
             std::lock_guard<std::mutex> lock(mlHeroPathDebugMutex15ev);
-            FILE *f=fopen(ML_HERO_PATH_LOG_FILE,"a");
+            FILE *f=MLHeroPathOpenLog15gj("a");
             if (f) {
                 fprintf(f,"phase15fg TRANSLUCENT_FACTORS stage=%u transmit=%u materialID=%u sampled=%u count=%u compensation=%u helperOK=%u wrapper=%.9g rrProb=%.9g Kr=(%.9g,%.9g,%.9g) Kt=(%.9g,%.9g,%.9g) actualApplied=SUMMARY_only",stage,(event&TRANSMIT)?1u:0u,bsdf.GetMaterialID(),sampled?1u:0u,count,compensation?1u:0u,ok?1u:0u,wrapper,rrProb,kr.c[0],kr.c[1],kr.c[2],kt.c[0],kt.c[1],kt.c[2]);
                 for(u_int lane=0u;ok&&lane<count;++lane) fprintf(f," lane%uLambda=%.9g lane%uFactor=%.9g",lane,GetMLHeroWaveLengthAt(lane),lane,pending[lane]);
@@ -544,7 +552,7 @@ static void MLHeroPathLogGlossy2Decomposition15ev(const u_int depth, const BSDF 
         classicPhysicalValue, GetMLHeroWaveLengthAt(0), &lane0, &helperFitError);
 
     std::lock_guard<std::mutex> lock(mlHeroPathDebugMutex15ev);
-    FILE *f = fopen(ML_HERO_PATH_LOG_FILE, "a");
+    FILE *f = MLHeroPathOpenLog15gj("a");
     if (!f)
         return;
     fprintf(f,
@@ -577,7 +585,7 @@ static void MLHeroPathLogGlossy2Transport15ev(const u_int depth,
     if (budget == 0ull)
         return;
     std::lock_guard<std::mutex> lock(mlHeroPathDebugMutex15ev);
-    FILE *f = fopen(ML_HERO_PATH_LOG_FILE, "a");
+    FILE *f = MLHeroPathOpenLog15gj("a");
     if (!f)
         return;
     fprintf(f, "phase15ev GLOSSY2_TRANSPORT depth=%u event=%u packetBefore=%d packetAfter=%d mode=%s factorsApplied=%d rrProb=%.9g laneCount=%u",
@@ -630,7 +638,7 @@ static void MLHeroPathLogMetal2Audit15ev(const char *kind, const BSDF &bsdf,
     if (budget == 0ull)
         return;
     std::lock_guard<std::mutex> lock(mlHeroPathDebugMutex15ev);
-    FILE *f = fopen(ML_HERO_PATH_LOG_FILE, "a");
+    FILE *f = MLHeroPathOpenLog15gj("a");
     if (!f)
         return;
     fprintf(f, "phase15ev METAL2_%s materialID=%u materialType=%u packetBefore=%d packetAfter=%d helpersCalled=%d applied=%d mode=%s rrProb=%.9g laneCount=%u legacySpectralUsed=%d packetFallbackUsed=%d",
@@ -667,7 +675,7 @@ static unsigned long long MLHeroPathLogGlassSample15ev(const u_int depth,
     const unsigned long long id = mlHeroPathGlassOrdinal15ev.fetch_add(1ull,
         std::memory_order_relaxed) + 1ull;
     std::lock_guard<std::mutex> lock(mlHeroPathDebugMutex15ev);
-    FILE *f = fopen(ML_HERO_PATH_LOG_FILE, "a");
+    FILE *f = MLHeroPathOpenLog15gj("a");
     if (!f)
         return 0ull;
     fprintf(f, "phase15ev GLASS_SAMPLE id=%llu depth=%u materialID=%u event=%u branch=%s samplePdfW=%.9g packetBefore=%d snapshotBefore=%d dispersionUsed=%d packetFallbackUsed=%d laneCount=%u classicPreRR=(%.9g,%.9g,%.9g) scalar=%d\n",
@@ -703,7 +711,7 @@ static void MLHeroPathLogGlassTransport15ev(const unsigned long long id,
     if (id == 0ull)
         return;
     std::lock_guard<std::mutex> lock(mlHeroPathDebugMutex15ev);
-    FILE *f = fopen(ML_HERO_PATH_LOG_FILE, "a");
+    FILE *f = MLHeroPathOpenLog15gj("a");
     if (!f)
         return;
     fprintf(f, "phase15ev GLASS_TRANSPORT id=%llu mode=%s packetAfter=%d snapshotTaken=%d dispersionUsed=%d packetFallbackUsed=%d rrProb=%.9g laneCount=%u",
@@ -734,7 +742,7 @@ static void MLHeroPathLogMaterialAudit15ev(const u_int depth, const BSDF &bsdf,
     const BSDFEvent eventTypes = bsdf.GetEventTypes();
 
     std::lock_guard<std::mutex> lock(mlHeroPathDebugMutex15ev);
-    FILE *f = fopen(ML_HERO_PATH_LOG_FILE, "a");
+    FILE *f = MLHeroPathOpenLog15gj("a");
     if (!f)
         return;
 
@@ -765,7 +773,7 @@ static void MLHeroPathLogBounce15ev(const u_int depth, const BSDFEvent event,
         return;
 
     std::lock_guard<std::mutex> lock(mlHeroPathDebugMutex15ev);
-    FILE *f = fopen(ML_HERO_PATH_LOG_FILE, "a");
+    FILE *f = MLHeroPathOpenLog15gj("a");
     if (!f)
         return;
 
@@ -969,7 +977,7 @@ static void MLHeroPathContinuationLog15ev(const char *kind, const u_int depth,
     const MLHeroPathContinuation15ev &s = mlHeroContinuation15ev;
     if (!s.active || s.id == 0ull || !MLHeroPathContinuationClaim15ev(mlHeroContinuationRowBudget15ev)) return;
     std::lock_guard<std::mutex> lock(mlHeroPathDebugMutex15ev);
-    FILE *f = fopen(ML_HERO_PATH_LOG_FILE, "a");
+    FILE *f = MLHeroPathOpenLog15gj("a");
     if (!f) return;
     fprintf(f, "phase15ev HERO_CONTINUATION kind=%s path=%llu depth=%u mode=%s event=%u materialType=%u valid=%d collapsed=%d activeCount=%u rrProb=%.9g maxDirectionDelta=%.9g estimatorScale=1 packetAverage=1/activeCount candidateApplied=%d classicFinalRGB=(%.9g,%.9g,%.9g) candidateCIE=(%.9g,%.9g,%.9g)",
         kind, s.id, depth, mode, (u_int)event, materialType, s.valid ? 1 : 0, s.collapsed ? 1 : 0,
@@ -1069,7 +1077,7 @@ static void MLHeroPathLogRough15ev(const BSDF &bsdf, const char *kind,
     while (remaining && !budget.compare_exchange_weak(remaining, remaining - 1ull,
         std::memory_order_relaxed)) {}
     if (!remaining) return;
-    FILE *f = fopen(ML_HERO_PATH_LOG_FILE, "a");
+    FILE *f = MLHeroPathOpenLog15gj("a");
     if (!f) return;
     const auto &state = mlHeroContinuation15ev;
     fprintf(f, "phase15ev ROUGHGLASS_%s materialID=%u name=\"%s\" event=%u dispersion=%d valid=%d collapsed=%d activeCount=%u rrProb=%.9g helperOK=%d sampledPdfOwner=HERO_SHARED activeAverage=1/activeCount",
@@ -1137,7 +1145,7 @@ static void MLHeroPathContinuationBounce15ev(const BSDF &bsdf, const Vector &dir
             (s.collapsed ? "GLASS_TX_HERO_ONLY" : "GLASS_TX_PACKET");
         if (MLHeroPathContinuationClaim15ev(mlHeroGlassDetailBudget15ev)) {
             std::lock_guard<std::mutex> lock(mlHeroPathDebugMutex15ev);
-            FILE *f = fopen(ML_HERO_PATH_LOG_FILE, "a");
+            FILE *f = MLHeroPathOpenLog15gj("a");
             if (f) {
                 fprintf(f, "phase15ev GLASS_CONTINUATION materialID=%u name=\"%s\" event=%u dispersion=%u helperOK=%u nativeSampleFallback=%u firstCollapse=%u collapsed=%u activeCount=%u rrProb=%.9g heroDirectionDelta=%.9g heroFactor=%.9g colorTransport=SPECTRAL activeAverage=1/activeCount extraN=0\n",
                     bsdf.GetMaterialID(), bsdf.GetMaterialName().c_str(), (u_int)event,
@@ -1235,7 +1243,7 @@ static void MLHeroPathLogEndpoint15ev(const char *kind, const Spectrum &classicC
             ciePacketRGB.c[c] / classicContribution.c[c] : 0.f;
 
     std::lock_guard<std::mutex> lock(mlHeroPathDebugMutex15ev);
-    FILE *f = fopen(ML_HERO_PATH_LOG_FILE, "a");
+    FILE *f = MLHeroPathOpenLog15gj("a");
     if (!f)
         return;
 
@@ -1384,7 +1392,7 @@ void PathTracer::ResetMLHeroEstimator15fh() const {
 void PathTracer::LogMLHeroMatteTranslucent15fg(const u_int threadIndex) const {
     if(!mlHeroDiagnostics15fg || !mlHeroEnabled) return;
     std::lock_guard<std::mutex> lock(mlHeroPathDebugMutex15ev);
-    FILE*f=fopen(ML_HERO_PATH_LOG_FILE,"a"); if(!f)return;
+    FILE*f=MLHeroPathOpenLog15gj("a"); if(!f)return;
     for(u_int i=0u;i<8u;++i)
         fprintf(f,"phase15fg TRANSLUCENT_SUMMARY thread=%u stage=%u transmit=%u preparations=%llu helperRejected=%llu applied=%llu globalCumulativeSnapshot=1 doNotSumSnapshots=1 stageNames=packetBounce,packetDLS,continuationBounce,continuationDLS\n",threadIndex,i/2u,i%2u,mlHero15fgPrepared[i].load(),mlHero15fgRejected[i].load(),mlHero15fgApplied[i].load());
     fprintf(f,"phase15fg TRANSPORT_AUDIT thread=%u eyeResults=%llu eyeNonfinite=%llu appliedNonfinite=%llu nonNeutralOrInvalidAppliedLanes=%llu globalCumulativeSnapshot=1 doNotSumSnapshots=1 onlyNewMaterialStages=1\n",threadIndex,mlHero15fgEyeResults.load(),mlHero15fgEyeNonfinite.load(),mlHero15fgAppliedNonfinite.load(),mlHero15fgRgbLanes.load());
@@ -2451,7 +2459,7 @@ void PathTracer::RenderEyePath(IntersectionDevice *device,
                 MLHeroPathRRRecord15fz(kind15fz,selected15fz,baseline15fz,rrProb,random15fz,killed15fz);
                 if(mlHeroPathRRStats15fz.details++<24u) {
                     std::lock_guard<std::mutex> lock(mlHeroPathDebugMutex15ev);
-                    FILE *f=fopen(ML_HERO_PATH_LOG_FILE,"a");
+                    FILE *f=MLHeroPathOpenLog15gj("a");
                     if(f) {
                         fprintf(f,"phase15fz PATH_RR_DECISION material=%u depth=%u nativeRR=%u glassRR=%u selected=%u validEta=%u continuation=%u activeLanes=%u beta=%.17g baselineQ=%.9g liveQ=%.9g random=%.9g killed=%u currentRRExcluded=1 compensationOnce=1\n",
                             (u_int)bsdf.GetMaterialType(),pathInfo.depth.depth,nativeRR15fz?1u:0u,
