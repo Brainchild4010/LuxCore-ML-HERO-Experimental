@@ -58,6 +58,21 @@ public:
 		const luxrays::Vector &localLightDir, const luxrays::Vector &localEyeDir,
 		float *directPdfW, float *reversePdfW) const;
 
+	bool HasMLHeroDispersion(const HitPoint &hitPoint) const;
+
+	// ML HERO phase 15du: diagnostic-only microfacet ownership audit for
+	// dispersive RoughGlass transmission. Reconstructs the HERO-sampled
+	// microfacet normal and compares the companion wavelength's natural
+	// same-microfacet direction with the shared HERO direction.
+	bool EvaluateMLHeroMicrofacetOwnershipDebug(const HitPoint &hitPoint,
+		const luxrays::Vector &localFixedDir, const luxrays::Vector &localSharedDir,
+		const BSDFEvent sampledEvent, const float heroWaveLength,
+		const float laneWaveLength, float *heroEta, float *laneEta,
+		float *heroMicrofacetPdf, float *laneSharedMicrofacetPdf,
+		float *naturalJacobian, float *sharedJacobian,
+		float *naturalDirPdf, float *sharedDirPdf,
+		float *naturalDirDelta, float *sharedWhDelta, bool *naturalTir) const;
+
 	virtual void AddReferencedTextures(std::unordered_set<const Texture *>  &referencedTexsreferencedTexs) const;
 	virtual void UpdateTextureReferences(TextureConstRef oldTex, TextureRef newTex);
 

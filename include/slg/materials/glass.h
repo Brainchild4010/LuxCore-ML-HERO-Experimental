@@ -110,6 +110,7 @@ public:
 	// wavelength for the already chosen specular event. This does not alter
 	// transport; it exposes IOR/Fresnel/eta and the wavelength-specific ideal
 	// multiplier/direction so BIDIR can validate the current HERO glass path.
+    bool HasMLHeroDispersion(const HitPoint &hitPoint) const;
 	bool EvaluateMLHeroDebugAtWaveLength(const HitPoint &hitPoint,
 			const luxrays::Vector &localFixedDir,
 			const luxrays::Vector &actualLocalSampledDir,

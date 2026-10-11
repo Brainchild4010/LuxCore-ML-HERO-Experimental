@@ -36,7 +36,7 @@ namespace slg {
 // Bidirectional path tracing CPU render engine
 //------------------------------------------------------------------------------
 
-typedef struct {
+typedef struct PathVertexVM {
 	BSDF bsdf;
 	BSDFEvent bsdfEvent;
 	luxrays::Spectrum throughput;
@@ -45,7 +45,27 @@ typedef struct {
 	// are propagated alongside the classic RGB throughput but are not yet used
 	// by radiance accumulation or MIS.
 	u_int mlHeroLaneCount;
+    // Retained across vertex copies: enables scalar endpoint connections after
+    // a spectral ideal-Glass bounce, including non-dispersive colored Glass.
+    bool mlHeroSpectralGlassHistory = false;
 	luxrays::Spectrum mlHeroLaneThroughput[8];
+    // 15fs diagnostic only; never read by transport, MIS or sampling.
+    double mlHeroRREtaScale15fs[8] = {1.,1.,1.,1.,1.,1.,1.,1.};
+    bool mlHeroRREtaValid15fs = true;
+    // 15ge: bounded diagnostic history travels with copied BIDIR vertices.
+    // Written only with Current+Heavy; never consulted by transport.
+    struct MLHeroBounceTrace15ge {
+        u_int depth, materialType, event, active, collapsed;
+        float pdf, rr, cosine;
+        // 15gg: cosines relative to shading and true geometry normals; diagnostic only.
+        float incidentShadeCos, exitShadeCos, incidentGeomCos, exitGeomCos;
+        float pre[8], post[8], ratio[8];
+    };
+    u_int mlHeroTraceCount15ge = 0u;
+    MLHeroBounceTrace15ge mlHeroTrace15ge[12];
+    // 15fw diagnostic snapshot of the preceding successful bounce.
+    float mlHeroLastRR15fw = 1.f, mlHeroLastPdf15fw = 0.f;
+    u_int mlHeroLastDepth15fw = 0u;
 
 	// ML HERO phase 15l: wavelength packet metadata belongs to the vertex.
 	// This makes a stored eye/light vertex self-contained and prevents later
@@ -78,6 +98,22 @@ typedef struct {
 	// zeros a lane when the sampled HERO direction is impossible at that wavelength.
 	double mlHeroLaneGlassEventPdfProduct[8];
 	double mlHeroLaneDiracSupportPdfProduct[8];
+
+	// ML HERO phase 15ds: diagnostic-only cumulative same-path density for
+	// continuous dispersive RoughGlass TRANSMIT. Wavelength-independent
+	// factors cancel in spectral-MIS ratios, so only wavelength-dependent
+	// RoughGlass directional PDFs are accumulated. 0.0 is log(1) at path start;
+	// -infinity marks a lane that cannot generate the sampled path.
+	double mlHeroLaneRoughPathLogPdf[8];
+
+	// ML HERO phase 15dt: diagnostic-only full-path estimator reconstruction.
+	// LogEstimator accumulates the counterfactual product of RoughGlass
+	// same-direction f_i / p_i factors. LogActiveMultiplier accumulates the
+	// Blend25 factors actually applied by the renderer, allowing the audit to
+	// divide previous RoughGlass modifications out of the live lane throughput
+	// before rebuilding a parallel full-path estimator.
+	double mlHeroLaneRoughPathLogEstimator[8];
+	double mlHeroLaneRoughActiveLogMultiplier[8];
 
 	// ML-HERO phase 7 diagnostic: mark one path so the same lane state can
 	// be observed over several consecutive BIDIR bounces.
@@ -194,9 +230,12 @@ public:
 
 	u_int rrDepth;
 	float rrImportanceCap;
+    bool mlHeroRRMaterialExperiment = false; // 15fv: eye Matte/Metal2/Glossy2
+    bool mlHeroRRGlassEtaExperiment = false; // 15ft: explicit eye-Glass A/B switch
 
 	// ML HERO global spectral mode
 	bool mlHeroEnabled;
+	bool mlHeroRoughGlassFresnelImportanceConfig;
 	
 	
 	// ML HERO wavelength sampling: 1=Linear, 2=CIE Weighted, 3=Sensor Weighted

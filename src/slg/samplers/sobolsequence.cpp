@@ -17,6 +17,9 @@
  ***************************************************************************/
 
 #include <math.h>
+#include <stdexcept>
+#include <string>
+#include <memory>
 
 #include "slg/samplers/sobolsequence.h"
 
@@ -39,8 +42,13 @@ SobolSequence::~SobolSequence() {
 }
 
 void SobolSequence::RequestSamples(const u_int size) {
-	directions = new u_int[size * SOBOL_BITS];
-	GenerateDirectionVectors(directions, size);
+	if (size == 0u || size > SOBOL_MAX_DIMENSIONS)
+        throw std::runtime_error("SOBOL requires 1.." + std::to_string(SOBOL_MAX_DIMENSIONS) +
+            " sample dimensions; requested " + std::to_string(size) + ". Reduce path depths.");
+    std::unique_ptr<u_int[]> next(new u_int[size * SOBOL_BITS]);
+    GenerateDirectionVectors(next.get(), size);
+    delete[] directions;
+    directions = next.release();
 }
 
 u_int SobolSequence::SobolDimension(const u_int index, const u_int dimension) const {

@@ -53,6 +53,10 @@ void PathCPURenderThread::RenderFunc(std::stop_token stop_token) {
 
 	PathCPURenderEngine *engine = (PathCPURenderEngine *)renderEngine;
 	const PathTracer &pathTracer = engine->pathTracer;
+// 15fh BEGIN diagnostic-only
+	pathTracer.ResetMLHeroEstimator15fh();
+// 15fh END
+
 
 	// (engine->seedBase + 1) seed is used for sharedRndGen
 	auto rndGen = std::make_unique<RandomGenerator>(engine->seedBase + 1 + threadIndex);
@@ -136,6 +140,9 @@ void PathCPURenderThread::RenderFunc(std::stop_token stop_token) {
 	}
 
 
+// 15fg BEGIN
+	pathTracer.LogMLHeroMatteTranslucent15fg(threadIndex);
+// 15fg END
 	threadDone = true;
 
 	// This is done to stop threads pending on barrier wait

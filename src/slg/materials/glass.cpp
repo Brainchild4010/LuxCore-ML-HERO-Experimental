@@ -34,11 +34,16 @@ using namespace slg;
 
 thread_local float mlDispersionWaveLength = -1.f;
 thread_local bool mlDispersionUsed = false;
+// 15ep: legacy spectral-color bookkeeping is broader than packet fallback.
+// Explicit Metal2 lane helpers support a packet; Glass/RoughGlass and the
+// existing generic single-wavelength users still require the legacy fallback.
+thread_local bool mlHeroPacketFallbackUsed = false;
 thread_local float mlDispersionCurrentCauchyB = 0.f;
 thread_local GlassDispersionModel mlDispersionCurrentModel = GLASS_DISPERSION_CAUCHY;
 thread_local GlassSellmeierPreset mlDispersionCurrentSellmeierPreset = GLASS_SELLMEIER_N_BK7;
 thread_local float mlDispersionSampleWeight = 1.f;
 thread_local bool mlHeroEnabled = true;
+thread_local bool mlHeroRoughGlassFresnelImportance = false;
 
 // ML HERO multi-wavelength packet infrastructure. Lane 0 is always the
 // existing primary HERO wavelength, so wavelengthcount=1 keeps the old
@@ -54,6 +59,7 @@ void SetMLHeroEnabled(const bool enabled) {
 	mlHeroEnabled = enabled;
 	mlDispersionWaveLength = -1.f;
 	mlDispersionUsed = false;
+	mlHeroPacketFallbackUsed = false;
 	mlDispersionCurrentCauchyB = 0.f;
 	mlDispersionCurrentModel = GLASS_DISPERSION_CAUCHY;
 	mlDispersionCurrentSellmeierPreset = GLASS_SELLMEIER_N_BK7;
@@ -103,6 +109,7 @@ void SetMLHeroActiveLane(const u_int lane) {
 	mlDispersionWaveLength = mlHeroWaveLengths[lane];
 	mlDispersionSampleWeight = mlHeroSampleWeights[lane];
 	mlDispersionUsed = false;
+	mlHeroPacketFallbackUsed = false;
 }
 
 u_int GetMLHeroActiveLane() {
@@ -117,6 +124,7 @@ void SetMLDispersionWaveLength(const float waveLength) {
 	mlHeroSampleWeights[0] = 1.f;
 	// Start a new hero-wavelength sample.
 	mlDispersionUsed = false;
+	mlHeroPacketFallbackUsed = false;
 }
 
 void SetMLDispersionWaveLength(const float waveLength, const float sampleWeight) {
@@ -127,6 +135,7 @@ void SetMLDispersionWaveLength(const float waveLength, const float sampleWeight)
 	mlHeroSampleWeights[0] = sampleWeight;
 	// Start a new hero-wavelength sample.
 	mlDispersionUsed = false;
+	mlHeroPacketFallbackUsed = false;
 }
 
 float GetMLCurrentWaveLength() {
@@ -135,6 +144,16 @@ float GetMLCurrentWaveLength() {
 
 void MarkMLDispersionUsed() {
 	mlDispersionUsed = true;
+	mlHeroPacketFallbackUsed = true;
+}
+
+// Preserve HERO-1.0 coloring without retiring a supported Metal2 packet.
+void MarkMLHeroSpectralMetalUsed() {
+	mlDispersionUsed = true;
+}
+
+bool GetMLHeroPacketFallbackUsed() {
+	return mlHeroPacketFallbackUsed;
 }
 
 static float GetMLDispersionWaveLength(const float fallbackU) {
@@ -333,6 +352,7 @@ Spectrum GlassMaterial::EvalSpecularReflection(const HitPoint &hitPoint,
 		const float waveLength = GetMLDispersionWaveLength(0.5f);
 		lnt = MLWaveLength2IOR(waveLength, nt, mlDispersionCurrentCauchyB);
 		mlDispersionUsed = true;
+		mlHeroPacketFallbackUsed = true;
 	}
 
 	const float ntc = lnt / nc;
@@ -362,6 +382,7 @@ Spectrum GlassMaterial::EvalSpecularTransmission(const HitPoint &hitPoint,
 			lnt = MLWaveLength2IOR(waveLength, nt, cauchyB);
 			lkt = kt;
 			mlDispersionUsed = true;
+			mlHeroPacketFallbackUsed = true;
 		} else if (mlDispersionCurrentModel == GLASS_DISPERSION_SELLMEIER) {
 			// Standard per-bounce wavelength, but with Sellmeier IOR.
 			const float waveLength = Lerp(u0, 380.f, 780.f);
@@ -404,6 +425,11 @@ Spectrum GlassMaterial::EvalSpecularTransmission(const HitPoint &hitPoint,
 	return lkt * ce;
 }
 
+
+bool GlassMaterial::HasMLHeroDispersion(const HitPoint &hitPoint) const {
+    return dispersionModel == GLASS_DISPERSION_SELLMEIER ||
+        (cauchyB && cauchyB->GetFloatValue(hitPoint) > 0.f);
+}
 
 bool GlassMaterial::EvaluateMLHeroDebugAtWaveLength(const HitPoint &hitPoint,
 		const Vector &localFixedDir, const Vector &actualLocalSampledDir,

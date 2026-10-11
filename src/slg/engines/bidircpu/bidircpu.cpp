@@ -17,6 +17,10 @@
  ***************************************************************************/
 
 #include "slg/engines/bidircpu/bidircpu.h"
+#include "../mlherolog.h"
+
+#include <stdexcept>
+#include <string>
 #include "slg/engines/bidircpu/bidircpurenderstate.h"
 #include "slg/samplers/sobol.h"
 #include "slg/cameras/camera.h"
@@ -65,7 +69,16 @@ void BiDirCPURenderEngine::StartLockLess() {
 
 	maxEyePathDepth = (u_int)Max(1, cfg.Get(GetDefaultProps()->Get("path.maxdepth")).Get<int>());
 	maxLightPathDepth = (u_int)Max(1, cfg.Get(GetDefaultProps()->Get("light.maxdepth")).Get<int>());
+    if (GetType() == BIDIRCPU && cfg.Get(Property("sampler.type")("SOBOL")).Get<std::string>() == "SOBOL") {
+        const unsigned long long required = 14ull + 5ull*maxLightPathDepth + 10ull*maxEyePathDepth;
+        if (required > SOBOL_MAX_DIMENSIONS)
+            throw std::runtime_error("BIDIRCPU + SOBOL: requested " + std::to_string(required) +
+                " sample dimensions, maximum " + std::to_string(SOBOL_MAX_DIMENSIONS) +
+                ". Reduce Eye/Light Depth (equal depths: maximum 1412).");
+    }
+
 	
+	mlHeroRoughGlassFresnelImportanceConfig = cfg.Get(GetDefaultProps()->Get("path.mlhero.roughglass.fresnelimportance")).Get<bool>();
 	mlHeroEnabled = cfg.Get(GetDefaultProps()->Get("path.mlhero.enable")).Get<bool>();
 
 	mlHeroSamplingMode = Clamp(cfg.Get(GetDefaultProps()->Get("path.mlhero.samplingmode")).Get<int>(), 1, 3);
@@ -83,6 +96,8 @@ void BiDirCPURenderEngine::StartLockLess() {
 	mlHeroHeavyDiagnostics = cfg.Get(GetDefaultProps()->Get("path.mlhero.heavydiagnostics")).Get<bool>();
 	rrDepth = (u_int)Max(1, cfg.Get(GetDefaultProps()->Get("path.russianroulette.depth")).Get<int>());
 	rrImportanceCap = Clamp(cfg.Get(GetDefaultProps()->Get("path.russianroulette.cap")).Get<double>(), 0.0, 1.0);
+    mlHeroRRMaterialExperiment = cfg.Get(GetDefaultProps()->Get("path.mlhero.rr.materialexperiment")).Get<bool>();
+    mlHeroRRGlassEtaExperiment = cfg.Get(GetDefaultProps()->Get("path.mlhero.rr.glassetaexperiment")).Get<bool>();
 
 	// Clamping settings
 	// clamping.radiance.maxvalue is the old radiance clamping, now converted in variance clamping
@@ -163,8 +178,13 @@ void BiDirCPURenderEngine::InitFilm() {
 	GetFilm().Init();
 }
 
+// Heavy RoughGlass diagnostic flush, implemented in bidircputhread.cpp.
+extern void MLHeroFlushRoughTop15gd();
+
 void BiDirCPURenderEngine::StopLockLess() {
 	CPUNoTileRenderEngine::StopLockLess();
+	MLHeroFlushRoughTop15gd();
+	slg::mlhero15gb::Finish("BIDIR");
 
 	ResetSampleSplatter();
 
@@ -185,6 +205,7 @@ PropertiesUPtr BiDirCPURenderEngine::ToProperties(const Properties &cfg) {
 			cfg.Get(GetDefaultProps()->Get("light.maxdepth")) <<
 			cfg.Get(GetDefaultProps()->Get("path.aovs.warmup.spp")) <<
 			cfg.Get(GetDefaultProps()->Get("path.mlhero.enable")) <<
+			cfg.Get(GetDefaultProps()->Get("path.mlhero.roughglass.fresnelimportance")) <<
 			cfg.Get(GetDefaultProps()->Get("path.mlhero.samplingmode")) <<
 			cfg.Get(GetDefaultProps()->Get("path.mlhero.wavelengthcount")) <<
 			cfg.Get(GetDefaultProps()->Get("path.mlhero.glassmode")) <<
@@ -200,6 +221,8 @@ PropertiesUPtr BiDirCPURenderEngine::ToProperties(const Properties &cfg) {
 			cfg.Get(GetDefaultProps()->Get("path.mlhero.heavydiagnostics")) <<
 			cfg.Get(GetDefaultProps()->Get("path.russianroulette.depth")) <<
 			cfg.Get(GetDefaultProps()->Get("path.russianroulette.cap")) <<
+            cfg.Get(GetDefaultProps()->Get("path.mlhero.rr.materialexperiment")) <<
+            cfg.Get(GetDefaultProps()->Get("path.mlhero.rr.glassetaexperiment")) <<
 			cfg.Get(GetDefaultProps()->Get("path.clamping.variance.maxvalue")) <<
 			cfg.Get(GetDefaultProps()->Get("path.albedospecular.type")) <<
 			cfg.Get(GetDefaultProps()->Get("path.albedospecular.glossinessthreshold")) <<
@@ -222,6 +245,7 @@ PropertiesUPtr BiDirCPURenderEngine::GetDefaultProps() {
 		Property("light.maxdepth")(5) <<
 		Property("path.aovs.warmup.spp")(0) <<
 		Property("path.mlhero.enable")(false) <<
+		Property("path.mlhero.roughglass.fresnelimportance")(false) <<
 		Property("path.mlhero.samplingmode")(1) <<
 		Property("path.mlhero.wavelengthcount")(1) <<
 		Property("path.mlhero.glassmode")(0) <<
@@ -237,6 +261,9 @@ PropertiesUPtr BiDirCPURenderEngine::GetDefaultProps() {
 		Property("path.mlhero.heavydiagnostics")(false) <<
 		Property("path.russianroulette.depth")(3) <<
 		Property("path.russianroulette.cap")(.5f) <<
+        // 15ft: false = baseline; true = experimental Eye-Glass RR.
+        Property("path.mlhero.rr.materialexperiment")(false) <<
+        Property("path.mlhero.rr.glassetaexperiment")(false) <<
 		Property("path.clamping.variance.maxvalue")(0.f) <<
 		Property("path.albedospecular.type")("REFLECT_TRANSMIT") <<
 		Property("path.albedospecular.glossinessthreshold")(.05f) <<

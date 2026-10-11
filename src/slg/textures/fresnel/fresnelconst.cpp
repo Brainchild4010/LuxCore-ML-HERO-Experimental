@@ -28,7 +28,7 @@ using namespace slg;
 // Keep these declarations global too (do not put them in namespace slg).
 bool GetMLHeroEnabled();
 float GetMLCurrentWaveLength();
-void MarkMLDispersionUsed();
+void MarkMLHeroSpectralMetalUsed();
 
 //------------------------------------------------------------------------------
 // Fresnel const texture
@@ -97,7 +97,7 @@ Spectrum FresnelConstTexture::Evaluate(const HitPoint &hitPoint, const float cos
 	if (::GetMLHeroEnabled()) {
 		Spectrum eta, kk;
 		if (GetNKAtWaveLength(hitPoint, ::GetMLCurrentWaveLength(), &eta, &kk)) {
-			::MarkMLDispersionUsed();
+			::MarkMLHeroSpectralMetalUsed();
 			return GeneralEvaluate(eta, kk, cosi);
 		}
 	}

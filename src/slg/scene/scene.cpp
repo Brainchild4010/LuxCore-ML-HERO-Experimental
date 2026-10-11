@@ -1,3 +1,4 @@
+#include "slg/engines/mlhero_volume_diagnostics15fp.h"
 /***************************************************************************
  * Copyright 1998-2020 by authors (see AUTHORS.txt)                        *
  *                                                                         *
@@ -688,6 +689,7 @@ bool Scene::Intersect(IntersectionDevice *device,
 		const float initialPassThrough, Ray *ray, RayHit *rayHit, BSDF *bsdf,
 		Spectrum *connectionThroughput, const Spectrum *pathThroughput,
 		SampleResult *sampleResult, const bool backTracing) const {
+	const MLHeroVolumeRayScope15fp volumeRayScope15fp(static_cast<unsigned>(rayType), backTracing);
 	*connectionThroughput = Spectrum(1.f);
 
 	// I need a sequence of pseudo-random numbers starting form a floating point

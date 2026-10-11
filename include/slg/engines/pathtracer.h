@@ -111,7 +111,10 @@ public:
 		const float u3, const float u4,
 		const EyePathInfo &pathInfo, const luxrays::Spectrum &pathThrouput,
 		const BSDF &bsdf, SampleResult *sampleResult,
-		const bool useBSDFEVal = true) const;
+		const bool useBSDFEVal = true,
+		const luxrays::Spectrum *mlHeroLaneThroughput = nullptr,
+		const u_int mlHeroLaneCount = 0u,
+		const bool mlHeroPacketValid = false) const;
 
 	void RenderEyePath(
 		luxrays::IntersectionDevice *device,
@@ -148,6 +151,13 @@ public:
 	void ApplyVarianceClamp(const PathTracerThreadState &state,
 			std::vector<SampleResult> &sampleResults) const;
 	void RenderSample(PathTracerThreadState &state) const;
+// 15fg BEGIN
+// 15fh BEGIN diagnostic-only
+	void ResetMLHeroEstimator15fh() const;
+// 15fh END
+	void LogMLHeroMatteTranslucent15fg(const u_int threadIndex) const;
+// 15fg END
+
 
 	static void InitEyeSampleResults(FilmConstRef film, std::vector<SampleResult> &sampleResults,
 			const bool useFilmSplat = false);
@@ -170,10 +180,19 @@ public:
 
 	// ML HERO global spectral mode
 	bool mlHeroEnabled;
+	bool mlHeroRoughGlassFresnelImportanceConfig;
 	// 1 = uniform GOLDSTAND, 2 = Sampling 2.0 O1
 	int mlHeroSamplingMode;
-	// Number of HERO wavelengths evaluated per path (reserved for multi-wavelength mode)
+	// Number of HERO wavelengths evaluated per path
 	int mlHeroWavelengthCount;
+	// Quarter Phase Cycling for Sampling 1.0 packet starts
+	bool mlHeroQuarterCycling;
+// 15fg BEGIN
+	bool mlHeroGenericReflectanceCompensation;
+	bool mlHeroDiagnostics15fg;
+    bool mlHeroRRGlassEtaExperiment, mlHeroRRMaterialExperiment, mlHeroRRCPUPath15fz;
+// 15fg END
+
 
 	// Clamping settings
 	float sqrtVarianceClampMaxValue;
@@ -199,10 +218,12 @@ private:
 	void DirectHitFiniteLight(SceneConstRef scene, const EyePathInfo &pathInfo,
 			const luxrays::Spectrum &pathThrouput, const luxrays::Ray &ray,
 			const float distance, const BSDF &bsdf,
-			SampleResult *sampleResult) const;
+			SampleResult *sampleResult, const luxrays::Spectrum *mlHeroLaneThroughput,
+			const u_int mlHeroLaneCount, const bool mlHeroPacketValid) const;
 	void DirectHitInfiniteLight(SceneConstRef scene, const EyePathInfo &pathInfo,
 			const luxrays::Spectrum &pathThrouput, const luxrays::Ray &ray,
-			const BSDF *bsdf, SampleResult *sampleResult) const;
+			const BSDF *bsdf, SampleResult *sampleResult, const luxrays::Spectrum *mlHeroLaneThroughput,
+			const u_int mlHeroLaneCount, const bool mlHeroPacketValid) const;
 	bool CheckDirectHitVisibilityFlags(LightSourceConstRef lightSource,
 			const PathDepthInfo &depthInfo,	const BSDFEvent lastBSDFEvent) const;
 

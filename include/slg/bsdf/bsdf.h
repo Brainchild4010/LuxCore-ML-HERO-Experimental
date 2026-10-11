@@ -159,6 +159,15 @@ public:
 	// ML-HERO phase 6 diagnostic path: evaluate the already sampled Metal2
 	// bounce at an explicit wavelength. Returns false for non-Metal2 materials
 	// or Metal2 materials without measured Fresnel n/k data.
+// 15fe BEGIN
+    bool GetMLHeroMatteTranslucentFactors15fe(const luxrays::Vector &dir,
+        const BSDFEvent event, const bool sampled, luxrays::Spectrum *kr,
+        luxrays::Spectrum *kt, float *wrapper) const;
+// 15fe END
+// 15fd BEGIN diagnostic-only
+    bool GetMLHeroMatteTranslucentInputs15fd(luxrays::Spectrum *kr,
+        luxrays::Spectrum *kt) const;
+// 15fd END diagnostic-only
 	bool EvaluateMLHeroMetal2SampleAtWaveLength(const luxrays::Vector &sampledDir,
 			const float waveLength, luxrays::Spectrum *sampleMultiplier) const;
 	bool EvaluateMLHeroMetal2AtWaveLength(const luxrays::Vector &generatedDir,
@@ -183,6 +192,27 @@ public:
 			float *cosFixedOut = nullptr, float *sinI2Out = nullptr,
 			float *sinT2Out = nullptr, bool *tirOut = nullptr,
 			float *laneEventPdfWOut = nullptr) const;
+
+    bool HasMLHeroGlassDispersion() const;
+    // Sample multiplier for the selected Dirac event, with the shared HERO
+    // PDF and the same light-side adjoint factor as BSDF::Sample().
+    bool EvaluateMLHeroGlassSampleAtWaveLength(const luxrays::Vector &dir,
+        const BSDFEvent event, const float pdfW, const float wavelength,
+        luxrays::Spectrum *value, float *directionDelta = nullptr) const;
+    bool HasMLHeroRoughGlassDispersion() const;
+    bool EvaluateMLHeroRoughGlassAtWaveLength(const luxrays::Vector &dir,
+        const BSDFEvent expectedEvent, const float wavelength,
+        luxrays::Spectrum *value) const;
+
+	// ML HERO phase 15du: RoughGlass microfacet-domain ownership diagnostic.
+	bool EvaluateMLHeroRoughGlassMicrofacetOwnershipDebug(
+			const luxrays::Vector &sampledDir, const BSDFEvent sampledEvent,
+			const float heroWaveLength, const float laneWaveLength,
+			float *heroEta, float *laneEta,
+			float *heroMicrofacetPdf, float *laneSharedMicrofacetPdf,
+			float *naturalJacobian, float *sharedJacobian,
+			float *naturalDirPdf, float *sharedDirPdf,
+			float *naturalDirDelta, float *sharedWhDelta, bool *naturalTir) const;
 
 	// ML HERO phase 15ac diagnostic: exact RGB component split for Glossy2
 	// using the already sampled bounce direction and mixture PDF.

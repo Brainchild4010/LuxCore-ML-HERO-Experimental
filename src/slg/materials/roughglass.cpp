@@ -20,6 +20,8 @@
 #include "slg/materials/roughglass.h"
 #include "slg/materials/thinfilmcoating.h"
 #include "slg/usings.h"
+#include <cstdlib>
+#include <cstring>
 
 using namespace std;
 using namespace luxrays;
@@ -30,8 +32,34 @@ using namespace slg;
 //------------------------------------------------------------------------------
 
 extern thread_local float mlDispersionWaveLength;
-extern thread_local bool mlDispersionUsed;
+void MarkMLDispersionUsed();
 extern thread_local bool mlHeroEnabled;
+// 15gf: strictly observational BIDIR-only material consistency audit.
+extern bool MLHeroRoughGlass15gfShouldAudit();
+extern void MLHeroRoughGlass15gfReport(bool fromLight, bool transmit,
+        float nc, float nt, float samplePdf, float evalPdf, float pdfFunction,
+        float sampleWeight, float evaluateWeight, float cosFixed, float cosSampled);
+
+
+// Phase 15gi: render-config driven CPU A/B switch. Per-thread state is set
+// at the start of every eye/light render sample, so switching between renders
+// does not require restarting Blender. Default remains legacy 50:50.
+extern thread_local bool mlHeroRoughGlassFresnelImportance;
+static inline bool RoughGlassML15ghEnabled() {
+    return mlHeroEnabled && mlHeroRoughGlassFresnelImportance;
+}
+
+// Probability of selecting TRANSMISSION once the microfacet wh is sampled.
+// The parameter is the signed cosine of the incoming direction against wh.
+// FresnelTexture::CauchyEvaluate handles entering/exiting and TIR.
+static float RoughGlassML15ghTransmitProbability(const float ntc,
+        const Vector &incoming, const Vector &wh, const bool isKrBlack,
+        const bool isKtBlack) {
+    if (isKrBlack) return 1.f;
+    if (isKtBlack) return 0.f;
+    return Clamp(1.f - FresnelTexture::CauchyEvaluate(ntc,
+            Dot(incoming, wh)), 0.f, 1.f);
+}
 
 static float RoughGlassMLGetWaveLength() {
 	if ((mlDispersionWaveLength >= 380.f) && (mlDispersionWaveLength <= 780.f))
@@ -150,6 +178,19 @@ static float RoughGlassMLVisibleNormalPdf(const float roughness,
 	const float D = SchlickDistribution_D(roughness, wh, 0.f);
 	const float G1 = RoughGlassMLGGXG1(alpha, fixedDir);
 	return D * G1 * fabsf(Dot(fixedDir, wh)) / cosTheta;
+}
+
+// 15ga: isotropic Schlick D is GGX with alpha^2 = roughness. Its
+// masking/shadowing must use the matching Smith term. The legacy Schlick
+// G approximation can return excessive grazing-angle reflected energy.
+// This is a BSDF model correction, not a clamp of the sample or radiance.
+// Anisotropic Schlick D is not this isotropic GGX model: retain its G here.
+static float RoughGlassMLGeometry15ga(const float roughness,
+        const float anisotropy, const Vector &fixed, const Vector &sampled) {
+    if (!RoughGlassMLUseVNDF(anisotropy))
+        return SchlickDistribution_G(roughness, fixed, sampled);
+    const float alpha = sqrtf(Max(roughness, 1e-18f));
+    return RoughGlassMLGGXG1(alpha, fixed) * RoughGlassMLGGXG1(alpha, sampled);
 }
 
 static void RoughGlassMLSampleVisibleNormal(const float roughness,
@@ -333,6 +374,11 @@ RoughGlassMaterial::RoughGlassMaterial(TextureConstPtr frontTransp, TextureConst
 	glossiness = ComputeGlossiness(nu, nv);
 }
 
+bool RoughGlassMaterial::HasMLHeroDispersion(const HitPoint &hitPoint) const {
+    return (dispersionModel == GLASS_DISPERSION_SELLMEIER) ||
+        (cauchyB && (cauchyB->GetFloatValue(hitPoint) > 0.f));
+}
+
 Spectrum RoughGlassMaterial::Evaluate(const HitPoint &hitPoint,
 	const Vector &localLightDir, const Vector &localEyeDir, BSDFEvent *event,
 	float *directPdfW, float *reversePdfW) const {
@@ -361,7 +407,7 @@ Spectrum RoughGlassMaterial::Evaluate(const HitPoint &hitPoint,
 	if (roughWeight <= 0.f)
 		return Spectrum();
 
-	const float threshold = isKrBlack ? 1.f : (isKtBlack ? 0.f : .5f);
+	const float legacyThreshold = isKrBlack ? 1.f : (isKtBlack ? 0.f : .5f);
 	if (localLightDir.z * localEyeDir.z < 0.f) {
 		// Transmit
 
@@ -379,12 +425,20 @@ Spectrum RoughGlassMaterial::Evaluate(const HitPoint &hitPoint,
 		if (!(lengthSquared > 0.f))
 			return Spectrum();
 		wh /= sqrtf(lengthSquared);
+        const float threshold = RoughGlassML15ghEnabled() ?
+                RoughGlassML15ghTransmitProbability(ntc,
+                    hitPoint.fromLight ? localLightDir : localEyeDir,
+                    wh, isKrBlack, isKtBlack) : legacyThreshold;
+        const float reverseThreshold = RoughGlassML15ghEnabled() ?
+                RoughGlassML15ghTransmitProbability(ntc,
+                    hitPoint.fromLight ? localEyeDir : localLightDir,
+                    wh, isKrBlack, isKtBlack) : legacyThreshold;
 		const float cosThetaI = fabsf(CosTheta(localEyeDir));
 		const float cosThetaIH = AbsDot(localEyeDir, wh);
 		const float cosThetaOH = Dot(localLightDir, wh);
 
 		const float D = SchlickDistribution_D(roughness, wh, anisotropy);
-		const float G = SchlickDistribution_G(roughness, localLightDir, localEyeDir);
+		const float G = RoughGlassMLGeometry15ga(roughness, anisotropy, localLightDir, localEyeDir);
 		const float directSpecPdf = (fineRoughGlass && RoughGlassMLUseVNDF(anisotropy)) ?
 				RoughGlassMLVisibleNormalPdf(roughness,
 						hitPoint.fromLight ? localLightDir : localEyeDir, wh) :
@@ -399,7 +453,7 @@ Spectrum RoughGlassMaterial::Evaluate(const HitPoint &hitPoint,
 			*directPdfW = roughWeight * threshold * directSpecPdf * (hitPoint.fromLight ? fabsf(cosThetaIH) : (fabsf(cosThetaOH) * eta * eta)) / lengthSquared;
 
 		if (reversePdfW)
-			*reversePdfW = roughWeight * threshold * reverseSpecPdf * (hitPoint.fromLight ? (fabsf(cosThetaOH) * eta * eta) : fabsf(cosThetaIH)) / lengthSquared;
+			*reversePdfW = roughWeight * reverseThreshold * reverseSpecPdf * (hitPoint.fromLight ? (fabsf(cosThetaOH) * eta * eta) : fabsf(cosThetaIH)) / lengthSquared;
 
 		Spectrum result = roughWeight * (fabsf(cosThetaOH) * cosThetaIH * D *
 			G / (cosThetaI * lengthSquared)) *
@@ -428,10 +482,18 @@ Spectrum RoughGlassMaterial::Evaluate(const HitPoint &hitPoint,
 		wh = Normalize(wh);
 		if (wh.z < 0.f)
 			wh = -wh;
+        const float threshold = RoughGlassML15ghEnabled() ?
+                RoughGlassML15ghTransmitProbability(ntc,
+                    hitPoint.fromLight ? localLightDir : localEyeDir,
+                    wh, isKrBlack, isKtBlack) : legacyThreshold;
+        const float reverseThreshold = RoughGlassML15ghEnabled() ?
+                RoughGlassML15ghTransmitProbability(ntc,
+                    hitPoint.fromLight ? localEyeDir : localLightDir,
+                    wh, isKrBlack, isKtBlack) : legacyThreshold;
 
 		float cosThetaH = Dot(localEyeDir, wh);
 		const float D = SchlickDistribution_D(roughness, wh, anisotropy);
-		const float G = SchlickDistribution_G(roughness, localLightDir, localEyeDir);
+		const float G = RoughGlassMLGeometry15ga(roughness, anisotropy, localLightDir, localEyeDir);
 		const float directSpecPdf = (fineRoughGlass && RoughGlassMLUseVNDF(anisotropy)) ?
 				RoughGlassMLVisibleNormalPdf(roughness,
 						hitPoint.fromLight ? localLightDir : localEyeDir, wh) :
@@ -446,7 +508,7 @@ Spectrum RoughGlassMaterial::Evaluate(const HitPoint &hitPoint,
 			*directPdfW = roughWeight * (1.f - threshold) * directSpecPdf / (4.f * AbsDot(localLightDir, wh));
 
 		if (reversePdfW)
-			*reversePdfW = roughWeight * (1.f - threshold) * reverseSpecPdf / (4.f * AbsDot(localLightDir, wh));
+			*reversePdfW = roughWeight * (1.f - reverseThreshold) * reverseSpecPdf / (4.f * AbsDot(localLightDir, wh));
 
 		const Spectrum result = roughWeight * (D * G / (4.f * cosThetaI)) * kr * F;
 
@@ -510,7 +572,7 @@ Spectrum RoughGlassMaterial::Sample(const HitPoint &hitPoint,
 					cauchyB ? cauchyB->GetFloatValue(hitPoint) : 0.f;
 			if (mlHeroEnabled && ((dispersionModel == GLASS_DISPERSION_SELLMEIER) ||
 					(cauchyBValue > 0.f)))
-				mlDispersionUsed = true;
+				::MarkMLDispersionUsed();
 		}
 
 		return deltaResult;
@@ -547,6 +609,10 @@ Spectrum RoughGlassMaterial::Sample(const HitPoint &hitPoint,
 			return Spectrum();
 	}
 
+    if (RoughGlassML15ghEnabled())
+        threshold = RoughGlassML15ghTransmitProbability(ntc, localFixedDir,
+                wh, isKrBlack, isKtBlack);
+
 	Spectrum result;
 	if (passThroughEvent < threshold) {
 		// Transmit
@@ -570,7 +636,7 @@ Spectrum RoughGlassMaterial::Sample(const HitPoint &hitPoint,
 
 		const float cosi = fabsf(localSampledDir->z);
 
-		const float G = SchlickDistribution_G(roughness, localFixedDir, *localSampledDir);
+		const float G = RoughGlassMLGeometry15ga(roughness, anisotropy, localFixedDir, *localSampledDir);
 		float factor = (d / specPdf) * G * fabsf(cosThetaOH) / threshold;
 
 		if (!hitPoint.fromLight) {
@@ -595,7 +661,7 @@ Spectrum RoughGlassMaterial::Sample(const HitPoint &hitPoint,
 		if ((cosi < DEFAULT_COS_EPSILON_STATIC) || (localFixedDir.z * localSampledDir->z < 0.f))
 			return Spectrum();
 
-		const float G = SchlickDistribution_G(roughness, localFixedDir, *localSampledDir);
+		const float G = RoughGlassMLGeometry15ga(roughness, anisotropy, localFixedDir, *localSampledDir);
 		float factor = (d / specPdf) * G * fabsf(cosThetaOH) / (1.f - threshold);
 
 		const float F = FresnelTexture::CauchyEvaluate(ntc, cosThetaOH);
@@ -621,9 +687,165 @@ Spectrum RoughGlassMaterial::Sample(const HitPoint &hitPoint,
 	const float cauchyBValue = cauchyB ? cauchyB->GetFloatValue(hitPoint) : 0.f;
 	if (mlHeroEnabled && ((dispersionModel == GLASS_DISPERSION_SELLMEIER) ||
 			(cauchyBValue > 0.f)))
-		mlDispersionUsed = true;
+		::MarkMLDispersionUsed();
 
+	// 15gf: Evaluate and Pdf at the *same sampled directions* and same
+	// transport orientation. Sample() returns f*cos(sampled)/pdf, while
+	// Evaluate() already includes the cosine factor in LuxCore's convention.
+	// No correction or replayed sample is used for actual rendering.
+	if (mlHeroEnabled && MLHeroRoughGlass15gfShouldAudit() &&
+			(*pdfW > 0.f) && !result.Black()) {
+		const Vector &lightDir = hitPoint.fromLight ? localFixedDir : *localSampledDir;
+		const Vector &eyeDir = hitPoint.fromLight ? *localSampledDir : localFixedDir;
+		BSDFEvent evalEvent = NONE;
+		float evalDirectPdf = 0.f, evalReversePdf = 0.f;
+		const Spectrum evaluated = Evaluate(hitPoint, lightDir, eyeDir,
+				&evalEvent, &evalDirectPdf, &evalReversePdf);
+		float pdfDirect = 0.f, pdfReverse = 0.f;
+		Pdf(hitPoint, lightDir, eyeDir, &pdfDirect, &pdfReverse);
+		const float sampleWeight = result.Filter();
+		const float evaluateWeight = (evalDirectPdf > 0.f) ?
+				evaluated.Filter() / evalDirectPdf : 0.f;
+		MLHeroRoughGlass15gfReport(hitPoint.fromLight,
+				(*event & TRANSMIT) != 0, nc, nt, *pdfW, evalDirectPdf,
+				pdfDirect, sampleWeight, evaluateWeight,
+				fabsf(localFixedDir.z), fabsf(localSampledDir->z));
+	}
 	return result;
+}
+
+
+bool RoughGlassMaterial::EvaluateMLHeroMicrofacetOwnershipDebug(const HitPoint &hitPoint,
+		const Vector &localFixedDir, const Vector &localSharedDir,
+		const BSDFEvent sampledEvent, const float heroWaveLength,
+		const float laneWaveLength, float *heroEta, float *laneEta,
+		float *heroMicrofacetPdf, float *laneSharedMicrofacetPdf,
+		float *naturalJacobian, float *sharedJacobian,
+		float *naturalDirPdf, float *sharedDirPdf,
+		float *naturalDirDelta, float *sharedWhDelta, bool *naturalTir) const {
+	if (!(sampledEvent & TRANSMIT) || !(sampledEvent & GLOSSY) ||
+			(sampledEvent & SPECULAR) ||
+			(heroWaveLength < 380.f) || (heroWaveLength > 780.f) ||
+			(laneWaveLength < 380.f) || (laneWaveLength > 780.f))
+		return false;
+
+	const Spectrum kt = Kt->GetSpectrumValue(hitPoint).Clamp(0.f, 1.f);
+	const Spectrum kr = Kr->GetSpectrumValue(hitPoint).Clamp(0.f, 1.f);
+	const bool isKtBlack = kt.Black();
+	const bool isKrBlack = kr.Black();
+	if (isKtBlack || (isKtBlack && isKrBlack))
+		return false;
+
+	const float threshold = isKrBlack ? 1.f : .5f;
+	if (!(threshold > 0.f))
+		return false;
+
+	const float u = Clamp(nu->GetFloatValue(hitPoint), 1e-9f, 1.f);
+	const float v = Clamp(nv->GetFloatValue(hitPoint), 1e-9f, 1.f);
+	const float u2 = u * u;
+	const float v2 = v * v;
+	const float anisotropy = (u2 < v2) ? (1.f - u2 / v2) : u2 > 0.f ? (v2 / u2 - 1.f) : 0.f;
+	const float roughness = u * v;
+	const float deltaWeight = fineRoughGlass ? RoughGlassMLNearDeltaWeight(u, v) : 0.f;
+	const float roughWeight = 1.f - deltaWeight;
+	if (!(roughWeight > 0.f))
+		return false;
+
+	const float nc = ExtractExteriorIors(hitPoint, exteriorIor);
+	const float ntBase = ExtractInteriorIors(hitPoint, interiorIor);
+	const float b = cauchyB ? cauchyB->GetFloatValue(hitPoint) : 0.f;
+	auto ntAt = [&](const float wl) -> float {
+		if (dispersionModel == GLASS_DISPERSION_SELLMEIER)
+			return RoughGlassMLWaveLength2IORSellmeier(wl, sellmeierPreset);
+		if (b > 0.f)
+			return RoughGlassMLWaveLength2IOR(wl, ntBase, b);
+		return ntBase;
+	};
+
+	const float ntHero = ntAt(heroWaveLength);
+	const float ntLane = ntAt(laneWaveLength);
+	if (!(nc > 1e-20f) || !(ntHero > 1e-20f) || !(ntLane > 1e-20f))
+		return false;
+
+	const bool entering = (CosTheta(localFixedDir) > 0.f);
+	const float eHero = entering ? (nc / ntHero) : (ntHero / nc);
+	const float eLane = entering ? (nc / ntLane) : (ntLane / nc);
+	if (heroEta) *heroEta = eHero;
+	if (laneEta) *laneEta = eLane;
+
+	Vector heroWhUn = localSharedDir + eHero * localFixedDir;
+	const float heroWhLen2 = heroWhUn.LengthSquared();
+	if (!(heroWhLen2 > 1e-30f))
+		return false;
+	Vector heroWh = heroWhUn / sqrtf(heroWhLen2);
+	if (heroWh.z < 0.f)
+		heroWh = -heroWh;
+
+	const float heroSpecPdf = (fineRoughGlass && RoughGlassMLUseVNDF(anisotropy)) ?
+			RoughGlassMLVisibleNormalPdf(roughness, localFixedDir, heroWh) :
+			SchlickDistribution_Pdf(roughness, heroWh, anisotropy);
+	if (heroMicrofacetPdf) *heroMicrofacetPdf = heroSpecPdf;
+
+	// Same RNG / same sampled microfacet normal, but lane-specific eta.
+	const float cosOHNatural = Dot(localFixedDir, heroWh);
+	const float laneEta2 = eLane * eLane;
+	const float sinIH2 = laneEta2 * Max(0.f, 1.f - cosOHNatural * cosOHNatural);
+	const bool tir = (sinIH2 >= 1.f);
+	if (naturalTir) *naturalTir = tir;
+
+	Vector laneNaturalDir(0.f);
+	float naturalJac = 0.f;
+	float naturalPdf = 0.f;
+	if (!tir) {
+		float cosIH = sqrtf(Max(0.f, 1.f - sinIH2));
+		if (entering)
+			cosIH = -cosIH;
+		const float length = eLane * cosOHNatural + cosIH;
+		laneNaturalDir = length * heroWh - eLane * localFixedDir;
+		const float length2 = length * length;
+		if (length2 > 1e-30f) {
+			naturalJac = fabsf(cosIH) / length2;
+			naturalPdf = roughWeight * threshold * heroSpecPdf * naturalJac;
+		}
+	}
+	if (naturalJacobian) *naturalJacobian = naturalJac;
+	if (naturalDirPdf) *naturalDirPdf = naturalPdf;
+
+	// Alternative lane technique evaluated at the shared HERO direction. This
+	// generally requires a *different* microfacet normal because eta(lambda)
+	// changes the refraction mapping.
+	Vector laneWhUn = localSharedDir + eLane * localFixedDir;
+	const float laneWhLen2 = laneWhUn.LengthSquared();
+	if (!(laneWhLen2 > 1e-30f))
+		return false;
+	Vector laneWh = laneWhUn / sqrtf(laneWhLen2);
+	if (laneWh.z < 0.f)
+		laneWh = -laneWh;
+
+	const float laneSpecPdf = (fineRoughGlass && RoughGlassMLUseVNDF(anisotropy)) ?
+			RoughGlassMLVisibleNormalPdf(roughness, localFixedDir, laneWh) :
+			SchlickDistribution_Pdf(roughness, laneWh, anisotropy);
+	if (laneSharedMicrofacetPdf) *laneSharedMicrofacetPdf = laneSpecPdf;
+
+	const float sharedCosIH = fabsf(Dot(localSharedDir, laneWh));
+	const float sharedJac = sharedCosIH / laneWhLen2;
+	const float sharedPdf = roughWeight * threshold * laneSpecPdf * sharedJac;
+	if (sharedJacobian) *sharedJacobian = sharedJac;
+	if (sharedDirPdf) *sharedDirPdf = sharedPdf;
+
+	if (naturalDirDelta) {
+		if (tir)
+			*naturalDirDelta = 2.f;
+		else {
+			const Vector a = Normalize(laneNaturalDir);
+			const Vector bdir = Normalize(localSharedDir);
+			*naturalDirDelta = 1.f - Clamp(Dot(a, bdir), -1.f, 1.f);
+		}
+	}
+	if (sharedWhDelta)
+		*sharedWhDelta = 1.f - Clamp(Dot(heroWh, laneWh), -1.f, 1.f);
+
+	return true;
 }
 
 void RoughGlassMaterial::Pdf(const HitPoint &hitPoint,
@@ -659,7 +881,7 @@ void RoughGlassMaterial::Pdf(const HitPoint &hitPoint,
 	if (roughWeight <= 0.f)
 		return;
 
-	const float threshold = isKrBlack ? 1.f : (isKtBlack ? 0.f : .5f);
+	const float legacyThreshold = isKrBlack ? 1.f : (isKtBlack ? 0.f : .5f);
 	if (localLightDir.z * localEyeDir.z < 0.f) {
 		// Transmit
 
@@ -678,6 +900,14 @@ void RoughGlassMaterial::Pdf(const HitPoint &hitPoint,
 			return;
 
 		wh /= sqrtf(lengthSquared);
+        const float threshold = RoughGlassML15ghEnabled() ?
+                RoughGlassML15ghTransmitProbability(ntc,
+                    hitPoint.fromLight ? localLightDir : localEyeDir,
+                    wh, isKrBlack, isKtBlack) : legacyThreshold;
+        const float reverseThreshold = RoughGlassML15ghEnabled() ?
+                RoughGlassML15ghTransmitProbability(ntc,
+                    hitPoint.fromLight ? localEyeDir : localLightDir,
+                    wh, isKrBlack, isKtBlack) : legacyThreshold;
 		const float cosThetaIH = AbsDot(localEyeDir, wh);
 		const float cosThetaOH = AbsDot(localLightDir, wh);
 
@@ -696,7 +926,7 @@ void RoughGlassMaterial::Pdf(const HitPoint &hitPoint,
 					lengthSquared;
 
 		if (reversePdfW)
-			*reversePdfW = roughWeight * threshold * reverseSpecPdf *
+			*reversePdfW = roughWeight * reverseThreshold * reverseSpecPdf *
 					(hitPoint.fromLight ? (cosThetaOH * eta * eta) : cosThetaIH) /
 					lengthSquared;
 	} else {
@@ -712,6 +942,14 @@ void RoughGlassMaterial::Pdf(const HitPoint &hitPoint,
 		wh = Normalize(wh);
 		if (wh.z < 0.f)
 			wh = -wh;
+        const float threshold = RoughGlassML15ghEnabled() ?
+                RoughGlassML15ghTransmitProbability(ntc,
+                    hitPoint.fromLight ? localLightDir : localEyeDir,
+                    wh, isKrBlack, isKtBlack) : legacyThreshold;
+        const float reverseThreshold = RoughGlassML15ghEnabled() ?
+                RoughGlassML15ghTransmitProbability(ntc,
+                    hitPoint.fromLight ? localEyeDir : localLightDir,
+                    wh, isKrBlack, isKtBlack) : legacyThreshold;
 
 		const float directSpecPdf = (fineRoughGlass && RoughGlassMLUseVNDF(anisotropy)) ?
 				RoughGlassMLVisibleNormalPdf(roughness,
@@ -726,7 +964,7 @@ void RoughGlassMaterial::Pdf(const HitPoint &hitPoint,
 			*directPdfW = roughWeight * (1.f - threshold) * directSpecPdf / (4.f * AbsDot(localLightDir, wh));
 
 		if (reversePdfW)
-			*reversePdfW = roughWeight * (1.f - threshold) * reverseSpecPdf / (4.f * AbsDot(localLightDir, wh));
+			*reversePdfW = roughWeight * (1.f - reverseThreshold) * reverseSpecPdf / (4.f * AbsDot(localLightDir, wh));
 	}
 }
 

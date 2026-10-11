@@ -30,7 +30,8 @@ from .windows import win_recompose
 # ML LuxCore HERO build metadata
 #
 # BUILD / PHASE / FEATURE and compile switches are read automatically from
-# src/slg/engines/bidircpu/bidircputhread.cpp.
+# the active ML HERO engine source. PATHCPU uses src/slg/engines/pathtracer.cpp
+# as the primary source; BIDIRCPU remains a fallback for older builds.
 # ---------------------------------------------------------------------------
 
 ML_HERO_COMPILE_FLAGS = (
@@ -115,31 +116,16 @@ def _check_repairwheel():
 
 
 def _read_ml_hero_source_metadata():
-    """Read BUILD / PHASE / FEATURE from bidircputhread.cpp."""
-    source_file = (
-        PARAMS.SOURCE_DIR
-        / "src"
-        / "slg"
-        / "engines"
-        / "bidircpu"
-        / "bidircputhread.cpp"
+    """Read BUILD / PHASE / FEATURE from the active ML HERO engine source.
+
+    PATHCPU is checked first because current HERO builds are developed in
+    pathtracer.cpp. BIDIRCPU is retained as a compatibility fallback so older
+    wheels and Bidir-only checkpoints still get useful metadata.
+    """
+    candidates = (
+        PARAMS.SOURCE_DIR / "src" / "slg" / "engines" / "pathtracer.cpp",
+        PARAMS.SOURCE_DIR / "src" / "slg" / "engines" / "bidircpu" / "bidircputhread.cpp",
     )
-
-    result = {
-        "build": "UNKNOWN",
-        "phase": "UNKNOWN",
-        "feature": "UNKNOWN",
-    }
-
-    if not source_file.is_file():
-        logger.warning("ML HERO metadata: source file not found: %s", source_file)
-        return result
-
-    try:
-        source = source_file.read_text(encoding="utf-8", errors="ignore")
-    except OSError as err:
-        logger.warning("ML HERO metadata: could not read %s: %s", source_file, err)
-        return result
 
     define_map = {
         "build": "ML_HERO_BUILD",
@@ -147,24 +133,54 @@ def _read_ml_hero_source_metadata():
         "feature": "ML_HERO_FEATURE",
     }
 
-    for key, define_name in define_map.items():
-        match = re.search(
-            rf'^\s*#\s*define\s+{re.escape(define_name)}\s+"([^"]*)"',
-            source,
-            flags=re.MULTILINE,
-        )
-        if match:
-            result[key] = match.group(1)
+    for source_file in candidates:
+        if not source_file.is_file():
+            logger.warning("ML HERO metadata: source file not found: %s", source_file)
+            continue
 
-    return result
+        try:
+            source = source_file.read_text(encoding="utf-8", errors="ignore")
+        except OSError as err:
+            logger.warning("ML HERO metadata: could not read %s: %s", source_file, err)
+            continue
+
+        result = {
+            "build": "UNKNOWN",
+            "phase": "UNKNOWN",
+            "feature": "UNKNOWN",
+        }
+        found = False
+
+        for key, define_name in define_map.items():
+            match = re.search(
+                rf'^\s*#\s*define\s+{re.escape(define_name)}\s+"([^"]*)"',
+                source,
+                flags=re.MULTILINE,
+            )
+            if match:
+                result[key] = match.group(1)
+                found = True
+
+        if found:
+            logger.info("ML HERO metadata source: %s", source_file)
+            return result
+
+    logger.warning("ML HERO metadata: no BUILD / PHASE / FEATURE defines found")
+    return {
+        "build": "UNKNOWN",
+        "phase": "UNKNOWN",
+        "feature": "UNKNOWN",
+    }
 
 
 def _read_ml_hero_compile_flags():
     """Read selected ML HERO #define values from the current source tree."""
     values = {name: None for name in ML_HERO_COMPILE_FLAGS}
 
-    # The current HERO A/B switches live in bidircputhread.cpp.
+    # PATHCPU is the primary source for the current HERO build. Keep Bidir as
+    # a fallback because some switches still live there in older checkpoints.
     candidates = (
+        PARAMS.SOURCE_DIR / "src" / "slg" / "engines" / "pathtracer.cpp",
         PARAMS.SOURCE_DIR / "src" / "slg" / "engines" / "bidircpu" / "bidircputhread.cpp",
     )
 

@@ -23,7 +23,17 @@
 #include <cassert>
 #include <cstdio>
 #include <atomic>
+#include <vector>
+#include <algorithm>
 #include <cmath>
+#include "slg/engines/mlhero_finite_tail15fw.h"
+#include "slg/engines/mlhero_unit_reflectance15fx.h"
+// 15fh BEGIN diagnostic-only
+#include "slg/engines/mlhero_diagnostics15fh.h"
+#include "../mlherolog.h"
+#include "slg/lights/trianglelight.h"
+// 15fh END
+
 #include <mutex>
 #include <boost/format.hpp>
 
@@ -39,6 +49,7 @@
 
 // ML dispersion experiment: implemented in glass.cpp
 void SetMLHeroEnabled(const bool enabled);
+extern thread_local bool mlHeroRoughGlassFresnelImportance;
 void SetMLDispersionWaveLength(const float waveLength);
 void SetMLDispersionWaveLength(const float waveLength, const float sampleWeight);
 void SetMLHeroWavelengthCount(const u_int count);
@@ -53,6 +64,24 @@ extern thread_local bool mlDispersionUsed;
 using namespace std;
 using namespace luxrays;
 using namespace slg;
+
+// 15fl: restrict paired endpoint reconstruction to ordinary flat area emitters.
+static unsigned MLHeroTerminalLightGuard15fl(LightSourceConstRef light,const float time) {
+    if(light.GetType()!=slg::TYPE_TRIANGLE)return 3u;
+    const auto&tl=static_cast<const TriangleLight&>(light);
+    if(tl.lightMaterial->GetEmissionFunc() || tl.lightMaterial->GetBumpTexture() ||
+            tl.lightMaterial->GetEmittedTheta()!=90.f || light.GetAvgPassThroughTransparency()!=1.f)
+        return 3u;
+    auto&mesh=tl.sceneObject->GetExtMesh();
+    if(mesh.HasNormals()) {
+        Transform transform;mesh.GetLocal2World(time,transform);
+        const Normal gn=mesh.GetGeometryNormal(transform,tl.triangleIndex);
+        for(unsigned i=0;i<3;++i)
+            if(Dot(gn,mesh.GetShadeNormal(transform,tl.triangleIndex,i))<1.f-1e-6f)return 6u;
+    }
+    return 0u;
+}
+
 using namespace std::literals::chrono_literals;
 
 // ML HERO phase 15cq: legacy diagnostics are no longer compile-disabled.
@@ -223,6 +252,127 @@ struct MLHero15dcTailOutlier {
 static std::mutex mlHero15dcTailMutex;
 static MLHero15dcTailOutlier mlHero15dcWorstRaw[MLHERO_15DC_TRANSPORT_CASES];
 static MLHero15dcTailOutlier mlHero15dcWorstApplied[MLHERO_15DC_TRANSPORT_CASES];
+
+// ML HERO phase 15dp: RoughGlass Mode-2 first-divergence audit. Diagnostic only.
+// The sampled direction/event belongs to the HERO wavelength. For every valid
+// companion lane we compare the same-direction Evaluate/Pdf result with the HERO
+// lane before the existing Blend25 render weighting is applied. This localizes
+// whether divergence first appears in support, PDF, BSDF value, or the blend.
+static const u_int MLHERO_15DP_SIDE_COUNT = 2u; // 0=EYE, 1=LIGHT
+static const u_int MLHERO_15DP_DEPTH_BUCKETS = 8u; // depth 0..6, 7=7+
+static std::atomic<unsigned long long> mlHero15dpEventCount[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<unsigned long long> mlHero15dpLaneCount[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<unsigned long long> mlHero15dpInvalidLaneCount[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15dpAbsPdfRatioDeltaSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15dpAbsRawRatioDeltaSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15dpAbsBlendDeltaSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15dpMaxPdfRatio[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15dpMaxRawRatio[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15dpMaxAppliedAbs[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+
+static inline u_int MLHero15dpDepthBucket(const u_int depth) {
+    return Min(depth, MLHERO_15DP_DEPTH_BUCKETS - 1u);
+}
+
+// ML HERO phase 15dr: diagnostic-only ownership audit for continuous
+// RoughGlass TRANSMIT.  On the same HERO-sampled direction compare three
+// counterfactual estimators: f_i/p_i, f_i/p_HERO and f_i/q where
+// q = mean_k p_k over valid packet lanes.  The active renderer remains the
+// validated 15dp baseline (Blend25); 15dq shared-HERO-PDF physics is reverted.
+static const u_int MLHERO_15DR_MODEL_COUNT = 3u; // 0=LANE_PDF, 1=HERO_PDF, 2=MIXTURE_PDF
+static const u_int MLHERO_15DR_BAND_COUNT = 3u;  // 380-500, 500-600, 600-780
+static std::atomic<unsigned long long> mlHero15drValidCount[MLHERO_15DR_MODEL_COUNT][MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15drSignedSum[MLHERO_15DR_MODEL_COUNT][MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15drAbsSum[MLHERO_15DR_MODEL_COUNT][MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15drSquareSum[MLHERO_15DR_MODEL_COUNT][MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15drAbsMax[MLHERO_15DR_MODEL_COUNT][MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<unsigned long long> mlHero15drBandCount[MLHERO_15DR_MODEL_COUNT][MLHERO_15DP_SIDE_COUNT][MLHERO_15DR_BAND_COUNT];
+static std::atomic<double> mlHero15drBandPreWeightedSum[MLHERO_15DR_MODEL_COUNT][MLHERO_15DP_SIDE_COUNT][MLHERO_15DR_BAND_COUNT];
+static std::atomic<unsigned long long> mlHero15drSkippedHeroInvalid[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+
+static inline u_int MLHero15drBand(const float lambda) {
+    return (lambda < 500.f) ? 0u : ((lambda < 600.f) ? 1u : 2u);
+}
+
+// ML HERO phase 15ds: paper-derived path-technique audit.  The current
+// renderer remains the 15dp Blend25 baseline. For every continuous
+// RoughGlass TRANSMIT we extend the counterfactual same-path probability
+// P_k = product_v p_v(omega_v | lambda_k).  Wavelength-independent factors
+// cancel in N*P_k/sum(P), so only wavelength-dependent RoughGlass PDFs are
+// needed here.  The candidate estimator is the existing per-lane raw
+// f_i/p_i multiplied by the full-path balance factor N*P_i/sum_k P_k.
+static std::atomic<unsigned long long> mlHero15dsValidCount[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15dsBalanceFactorSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15dsBalanceFactorAbsDeltaSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15dsBalanceFactorMax[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15dsCandidateSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15dsCandidateSquareSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15dsCandidateMax[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15dsHeroTechniqueWeightSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15dsEffectiveTechniqueCountSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<unsigned long long> mlHero15dsBandCount[MLHERO_15DP_SIDE_COUNT][MLHERO_15DR_BAND_COUNT];
+static std::atomic<double> mlHero15dsBandBaselinePreWeighted[MLHERO_15DP_SIDE_COUNT][MLHERO_15DR_BAND_COUNT];
+static std::atomic<double> mlHero15dsBandCandidatePreWeighted[MLHERO_15DP_SIDE_COUNT][MLHERO_15DR_BAND_COUNT];
+static std::atomic<unsigned long long> mlHero15dsEventCount[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<unsigned long long> mlHero15dsSupportlessLaneCount[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+
+// ML HERO phase 15dt: reconstruct numerator and denominator at the same
+// cumulative RoughGlass path depth. The active renderer remains Blend25.
+static std::atomic<unsigned long long> mlHero15dtValidCount[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<unsigned long long> mlHero15dtSkippedCount[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15dtFullBaselineSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15dtFullBaselineSquareSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15dtFullBaselineMax[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15dtFullCandidateSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15dtFullCandidateSquareSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15dtFullCandidateMax[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15dtFullOverLocalSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15dtFullOverLocalAbsDeltaSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15dtBalanceFactorSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<unsigned long long> mlHero15dtBandCount[MLHERO_15DP_SIDE_COUNT][MLHERO_15DR_BAND_COUNT];
+static std::atomic<double> mlHero15dtBandBaseline[MLHERO_15DP_SIDE_COUNT][MLHERO_15DR_BAND_COUNT];
+static std::atomic<double> mlHero15dtBandCandidate[MLHERO_15DP_SIDE_COUNT][MLHERO_15DR_BAND_COUNT];
+
+// ML HERO phase 15du: microfacet-domain ownership / realizability audit.
+// Compares the shared HERO direction with the companion wavelength's natural
+// direction generated from the same sampled microfacet normal. Diagnostic only.
+static std::atomic<unsigned long long> mlHero15duCount[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<unsigned long long> mlHero15duNaturalTirCount[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15duNaturalDirDeltaSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15duNaturalDirDeltaMax[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15duSharedWhDeltaSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15duSharedWhDeltaMax[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15duMicroPdfRatioSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15duJacobianRatioSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15duSharedOverNaturalPdfSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15duReconstructedPdfRelErrSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<double> mlHero15duReconstructedPdfRelErrMax[MLHERO_15DP_SIDE_COUNT][MLHERO_15DP_DEPTH_BUCKETS];
+static std::atomic<unsigned long long> mlHero15duBandCount[MLHERO_15DP_SIDE_COUNT][MLHERO_15DR_BAND_COUNT];
+static std::atomic<double> mlHero15duBandNaturalDirDeltaSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DR_BAND_COUNT];
+static std::atomic<double> mlHero15duBandSharedOverNaturalPdfSum[MLHERO_15DP_SIDE_COUNT][MLHERO_15DR_BAND_COUNT];
+
+// ML HERO phase 15dv: controlled RoughGlass dispersive-TX HERO-only reference.
+// Active renderer change for Mode 2 only. Non-dispersive RoughGlass remains packet.
+static std::atomic<unsigned long long> mlHero15dvTerminationCount(0ull);
+static std::atomic<unsigned long long> mlHero15dvEyeTerminationCount(0ull);
+static std::atomic<unsigned long long> mlHero15dvLightTerminationCount(0ull);
+static std::atomic<unsigned long long> mlHero15dvCompanionLanesTerminated(0ull);
+static std::atomic<unsigned long long> mlHero15dvNonDispersivePacketEvents(0ull);
+static std::atomic<double> mlHero15dvHeroRawMultiplierSum(0.0);
+static std::atomic<double> mlHero15dvHeroBlendMultiplierSum(0.0);
+static std::atomic<double> mlHero15dvHeroRawOverBlendSum(0.0);
+// ML HERO phase 15dw: guard the RoughGlass packet->HERO transition so it
+// can happen exactly once per path. Once the path is HERO-only, later
+// RoughGlass events must use the ordinary single-wavelength HERO sample.
+static std::atomic<unsigned long long> mlHero15dwSuppressedAlreadyHeroOnly(0ull);
+static std::atomic<unsigned long long> mlHero15dwSuppressedNoLiveSecondary(0ull);
+static std::atomic<unsigned long long> mlHero15erSampleFallback(0ull);
+
+static inline double MLHero15dsSafeExp(const double x) {
+    if (x < -745.0) return 0.0;
+    if (x > 700.0) return exp(700.0);
+    return exp(x);
+}
 
 // ML HERO phase 15dd: mode-independent full-render radiance fingerprint.
 // Diagnostic only. Accumulated immediately before variance clamping so a
@@ -1024,21 +1174,556 @@ static inline const char *MLHeroMaterialTypeName15cl(const u_int t) {
 
 // ML HERO central diagnostics configuration. Change the phase in ONE place;
 // the log filename and banner follow automatically.
-#define ML_HERO_BUILD "HERO_106"
-#define ML_HERO_TEST_PHASE "15do"
-#define ML_HERO_FEATURE "Reinhard Hero Classic + Exposure tone mappers"
+#define ML_HERO_BUILD "HERO_170"
+#define ML_HERO_TEST_PHASE "15gb"
+#define ML_HERO_FEATURE "Central CPU diagnostic log filenames; renderer physics unchanged from 15ga"
 // 15di A/B experiment: 1 = companion lanes keep the shared HERO event PDF
 // already owned by the sampled path; 0 = legacy Mode2 bsdfPdfW/laneEventPdfW
 // reweighting. HERO OFF and Glass Modes 0/1 are untouched.
 #define ML_HERO_MODE2_SHARED_HERO_PDF_15DI 1
-// 15dm regular path: for Mode 2 ideal-Glass TRANSMIT with PLW off, every
-// multi-lane packet keeps LuxCore's sampled Glass RGB multiplier owned as RGB.
-// This now applies both with and without dispersion. A dispersive Delta-Glass
-// packet still collapses to the HERO wavelength at the existing boundary; a
-// non-dispersive Glass packet continues as a packet. Reflection, RoughGlass,
-// Glass Modes 0/1 and HERO OFF are untouched.
-#define ML_HERO_MODE2_RGB_OWNERSHIP_15DM 1
-#define ML_HERO_LOG_FILE "C:\\LuxCoreCustom\\ML_HERO_debug_" ML_HERO_TEST_PHASE ".txt"
+#define ML_HERO_LOG_FILE slg::mlhero15gb::FilePath()
+
+
+// 15fa BEGIN diagnostic-only
+
+// Reasons are exclusive first failures in the documented priority below.
+// The mask records all observed failures; endpoint evaluation still stops at
+// the ORIGINAL first unsupported lane, so later lanes are deliberately unknown.
+static const u_int MLHERO_15FA_FLAGS = 9u;
+static const u_int MLHERO_15FA_REASONS = 11u;
+static const u_int MLHERO_15FA_MATERIALS = MLHERO_MATERIAL_TYPE_COUNT_15CL + 1u;
+static const u_int MLHERO_15FA_DETAIL_LIMIT = 12u;
+enum MLHeroFlag15fa {
+    ML15FA_NO_PACKET = 1u << 0,
+    ML15FA_PACKET_MISMATCH = 1u << 1,
+    ML15FA_EYE_TP = 1u << 2,
+    ML15FA_LIGHT_TP = 1u << 3,
+    ML15FA_CONNECTION = 1u << 4,
+    ML15FA_ROUGH_HELPER = 1u << 5,
+    ML15FA_EYE_ENDPOINT = 1u << 6,
+    ML15FA_LIGHT_ENDPOINT = 1u << 7,
+    ML15FA_ACTIVATION = 1u << 8
+};
+static const char *MLHeroReason15fa(const u_int reason) {
+    static const char *names[] = {"SPECTRAL", "PACKET_UNAVAILABLE", "PACKET_MISMATCH",
+        "EYE_THROUGHPUT_NONSCALAR", "LIGHT_THROUGHPUT_NONSCALAR",
+        "CONNECTION_NONSCALAR", "ROUGHGLASS_HELPER_REJECTED",
+        "EYE_ENDPOINT_NONSCALAR", "LIGHT_ENDPOINT_NONSCALAR",
+        "ACTIVATION_GATE_NOT_MET", "UNCLASSIFIED_RGB"};
+    return reason < MLHERO_15FA_REASONS ? names[reason] : "UNKNOWN";
+}
+static u_int MLHeroPrimary15fa(const bool spectral, const u_int mask) {
+    if (spectral) return 0u;
+    for (u_int bit = 0u; bit < MLHERO_15FA_FLAGS; ++bit)
+        if (mask & (1u << bit)) return bit + 1u;
+    return 10u;
+}
+static std::atomic<unsigned long long> mlHero15faReasons[MLHERO_15FA_REASONS],
+    mlHero15faFlags[MLHERO_15FA_FLAGS], mlHero15faDetails[MLHERO_15FA_REASONS],
+    mlHero15faPairs[MLHERO_15FA_REASONS][MLHERO_15FA_MATERIALS][MLHERO_15FA_MATERIALS];
+static u_int MLHeroMaterialSlot15fa(const u_int type) {
+    return type < MLHERO_MATERIAL_TYPE_COUNT_15CL ? type : MLHERO_MATERIAL_TYPE_COUNT_15CL;
+}
+static void MLHeroReset15fa() {
+    for (u_int r = 0u; r < MLHERO_15FA_REASONS; ++r) {
+        mlHero15faReasons[r].store(0ull, std::memory_order_relaxed);
+        mlHero15faDetails[r].store(0ull, std::memory_order_relaxed);
+        for (u_int e = 0u; e < MLHERO_15FA_MATERIALS; ++e)
+            for (u_int l = 0u; l < MLHERO_15FA_MATERIALS; ++l)
+                mlHero15faPairs[r][e][l].store(0ull, std::memory_order_relaxed);
+    }
+    for (u_int bit = 0u; bit < MLHERO_15FA_FLAGS; ++bit)
+        mlHero15faFlags[bit].store(0ull, std::memory_order_relaxed);
+}
+static void MLHeroRecordConnection15fa(const bool spectral, const u_int mask,
+        const PathVertexVM &eye, const PathVertexVM &light,
+        const Spectrum &eyeEval, const Spectrum &lightEval,
+        const Spectrum &connection, const u_int failedLane, const u_int checkedLanes,
+        const Spectrum &failedEyeEval, const Spectrum &failedLightEval) {
+    if (!MLHeroCurrentDiagnosticsEnabled15cq()) return;
+    const u_int reason = MLHeroPrimary15fa(spectral, mask);
+    const u_int e = MLHeroMaterialSlot15fa((u_int)eye.bsdf.GetMaterialType());
+    const u_int l = MLHeroMaterialSlot15fa((u_int)light.bsdf.GetMaterialType());
+    mlHero15faReasons[reason].fetch_add(1ull, std::memory_order_relaxed);
+    const unsigned long long pairTicket = mlHero15faPairs[reason][e][l].fetch_add(1ull, std::memory_order_relaxed);
+    if (!spectral)
+        for (u_int bit = 0u; bit < MLHERO_15FA_FLAGS; ++bit)
+            if (mask & (1u << bit)) mlHero15faFlags[bit].fetch_add(1ull, std::memory_order_relaxed);
+    // One example per reason/material-type pair, bounded globally per reason.
+    // No per-connection file open or BSDF re-evaluation.
+    if (spectral || pairTicket != 0ull) return;
+    const unsigned long long ticket = mlHero15faDetails[reason].fetch_add(1ull, std::memory_order_relaxed);
+    if (ticket >= MLHERO_15FA_DETAIL_LIMIT) return;
+    std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
+    FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+    if (!f) return;
+    fprintf(f, "phase15fa RGB_DETAIL reason=%s mask=%u detail=%llu eyeType=%s eyeTypeID=%u lightType=%s lightTypeID=%u eyeMaterialID=%u eyeName=\"%s\" lightMaterialID=%u lightName=\"%s\" eyeDepth=%u lightDepth=%u eyeLanes=%u lightLanes=%u eyeActive=%u lightActive=%u eyeGlassHistory=%u lightGlassHistory=%u endpointCheckedLanes=%u firstFailedLane=%u\n",
+        MLHeroReason15fa(reason), mask, ticket, MLHeroMaterialTypeName15cl(e), (u_int)eye.bsdf.GetMaterialType(),
+        MLHeroMaterialTypeName15cl(l), (u_int)light.bsdf.GetMaterialType(), eye.bsdf.GetMaterialID(),
+        eye.bsdf.GetMaterialName().c_str(), light.bsdf.GetMaterialID(), light.bsdf.GetMaterialName().c_str(),
+        eye.depth, light.depth, eye.mlHeroLaneCount, light.mlHeroLaneCount,
+        eye.mlHeroActiveWavelengthCount, light.mlHeroActiveWavelengthCount,
+        eye.mlHeroSpectralGlassHistory ? 1u : 0u, light.mlHeroSpectralGlassHistory ? 1u : 0u, checkedLanes, failedLane);
+    fprintf(f, "phase15fa RGB_FACTORS eyeClassicBSDF=(%.9g,%.9g,%.9g) lightClassicBSDF=(%.9g,%.9g,%.9g) connection=(%.9g,%.9g,%.9g) failedEyeLaneBSDF=(%.9g,%.9g,%.9g) failedLightLaneBSDF=(%.9g,%.9g,%.9g)\n",
+        eyeEval.c[0], eyeEval.c[1], eyeEval.c[2], lightEval.c[0], lightEval.c[1], lightEval.c[2],
+        connection.c[0], connection.c[1], connection.c[2], failedEyeEval.c[0], failedEyeEval.c[1], failedEyeEval.c[2],
+        failedLightEval.c[0], failedLightEval.c[1], failedLightEval.c[2]);
+    fclose(f);
+}
+static void MLHeroSummary15fa(FILE *f) {
+    unsigned long long total = 0ull, rgb = 0ull;
+    for (u_int r = 0u; r < MLHERO_15FA_REASONS; ++r) {
+        const unsigned long long n = mlHero15faReasons[r].load(std::memory_order_relaxed);
+        total += n;
+        if (r != 0u) rgb += n;
+    }
+    fprintf(f, "phase15fa CONNECTION_TOTAL total=%llu spectral=%llu rgb=%llu rgbCountPct=%.9g countOnly=1\n",
+        total, mlHero15faReasons[0].load(std::memory_order_relaxed), rgb,
+        total ? 100.0 * (double)rgb / (double)total : 0.0);
+    for (u_int r = 0u; r < MLHERO_15FA_REASONS; ++r) {
+        const unsigned long long n = mlHero15faReasons[r].load(std::memory_order_relaxed);
+        fprintf(f, "phase15fa REASON reason=%s connections=%llu rgbCountPct=%.9g exclusive=1\n",
+            MLHeroReason15fa(r), n, (r != 0u && rgb) ? 100.0 * (double)n / (double)rgb : 0.0);
+        for (u_int e = 0u; e < MLHERO_15FA_MATERIALS; ++e)
+            for (u_int l = 0u; l < MLHERO_15FA_MATERIALS; ++l) {
+                const unsigned long long pairs = mlHero15faPairs[r][e][l].load(std::memory_order_relaxed);
+                if (pairs) fprintf(f, "phase15fa MATERIAL_PAIR reason=%s eyeType=%s eyeTypeSlot=%u lightType=%s lightTypeSlot=%u connections=%llu\n",
+                    MLHeroReason15fa(r), MLHeroMaterialTypeName15cl(e), e, MLHeroMaterialTypeName15cl(l), l, pairs);
+            }
+    }
+    for (u_int bit = 0u; bit < MLHERO_15FA_FLAGS; ++bit)
+        fprintf(f, "phase15fa OBSERVED_FAILURE flag=%s bit=%u connections=%llu exclusive=0\n",
+            MLHeroReason15fa(bit + 1u), 1u << bit, mlHero15faFlags[bit].load(std::memory_order_relaxed));
+    fprintf(f, "phase15fa interpretation=REASON_is_first_observed_failure_in_flag_priority;_OBSERVED_FAILURE_can_overlap;_endpoint_checks_stop_at_original_first_failure;_activation_reflects_original_evaluated_prefix;_counts_are_not_film_energy_shares;_firstFailedLane_8_means_none;_connection_stage_only;_no_transport_change\n");
+}
+
+// 15fa END diagnostic-only
+// 15fb BEGIN
+
+// A NEW permission only. Never relax the existing successful legacy route.
+// No absolute tolerance: a tiny colored endpoint is still colored.
+static bool MLHeroStrictNeutral15fb(const Spectrum &v) {
+    return std::isfinite(v.c[0]) && std::isfinite(v.c[1]) && std::isfinite(v.c[2]) &&
+        v.c[0] >= 0.f && v.c[0] == v.c[1] && v.c[0] == v.c[2];
+}
+static bool MLHeroNeutralMattePair15fb(const PathVertexVM &eye, const PathVertexVM &light,
+        const Spectrum &eyeEval, const Spectrum &lightEval, const Spectrum &connection) {
+    if (eye.bsdf.GetMaterialType() != MATTE || light.bsdf.GetMaterialType() != MATTE)
+        return false;
+    const u_int n = eye.mlHeroLaneCount;
+    if ((n != 2u && n != 4u && n != 8u) || light.mlHeroLaneCount != n)
+        return false;
+    if (!MLHeroStrictNeutral15fb(eyeEval) || !MLHeroStrictNeutral15fb(lightEval) ||
+            !MLHeroStrictNeutral15fb(connection)) return false;
+    for (u_int i = 0u; i < n; ++i) {
+        const float lambda = eye.mlHeroLaneWaveLength[i];
+        const float weight = eye.mlHeroLaneSampleWeight[i];
+        if (!std::isfinite(lambda) || lambda < 380.f || lambda > 780.f ||
+                lambda != light.mlHeroLaneWaveLength[i] || !std::isfinite(weight) ||
+                weight < 0.f || weight != light.mlHeroLaneSampleWeight[i] ||
+                !MLHeroStrictNeutral15fb(eye.mlHeroLaneThroughput[i]) ||
+                !MLHeroStrictNeutral15fb(light.mlHeroLaneThroughput[i])) return false;
+    }
+    return true;
+}
+static std::atomic<unsigned long long> mlHero15fbApplied(0ull), mlHero15fbDetailTicket(0ull);
+static void MLHeroReset15fb() {
+    mlHero15fbApplied.store(0ull, std::memory_order_relaxed);
+    mlHero15fbDetailTicket.store(0ull, std::memory_order_relaxed);
+}
+static void MLHeroRecordMatte15fb(const PathVertexVM &eye, const PathVertexVM &light,
+        const Spectrum &actual, const Spectrum &classicReference) {
+    if (!MLHeroCurrentDiagnosticsEnabled15cq()) return;
+    mlHero15fbApplied.fetch_add(1ull, std::memory_order_relaxed);
+    const unsigned long long ticket = mlHero15fbDetailTicket.fetch_add(1ull, std::memory_order_relaxed);
+    if (ticket >= 12ull) return;
+    std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
+    FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+    if (!f) return;
+    fprintf(f, "phase15fb MATTE_CONNECTION detail=%llu eyeDepth=%u lightDepth=%u lanes=%u eyeActive=%u lightActive=%u eyeMaterialID=%u lightMaterialID=%u eyeGlassHistory=%u lightGlassHistory=%u actualSpectralRGB=(%.9g,%.9g,%.9g) classicCounterfactualRGB=(%.9g,%.9g,%.9g) classicNotAdded=1\n",
+        ticket, eye.depth, light.depth, eye.mlHeroLaneCount, eye.mlHeroActiveWavelengthCount,
+        light.mlHeroActiveWavelengthCount, eye.bsdf.GetMaterialID(), light.bsdf.GetMaterialID(),
+        eye.mlHeroSpectralGlassHistory ? 1u : 0u, light.mlHeroSpectralGlassHistory ? 1u : 0u,
+        actual.c[0], actual.c[1], actual.c[2], classicReference.c[0], classicReference.c[1], classicReference.c[2]);
+    fclose(f);
+}
+static void MLHeroSummary15fb(FILE *f) {
+    fprintf(f, "phase15fb MATTE_SUMMARY newlySpectralConnections=%llu scope=strict_neutral_MATTE_MATTE_no_legacy_activation physicsIndependentOfDiagnostics=1 otherEndpointsUnchanged=1\n",
+        mlHero15fbApplied.load(std::memory_order_relaxed));
+}
+
+// 15fb END
+// 15fc BEGIN
+// Only neutral diffuse reflection/transmission endpoints; exact 15fb packet guard.
+static bool MLHeroNeutralTranslucentPair15fc(const PathVertexVM &eye, const PathVertexVM &light,
+        const Spectrum &eyeEval, const Spectrum &lightEval, const Spectrum &connection) {
+    const u_int e = eye.bsdf.GetMaterialType(), l = light.bsdf.GetMaterialType();
+    if ((e != MATTE && e != MATTETRANSLUCENT) ||
+            (l != MATTE && l != MATTETRANSLUCENT) ||
+            (e != MATTETRANSLUCENT && l != MATTETRANSLUCENT)) return false;
+    const u_int n = eye.mlHeroLaneCount;
+    if ((n != 2u && n != 4u && n != 8u) || light.mlHeroLaneCount != n)
+        return false;
+    if (!MLHeroStrictNeutral15fb(eyeEval) || !MLHeroStrictNeutral15fb(lightEval) ||
+            !MLHeroStrictNeutral15fb(connection)) return false;
+    for (u_int i = 0u; i < n; ++i) {
+        const float lambda = eye.mlHeroLaneWaveLength[i];
+        const float weight = eye.mlHeroLaneSampleWeight[i];
+        if (!std::isfinite(lambda) || lambda < 380.f || lambda > 780.f ||
+                lambda != light.mlHeroLaneWaveLength[i] || !std::isfinite(weight) ||
+                weight < 0.f || weight != light.mlHeroLaneSampleWeight[i] ||
+                !MLHeroStrictNeutral15fb(eye.mlHeroLaneThroughput[i]) ||
+                !MLHeroStrictNeutral15fb(light.mlHeroLaneThroughput[i])) return false;
+    }
+    return true;
+}
+static std::atomic<unsigned long long> mlHero15fcApplied(0ull), mlHero15fcDetailTicket(0ull);
+static std::atomic<unsigned long long> mlHero15fcPairs[3];
+static void MLHeroReset15fc() {
+    for (u_int i = 0u; i < 3u; ++i) mlHero15fcPairs[i].store(0ull, std::memory_order_relaxed);
+    mlHero15fcApplied.store(0ull, std::memory_order_relaxed);
+    mlHero15fcDetailTicket.store(0ull, std::memory_order_relaxed);
+}
+static void MLHeroRecordTranslucent15fc(const PathVertexVM &eye, const PathVertexVM &light,
+        const Spectrum &actual, const Spectrum &classicReference) {
+    if (!MLHeroCurrentDiagnosticsEnabled15cq()) return;
+    const u_int pair = eye.bsdf.GetMaterialType() == MATTE ? 0u :
+        (light.bsdf.GetMaterialType() == MATTE ? 1u : 2u);
+    mlHero15fcPairs[pair].fetch_add(1ull, std::memory_order_relaxed);
+    mlHero15fcApplied.fetch_add(1ull, std::memory_order_relaxed);
+    const unsigned long long ticket = mlHero15fcDetailTicket.fetch_add(1ull, std::memory_order_relaxed);
+    if (ticket >= 12ull) return;
+    std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
+    FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+    if (!f) return;
+    fprintf(f, "phase15fc TRANSLUCENT_CONNECTION detail=%llu eyeDepth=%u lightDepth=%u lanes=%u eyeActive=%u lightActive=%u eyeMaterialID=%u lightMaterialID=%u eyeMaterialType=%u lightMaterialType=%u eyeGlassHistory=%u lightGlassHistory=%u actualSpectralRGB=(%.9g,%.9g,%.9g) classicCounterfactualRGB=(%.9g,%.9g,%.9g) classicNotAdded=1\n",
+        ticket, eye.depth, light.depth, eye.mlHeroLaneCount, eye.mlHeroActiveWavelengthCount,
+        light.mlHeroActiveWavelengthCount, eye.bsdf.GetMaterialID(), light.bsdf.GetMaterialID(), eye.bsdf.GetMaterialType(), light.bsdf.GetMaterialType(),
+        eye.mlHeroSpectralGlassHistory ? 1u : 0u, light.mlHeroSpectralGlassHistory ? 1u : 0u,
+        actual.c[0], actual.c[1], actual.c[2], classicReference.c[0], classicReference.c[1], classicReference.c[2]);
+    fclose(f);
+}
+static void MLHeroSummary15fc(FILE *f) {
+    fprintf(f, "phase15fc TRANSLUCENT_SUMMARY newlySpectralConnections=%llu scope=strict_neutral_MATTE_MATTETRANSLUCENT_pairs_no_legacy_activation physicsIndependentOfDiagnostics=1 otherEndpointsUnchanged=1\n",
+        mlHero15fcApplied.load(std::memory_order_relaxed));
+    fprintf(f, "phase15fc TRANSLUCENT_PAIRS MATTE_MATTETRANSLUCENT=%llu MATTETRANSLUCENT_MATTE=%llu MATTETRANSLUCENT_MATTETRANSLUCENT=%llu\n",
+        mlHero15fcPairs[0].load(std::memory_order_relaxed),
+        mlHero15fcPairs[1].load(std::memory_order_relaxed),
+        mlHero15fcPairs[2].load(std::memory_order_relaxed));
+}
+
+// 15fc END
+// 15ew diagnostic only. Never discard or repair a renderer contribution.
+static const u_int MLHERO_15EW_STAGES = 11u;
+static const char *MLHeroStage15ew(u_int stage) {
+    static const char *names[] = {"CONNECT_SPECTRAL", "CONNECT_RGB", "DLS", "CONNECT_TO_EYE",
+        "DIRECT_HIT_SPECTRAL", "DIRECT_HIT_RGB", "PHOTON_CAUSTIC", "GROUP_PRECLAMP",
+        "TOTAL_PRECLAMP", "BOUNCE_THROUGHPUT", "BOUNCE_MIS"};
+    return stage < MLHERO_15EW_STAGES ? names[stage] : "UNKNOWN";
+}
+static std::atomic<unsigned long long> mlHero15ewChecks[MLHERO_15EW_STAGES],
+    mlHero15ewNonfinite[MLHERO_15EW_STAGES], mlHero15ewNaN[MLHERO_15EW_STAGES],
+    mlHero15ewInf[MLHERO_15EW_STAGES], mlHero15ewDetails[MLHERO_15EW_STAGES];
+static std::atomic<unsigned long long> mlHero15ewFiniteTotals(0ull), mlHero15ewBadTotals(0ull);
+static inline bool MLHeroFinite15ew(const Spectrum &v) {
+    return std::isfinite(v.c[0]) && std::isfinite(v.c[1]) && std::isfinite(v.c[2]);
+}
+static void MLHeroVertex15ew(FILE *f, const char *side, const PathVertexVM *v) {
+    if (!v) return;
+    fprintf(f, "phase15ew VERTEX side=%s depth=%u materialID=%u name=\"%s\" materialType=%u fromLight=%u lanes=%u active=%u terminated=%u glassHistory=%u scale=%.9g classicTP=(%.9g,%.9g,%.9g) dVCM=%.9g dVC=%.9g dVM=%.9g\n",
+        side, v->depth, v->bsdf.GetMaterialID(), v->bsdf.GetMaterialName().c_str(),
+        (u_int)v->bsdf.GetMaterialType(), v->bsdf.hitPoint.fromLight ? 1u : 0u,
+        v->mlHeroLaneCount, v->mlHeroActiveWavelengthCount,
+        v->mlHeroSecondaryWavelengthsTerminated ? 1u : 0u, v->mlHeroSpectralGlassHistory ? 1u : 0u,
+        v->mlHeroTerminationCurrentScale, v->throughput.c[0], v->throughput.c[1], v->throughput.c[2],
+        v->dVCM, v->dVC, v->dVM);
+    fprintf(f,"phase15fw PREVIOUS_BOUNCE side=%s depth=%u rrQ=%.9g forwardPdfW=%.9g etaValid=%u\n",
+        side,v->mlHeroLastDepth15fw,v->mlHeroLastRR15fw,v->mlHeroLastPdf15fw,v->mlHeroRREtaValid15fs?1u:0u);
+    for (u_int lane = 0u; lane < Min(v->mlHeroLaneCount, 8u); ++lane) {
+        const Spectrum &tp = v->mlHeroLaneThroughput[lane];
+        fprintf(f, "phase15ew LANE side=%s lane=%u lambda=%.9g sampleWeight=%.9g wavelengthPdf=%.9g tp=(%.9g,%.9g,%.9g) finite=%u\n",
+            side, lane, v->mlHeroLaneWaveLength[lane], v->mlHeroLaneSampleWeight[lane],
+            v->mlHeroLaneWaveLengthPdf[lane], tp.c[0], tp.c[1], tp.c[2], MLHeroFinite15ew(tp) ? 1u : 0u);
+    }
+}
+// 15fw: read-only finite-tail audit, separate from the nonfinite counters.
+static std::atomic<unsigned long long> mlHero15fwEvents[MLHERO_15EW_STAGES][2],
+    mlHero15fwDetails[MLHERO_15EW_STAGES][2];
+static std::atomic<double> mlHero15fwPeak[MLHERO_15EW_STAGES][2];
+static thread_local float mlHeroFilmX15fw = -1.f, mlHeroFilmY15fw = -1.f;
+static thread_local u_int mlHeroThread15fw = 0u, mlHeroStep15fw = 0u;
+static std::atomic<unsigned long long> mlHero15fwConnectionDetails(0ull);
+static void MLHeroFiniteAudit15fw(const u_int stage, const char *role, const Spectrum &v,
+        const PathVertexVM *eye, const PathVertexVM *light, const float factor,
+        const float pdf, const float geometry, const float filmX, const float filmY,
+        const u_int group) {
+    const unsigned mask = MLHeroFiniteTailClass15fw(v.c[0], v.c[1], v.c[2]);
+    if (!mask) return;
+    const double peak = std::max(std::fabs(double(v.c[0])),
+        std::max(std::fabs(double(v.c[1])), std::fabs(double(v.c[2]))));
+    const double y = .2126*double(v.c[0])+.7152*double(v.c[1])+.0722*double(v.c[2]);
+    for (unsigned kind=0u; kind<2u; ++kind) {
+        if (!(mask & (1u<<kind))) continue;
+        mlHero15fwEvents[stage][kind].fetch_add(1ull,std::memory_order_relaxed);
+        double old=mlHero15fwPeak[stage][kind].load(std::memory_order_relaxed);
+        while (old<peak && !mlHero15fwPeak[stage][kind].compare_exchange_weak(
+                old,peak,std::memory_order_relaxed)) {}
+        const auto ticket=mlHero15fwDetails[stage][kind].fetch_add(1ull,std::memory_order_relaxed);
+        if (ticket>=32ull) continue;
+        std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
+        FILE *f=fopen(ML_HERO_LOG_FILE,"a"); if (!f) continue;
+        fprintf(f,"phase15fw FINITE_TAIL stage=%s role=%s kind=%s detail=%llu thread=%u step=%u filmX=%.9g filmY=%.9g group=%u rgb=(%.9g,%.9g,%.9g) Y=%.12g maxAbsChannel=%.12g factor=%.9g pdf=%.9g geometry=%.9g contributionRetained=1\n",
+            MLHeroStage15ew(stage),role,kind==0u?"ABS64":"COLOR16_RATIO8",ticket,
+            mlHeroThread15fw,mlHeroStep15fw,filmX>=0.f?filmX:mlHeroFilmX15fw,
+            filmY>=0.f?filmY:mlHeroFilmY15fw,group,v.c[0],v.c[1],v.c[2],y,peak,factor,pdf,geometry);
+        MLHeroVertex15ew(f,"EYE",eye); MLHeroVertex15ew(f,"LIGHT",light);
+        fclose(f);
+    }
+}
+static Spectrum MLHeroCIEEstimatorColor(const float lambda, const float sampleWeight);
+// Use already evaluated endpoint values: no extra BSDF/texture/sampler calls.
+static void MLHeroFiniteConnection15fw(const Spectrum &v, const Spectrum &beforeDual,
+        const PathVertexVM &eye, const PathVertexVM &light,
+        const float *eyeBsdf, const float *lightBsdf, const float connection,
+        const float mis, const float geometry, const float eyePdf, const float lightPdf) {
+    if (!MLHeroCurrentDiagnosticsEnabled15cq() ||
+            !(MLHeroFiniteTailClass15fw(v.c[0],v.c[1],v.c[2]) & 2u)) return;
+    const auto ticket=mlHero15fwConnectionDetails.fetch_add(1ull,std::memory_order_relaxed);
+    if (ticket>=64ull) return;
+    std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
+    FILE *f=fopen(ML_HERO_LOG_FILE,"a"); if (!f) return;
+    fprintf(f,"phase15fw CONNECTION detail=%llu thread=%u step=%u filmX=%.9g filmY=%.9g eyeDepth=%u lightDepth=%u eyePdfW=%.9g lightPdfW=%.9g mis=%.9g geometry=%.9g connection=%.9g beforeDualRGB=(%.9g,%.9g,%.9g) actualRGB=(%.9g,%.9g,%.9g)\n",
+        ticket,mlHeroThread15fw,mlHeroStep15fw,mlHeroFilmX15fw,mlHeroFilmY15fw,
+        eye.depth,light.depth,eyePdf,lightPdf,mis,geometry,connection,
+        beforeDual.c[0],beforeDual.c[1],beforeDual.c[2],v.c[0],v.c[1],v.c[2]);
+    MLHeroVertex15ew(f,"EYE",&eye); MLHeroVertex15ew(f,"LIGHT",&light);
+    for (u_int i=0u;i<Min(eye.mlHeroLaneCount,8u);++i) {
+        const Spectrum color=MLHeroCIEEstimatorColor(eye.mlHeroLaneWaveLength[i],eye.mlHeroLaneSampleWeight[i]);
+        const float scalar=eye.mlHeroLaneThroughput[i].c[0]*eyeBsdf[i]*
+            light.mlHeroLaneThroughput[i].c[0]*lightBsdf[i]*connection*(mis*geometry);
+        fprintf(f,"phase15fw ENDPOINT_LANE lane=%u eyeBSDF=%.9g lightBSDF=%.9g eyeEtaScale=%.12g lightEtaScale=%.12g\n",
+            i,eyeBsdf[i],lightBsdf[i],eye.mlHeroRREtaScale15fs[i],light.mlHeroRREtaScale15fs[i]);
+        fprintf(f,"phase15fw LANE_RECONSTRUCTION lane=%u scalar=%.9g estimatorColor=(%.9g,%.9g,%.9g) dividedByN=%u beforeDual=1\n",
+            i,scalar,color.c[0],color.c[1],color.c[2],eye.mlHeroLaneCount);
+    }
+    fclose(f);
+}
+static void MLHeroAudit15ew(const u_int stage, const char *role, const Spectrum &v,
+        const PathVertexVM *eye = nullptr, const PathVertexVM *light = nullptr,
+        const float factor = 0.f, const float pdf = 0.f, const float geometry = 0.f,
+        const float filmX = -1.f, const float filmY = -1.f, const u_int group = 0u) {
+    if (!MLHeroCurrentDiagnosticsEnabled15cq() || stage >= MLHERO_15EW_STAGES) return;
+    mlHero15ewChecks[stage].fetch_add(1ull, std::memory_order_relaxed);
+    if (MLHeroFinite15ew(v)) {
+        MLHeroFiniteAudit15fw(stage,role,v,eye,light,factor,pdf,geometry,filmX,filmY,group);
+        return;
+    }
+    const bool nan = std::isnan(v.c[0]) || std::isnan(v.c[1]) || std::isnan(v.c[2]);
+    const bool inf = std::isinf(v.c[0]) || std::isinf(v.c[1]) || std::isinf(v.c[2]);
+    mlHero15ewNonfinite[stage].fetch_add(1ull, std::memory_order_relaxed);
+    if (nan) mlHero15ewNaN[stage].fetch_add(1ull, std::memory_order_relaxed);
+    if (inf) mlHero15ewInf[stage].fetch_add(1ull, std::memory_order_relaxed);
+    const unsigned long long ticket = mlHero15ewDetails[stage].fetch_add(1ull, std::memory_order_relaxed);
+    if (ticket >= 16ull) return;
+    std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
+    FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+    if (!f) return;
+    fprintf(f, "phase15ew NONFINITE stage=%s role=%s index=%llu rgb=(%.9g,%.9g,%.9g) hasNaN=%u hasInf=%u factor=%.9g pdf=%.9g geometry=%.9g filmX=%.9g filmY=%.9g group=%u rendererContributionRetained=1\n",
+        MLHeroStage15ew(stage), role, ticket, v.c[0], v.c[1], v.c[2], nan ? 1u : 0u, inf ? 1u : 0u,
+        factor, pdf, geometry, filmX, filmY, group);
+    MLHeroVertex15ew(f, "EYE", eye); MLHeroVertex15ew(f, "LIGHT", light);
+    fclose(f);
+}
+static void MLHeroAddAudit15ew(Spectrum &destination, const Spectrum &contribution,
+        const u_int stage, const PathVertexVM *eye = nullptr, const PathVertexVM *light = nullptr,
+        const float factor = 0.f, const float pdf = 0.f, const float geometry = 0.f) {
+    if (!MLHeroCurrentDiagnosticsEnabled15cq()) {
+        destination += contribution;
+        return;
+    }
+// 15fh BEGIN diagnostic-only
+    if(eye && (stage==0u||stage==1u))
+        MLHeroRecord15fh(5u,contribution,stage==0u,light?eye->depth+light->depth:~0u);
+    else if(eye && (stage==4u||stage==5u))
+        MLHeroRecord15fh(MLHeroHitBucket15fh(eye->depth-1u),contribution,stage==4u,eye->depth-1u);
+// 15fh END
+    const Spectrum before = destination;
+    destination += contribution;
+    MLHeroAudit15ew(stage, "CONTRIBUTION", contribution, eye, light, factor, pdf, geometry);
+    // Only audit accumulator contamination/overflow when its inputs were finite,
+    // or the accumulator was already invalid. This distinguishes the origin
+    // from later finite contributions added to a contaminated sample.
+    if (!MLHeroFinite15ew(before))
+        MLHeroAudit15ew(stage, "ACCUMULATOR_ALREADY_NONFINITE", before, eye, light, factor, pdf, geometry);
+    else if (MLHeroFinite15ew(contribution) && !MLHeroFinite15ew(destination))
+        MLHeroAudit15ew(stage, "FINITE_ADDITION_OVERFLOW", destination, eye, light, factor, pdf, geometry);
+}
+static void MLHeroReset15ew() {
+    mlHero15fwConnectionDetails.store(0ull,std::memory_order_relaxed);
+    for (u_int stage=0u;stage<MLHERO_15EW_STAGES;++stage)
+        for (u_int kind=0u;kind<2u;++kind) {
+            mlHero15fwEvents[stage][kind].store(0ull,std::memory_order_relaxed);
+            mlHero15fwDetails[stage][kind].store(0ull,std::memory_order_relaxed);
+            mlHero15fwPeak[stage][kind].store(0.,std::memory_order_relaxed);
+        }
+    for (u_int stage = 0u; stage < MLHERO_15EW_STAGES; ++stage) {
+        mlHero15ewChecks[stage].store(0ull, std::memory_order_relaxed);
+        mlHero15ewNonfinite[stage].store(0ull, std::memory_order_relaxed);
+        mlHero15ewNaN[stage].store(0ull, std::memory_order_relaxed);
+        mlHero15ewInf[stage].store(0ull, std::memory_order_relaxed);
+        mlHero15ewDetails[stage].store(0ull, std::memory_order_relaxed);
+    }
+    mlHero15ewFiniteTotals.store(0ull, std::memory_order_relaxed);
+    mlHero15ewBadTotals.store(0ull, std::memory_order_relaxed);
+}
+
+
+// 15ex: inspect the exact float operations at a nonfinite DLS boundary.
+// Counterfactual values are never assigned to live MIS weights or radiance.
+struct MLHeroDLSMISProbe15ex {
+    float numerator, denominator, ratio, ratioSquared, reversePdfSquared, history;
+    float candidateCamera, candidateMis;
+    bool candidateApplicable;
+    u_int reason;
+};
+static MLHeroDLSMISProbe15ex MLHeroProbeDLSMIS15ex(
+        const float emissionPdf, const float cosToLight, const float directPdf,
+        const float cosAtLight, const float reversePdf, const float vmFactor,
+        const float dVCM, const float dVC, const float weightLight, const float weightCamera,
+        const bool shadowTransparent) {
+    MLHeroDLSMISProbe15ex out;
+    out.numerator = emissionPdf * cosToLight;
+    out.denominator = directPdf * cosAtLight;
+    out.ratio = out.numerator / out.denominator;
+    out.ratioSquared = out.ratio * out.ratio;
+    out.reversePdfSquared = reversePdf * reversePdf;
+    out.history = vmFactor + dVCM + dVC * out.reversePdfSquared;
+    out.candidateApplicable = std::isinf(out.ratioSquared) && out.ratioSquared > 0.f &&
+        out.history == 0.f && !std::isnan(weightLight) && weightLight >= 0.f;
+    out.candidateCamera = out.candidateApplicable ? 0.f : weightCamera;
+    out.candidateMis = shadowTransparent ? 1.f : 1.f / (weightLight + 1.f + out.candidateCamera);
+    if (std::isnan(out.history)) out.reason = 0u;
+    else if (std::isnan(out.ratio)) out.reason = 1u;
+    else if (std::isnan(weightLight)) out.reason = 2u;
+    else if (out.candidateApplicable && std::isnan(weightCamera)) out.reason = 3u;
+    else out.reason = 4u;
+    return out;
+}
+static const char *MLHeroMISReason15ex(const u_int reason) {
+    static const char *names[] = {"HISTORY_NAN", "CAMERA_RATIO_NAN", "LIGHT_WEIGHT_NAN",
+        "INF_TIMES_ZERO_HISTORY", "OTHER"};
+    return reason < 5u ? names[reason] : "UNKNOWN";
+}
+static std::atomic<unsigned long long> mlHero15exCases[5], mlHero15exDetails[5];
+static std::atomic<unsigned long long> mlHero15exInvalidMis(0ull), mlHero15exCandidateFinite(0ull);
+static void MLHeroLogDLSMIS15ex(const PathVertexVM &eye, const u_int lightID,
+        const u_int lightType, const float emissionPdf, const float directPdf, const float lightPickPdf,
+        const float cosToLight, const float cosAtLight, const float bsdfPdf, const float reversePdf,
+        const float vmFactor, const float weightLight, const float weightCamera, const float actualMis,
+        const float factor, const bool shadowTransparent, const float filmX, const float filmY) {
+    if (!MLHeroCurrentDiagnosticsEnabled15cq()) return;
+    const auto probe = MLHeroProbeDLSMIS15ex(emissionPdf, cosToLight, directPdf, cosAtLight,
+        reversePdf, vmFactor, eye.dVCM, eye.dVC, weightLight, weightCamera, shadowTransparent);
+    mlHero15exCases[probe.reason].fetch_add(1ull, std::memory_order_relaxed);
+    if (!std::isfinite(actualMis)) mlHero15exInvalidMis.fetch_add(1ull, std::memory_order_relaxed);
+    if (probe.candidateApplicable && std::isfinite(probe.candidateMis))
+        mlHero15exCandidateFinite.fetch_add(1ull, std::memory_order_relaxed);
+    const unsigned long long ticket = mlHero15exDetails[probe.reason].fetch_add(1ull, std::memory_order_relaxed);
+    if (ticket >= 16ull) return;
+    std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
+    FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+    if (!f) return;
+    fprintf(f, "phase15ex DLS_MIS_INPUT index=%llu reason=%s lightID=%u lightType=%u depth=%u materialID=%u name=\"%s\" emissionPdfW=%.9g directPdfW=%.9g lightPickPdf=%.9g directLightSamplingPdfW=%.9g bsdfPdfW=%.9g bsdfRevPdfW=%.9g cosThetaToLight=%.9g cosThetaAtLight=%.9g cameraNumerator=%.9g cameraDenominator=%.9g cameraRatio=%.9g cameraRatioSquared=%.9g reversePdfSquared=%.9g misVmWeightFactor=%.9g dVCM=%.9g dVC=%.9g cameraHistory=%.9g weightLight=%.9g weightCamera=%.9g actualMis=%.9g radianceFactor=%.9g shadowTransparent=%u filmX=%.9g filmY=%.9g candidateApplicable=%u candidateCamera=%.9g candidateMis=%.9g candidateApplied=0 auditDiagnosticOnly=1 liveZeroHistoryFix=15ey\n",
+        ticket, MLHeroMISReason15ex(probe.reason), lightID, lightType, eye.depth,
+        eye.bsdf.GetMaterialID(), eye.bsdf.GetMaterialName().c_str(), emissionPdf, directPdf, lightPickPdf,
+        directPdf * lightPickPdf, bsdfPdf, reversePdf, cosToLight, cosAtLight,
+        probe.numerator, probe.denominator, probe.ratio, probe.ratioSquared, probe.reversePdfSquared,
+        vmFactor, eye.dVCM, eye.dVC, probe.history, weightLight, weightCamera, actualMis, factor,
+        shadowTransparent ? 1u : 0u, filmX, filmY, probe.candidateApplicable ? 1u : 0u,
+        probe.candidateCamera, probe.candidateMis);
+    MLHeroVertex15ew(f, "EYE", &eye);
+    fclose(f);
+}
+static void MLHeroReset15ex() {
+    for (u_int reason = 0u; reason < 5u; ++reason) {
+        mlHero15exCases[reason].store(0ull, std::memory_order_relaxed);
+        mlHero15exDetails[reason].store(0ull, std::memory_order_relaxed);
+    }
+    mlHero15exInvalidMis.store(0ull, std::memory_order_relaxed);
+    mlHero15exCandidateFinite.store(0ull, std::memory_order_relaxed);
+}
+
+
+// 15ey: an absent camera-side competitor has weight zero. Do not evaluate
+// its PDF ratio first: a directional/overflowing emission PDF can be infinite.
+static inline float MLHeroDLSCameraWeight15ey(const float emissionPdf,
+        const float cosToLight, const float directPdf, const float cosAtLight,
+        const float cameraHistory) {
+    if (cameraHistory == 0.f) return 0.f;
+    const float ratio = emissionPdf * cosToLight / (directPdf * cosAtLight);
+    return (ratio * ratio) * cameraHistory;
+}
+static std::atomic<unsigned long long> mlHero15eyZeroHistory(0ull), mlHero15eyRecovered(0ull),
+    mlHero15eyUnresolved(0ull), mlHero15eyDetails(0ull);
+static void MLHeroRecordMISFix15ey(const PathVertexVM &eye, const u_int lightID,
+        const u_int lightType, const float emissionPdf, const float directPdf, const float lightPickPdf,
+        const float cosToLight, const float cosAtLight, const float bsdfPdf, const float reversePdf,
+        const float vmFactor, const float weightLight, const float actualMis, const float factor,
+        const bool shadowTransparent, const float filmX, const float filmY) {
+    if (!MLHeroCurrentDiagnosticsEnabled15cq()) return;
+    mlHero15eyZeroHistory.fetch_add(1ull, std::memory_order_relaxed);
+    const float ratio = emissionPdf * cosToLight / (directPdf * cosAtLight);
+    const float history = vmFactor + eye.dVCM + eye.dVC * (reversePdf * reversePdf);
+    const float legacyCamera = (ratio * ratio) * history;
+    const float legacyMis = shadowTransparent ? 1.f : 1.f / (weightLight + 1.f + legacyCamera);
+    if (std::isfinite(legacyMis)) return;
+    const bool recovered = std::isfinite(actualMis);
+    if (recovered) mlHero15eyRecovered.fetch_add(1ull, std::memory_order_relaxed);
+    else mlHero15eyUnresolved.fetch_add(1ull, std::memory_order_relaxed);
+    const unsigned long long ticket = mlHero15eyDetails.fetch_add(1ull, std::memory_order_relaxed);
+    if (ticket >= 16ull) return;
+    std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
+    FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+    if (!f) return;
+    fprintf(f, "phase15ey DLS_MIS_FIX index=%llu lightID=%u lightType=%u depth=%u materialID=%u name=\"%s\" emissionPdfW=%.9g directPdfW=%.9g lightPickPdf=%.9g bsdfPdfW=%.9g bsdfRevPdfW=%.9g cosThetaToLight=%.9g cosThetaAtLight=%.9g cameraRatio=%.9g cameraHistory=%.9g weightLight=%.9g legacyWeightCamera=%.9g legacyMis=%.9g actualWeightCamera=0 actualMis=%.9g radianceFactor=%.9g recovered=%u shadowTransparent=%u filmX=%.9g filmY=%.9g applied=1 policy=EXACT_ZERO_HISTORY_ONLY\n",
+        ticket, lightID, lightType, eye.depth, eye.bsdf.GetMaterialID(), eye.bsdf.GetMaterialName().c_str(),
+        emissionPdf, directPdf, lightPickPdf, bsdfPdf, reversePdf, cosToLight, cosAtLight,
+        ratio, history, weightLight, legacyCamera, legacyMis, actualMis, factor,
+        recovered ? 1u : 0u, shadowTransparent ? 1u : 0u, filmX, filmY);
+    MLHeroVertex15ew(f, "EYE", &eye);
+    fclose(f);
+}
+static void MLHeroReset15ey() {
+    mlHero15eyZeroHistory.store(0ull, std::memory_order_relaxed);
+    mlHero15eyRecovered.store(0ull, std::memory_order_relaxed);
+    mlHero15eyUnresolved.store(0ull, std::memory_order_relaxed);
+    mlHero15eyDetails.store(0ull, std::memory_order_relaxed);
+}
+
+// 15gf: inspect real RoughGlass Sample vs Evaluate/Pdf without modifying transport.
+static std::atomic<unsigned long long> mlHero15gfChecks(0ull);
+static std::atomic<unsigned int> mlHero15gfDetails(0u);
+bool MLHeroRoughGlass15gfShouldAudit() {
+    return MLHeroCurrentHeavyDiagnosticsEnabled15cq() &&
+        (mlHero15gfDetails.load(std::memory_order_relaxed) < 96u);
+}
+void MLHeroRoughGlass15gfReport(bool fromLight, bool transmit,
+        float nc, float nt, float samplePdf, float evalPdf, float pdfFunction,
+        float sampleWeight, float evaluateWeight, float cosFixed, float cosSampled) {
+    if (!MLHeroCurrentHeavyDiagnosticsEnabled15cq()) return;
+    mlHero15gfChecks.fetch_add(1ull, std::memory_order_relaxed);
+    const unsigned int ticket = mlHero15gfDetails.fetch_add(1u, std::memory_order_relaxed);
+    if (ticket >= 96u) return;
+    const float ratio = evaluateWeight != 0.f ? sampleWeight / evaluateWeight : 0.f;
+    std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
+    FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+    if (!f) return;
+    fprintf(f, "phase15gf ROUGH_CONSISTENCY ticket=%u side=%s event=%s nc=%.9g nt=%.9g etaInOut=%.9g samplePdf=%.9g evalDirectPdf=%.9g pdfFunction=%.9g sampleWeight=%.9g evalOverPdf=%.9g sampleVsEvalRatio=%.9g cosFixed=%.9g cosSampled=%.9g diagnosticOnly=1\n",
+        ticket, fromLight ? "LIGHT" : "EYE", transmit ? "TRANSMIT" : "REFLECT",
+        nc, nt, nt != 0.f ? nc/nt : 0.f, samplePdf, evalPdf, pdfFunction,
+        sampleWeight, evaluateWeight, ratio, cosFixed, cosSampled);
+    fclose(f);
+}
 
 static inline FILE *MLHeroOpenCurrentLog15cq(const char *mode) {
     return MLHeroCurrentDiagnosticsEnabled15cq() ? fopen(ML_HERO_LOG_FILE, mode) : nullptr;
@@ -1196,8 +1881,9 @@ static inline void MLHeroRecordDualTermination15by(const Spectrum &c,
     }
 }
 
-// ML HERO phase 15bz: runtime A/B correction for ConnectVertices. OFF preserves
-// HERO_65. ON divides only doubly HERO-only contributions by the packet size.
+// ML HERO phase 15bz: shared ConnectVertices correction primitive.
+// 15eu uses it for eligible spectral connections in all modes; the original
+// classic RGB Mode-1 fallback call remains separate.
 static std::atomic<unsigned long long> mlHero15bzAppliedCount(0ull);
 static std::atomic<double> mlHero15bzBaselineY(0.0);
 static std::atomic<double> mlHero15bzCompensatedY(0.0);
@@ -1229,6 +1915,63 @@ static inline bool MLHeroApplyDualTerminationCompensation15bz(Spectrum &c,
         }
     }
     return true;
+}
+
+// 15eu: the shared wavelength packet is sampled once for both subpaths.
+// Each terminated subpath carries N; their product is reconstructed with 1/N.
+// Remove the remaining N once at the spectral connection, in every Glass mode.
+// Legacy RGB fallback behavior is retained separately in its existing Mode-1 block.
+static inline bool MLHeroDualSpectralEligible15eu(const PathVertexVM &eye,
+        const PathVertexVM &light, const u_int count) {
+    return count > 1u && count <= 8u &&
+        eye.mlHeroLaneCount == count && light.mlHeroLaneCount == count &&
+        eye.mlHeroSecondaryWavelengthsTerminated && light.mlHeroSecondaryWavelengthsTerminated &&
+        eye.mlHeroActiveWavelengthCount == 1u && light.mlHeroActiveWavelengthCount == 1u &&
+        eye.mlHeroTerminationCurrentScale == (float)count &&
+        light.mlHeroTerminationCurrentScale == (float)count &&
+        fabsf(eye.mlHeroLaneWaveLength[0] - light.mlHeroLaneWaveLength[0]) < 1e-4f &&
+        fabsf(eye.mlHeroTerminationHeroLambda - eye.mlHeroLaneWaveLength[0]) < 1e-4f &&
+        fabsf(light.mlHeroTerminationHeroLambda - light.mlHeroLaneWaveLength[0]) < 1e-4f;
+}
+
+static std::atomic<unsigned long long> mlHero15euConnections[4];
+static std::atomic<unsigned long long> mlHero15euEligible[4];
+static std::atomic<unsigned long long> mlHero15euApplied[4];
+static std::atomic<double> mlHero15euBeforeY[4], mlHero15euAfterY[4];
+static std::atomic<double> mlHero15euBeforeAbsY[4], mlHero15euAfterAbsY[4];
+static std::atomic<double> mlHero15euCandidateY[4];
+static std::atomic<unsigned long long> mlHero15euDetailTicket(0ull);
+
+static void MLHeroRecordDualSpectral15eu(const Spectrum &before, const Spectrum &after,
+        const PathVertexVM &eye, const PathVertexVM &light, const u_int count,
+        const u_int mode, const bool enabled, const bool eligible, const bool applied) {
+    if (!MLHeroCurrentDiagnosticsEnabled15cq()) return;
+    const u_int category = (eye.mlHeroSecondaryWavelengthsTerminated ? 1u : 0u) +
+        (light.mlHeroSecondaryWavelengthsTerminated ? 2u : 0u);
+    const double beforeY = .2126 * before.c[0] + .7152 * before.c[1] + .0722 * before.c[2];
+    const double afterY = .2126 * after.c[0] + .7152 * after.c[1] + .0722 * after.c[2];
+    mlHero15euConnections[category].fetch_add(1ull, std::memory_order_relaxed);
+    if (eligible) mlHero15euEligible[category].fetch_add(1ull, std::memory_order_relaxed);
+    if (applied) mlHero15euApplied[category].fetch_add(1ull, std::memory_order_relaxed);
+    mlHero15euBeforeY[category].fetch_add(beforeY, std::memory_order_relaxed);
+    mlHero15euAfterY[category].fetch_add(afterY, std::memory_order_relaxed);
+    mlHero15euBeforeAbsY[category].fetch_add(fabs(beforeY), std::memory_order_relaxed);
+    mlHero15euAfterAbsY[category].fetch_add(fabs(afterY), std::memory_order_relaxed);
+    mlHero15euCandidateY[category].fetch_add(eligible ? beforeY / (double)count : beforeY,
+        std::memory_order_relaxed);
+    if (category != 3u) return;
+    const unsigned long long ticket = mlHero15euDetailTicket.fetch_add(1ull, std::memory_order_relaxed);
+    if (ticket >= 64ull) return;
+    std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
+    FILE *f = MLHeroOpenCurrentLog15cq("a");
+    if (!f) return;
+    fprintf(f, "phase15eu DUAL_SPECTRAL index=%llu glassMode=%u enabled=%u eligible=%u applied=%u lanes=%u eyeDepth=%u lightDepth=%u eyeActive=%u lightActive=%u eyeScale=%.9g lightScale=%.9g heroLambda=%.9g beforeY=%.12g afterY=%.12g candidateDivN_Y=%.12g ratio=%.9g\n",
+        ticket, mode, enabled ? 1u : 0u, eligible ? 1u : 0u, applied ? 1u : 0u,
+        count, eye.depth, light.depth, eye.mlHeroActiveWavelengthCount, light.mlHeroActiveWavelengthCount,
+        eye.mlHeroTerminationCurrentScale, light.mlHeroTerminationCurrentScale,
+        eye.mlHeroLaneWaveLength[0], beforeY, afterY, eligible ? beforeY / (double)count : beforeY,
+        fabs(beforeY) > 1e-30 ? afterY / beforeY : 0.0);
+    fclose(f);
 }
 
 
@@ -1557,7 +2300,41 @@ static float MLHeroRGBIllumSample380_780(const RGBColor &s, const float lambda) 
 	return Lerp(t, v0, v1);
 }
 
+// 15ev: preserve the original reconstruction packet size; compensate 1/N once.
+static bool MLHeroCollapseGlass15ev(PathVertexVM *vertex) {
+    const u_int n = vertex->mlHeroLaneCount;
+    if (n < 2u || n > 8u || vertex->mlHeroSecondaryWavelengthsTerminated ||
+        vertex->mlHeroActiveWavelengthCount <= 1u) return false;
+    const float hero = vertex->mlHeroLaneThroughput[0].c[0];
+    const float pdf = vertex->mlHeroLaneWaveLengthPdf[0];
+    vertex->mlHeroLaneThroughput[0] *= (float)n;
+    vertex->mlHeroLaneWaveLengthPdf[0] = pdf / (float)n;
+    for (u_int lane = 1u; lane < n; ++lane) {
+        vertex->mlHeroLaneThroughput[lane] = Spectrum(0.f);
+        vertex->mlHeroLaneWaveLengthPdf[lane] = 0.f;
+    }
+    vertex->mlHeroSecondaryWavelengthsTerminated = true;
+    vertex->mlHeroActiveWavelengthCount = 1u;
+    vertex->mlHeroTerminationHeroLambda = vertex->mlHeroLaneWaveLength[0];
+    vertex->mlHeroTerminationLaneSelectionPdf = 1.f / (float)n;
+    vertex->mlHeroTerminationWavelengthPdf = pdf;
+    vertex->mlHeroTerminationCurrentScale = (float)n;
+    // These describe the supported packet after companion TX directions were
+    // excluded. They are not a counterfactual evaluation of those directions.
+    vertex->mlHeroTerminationHeroScalar = hero;
+    vertex->mlHeroTerminationPacketAverage = hero / (float)n;
+    vertex->mlHeroTerminationBrightnessRatio = hero > 1e-20f ? (float)n : 0.f;
+    vertex->mlHero15buReferenceThroughput = (double)hero;
+    return true;
+}
+static std::atomic<unsigned long long> mlHero15evEvents[2], mlHero15evRejected[2],
+    mlHero15evCalls[2], mlHero15evCollapses[2];
+static std::atomic<unsigned long long> mlHero15evConnections(0ull);
+
 static void MLHeroInitLaneThroughput(PathVertexVM *vertex, const Spectrum &initial) {
+	vertex->mlHeroRREtaValid15fs = true;
+    for (u_int i15fs=0; i15fs<8u; ++i15fs) vertex->mlHeroRREtaScale15fs[i15fs]=1.;
+	vertex->mlHeroSpectralGlassHistory = false;
 	vertex->mlHeroLaneCount = Clamp(GetMLHeroWavelengthCount(), 1u, 8u);
 	for (u_int lane = 0; lane < vertex->mlHeroLaneCount; ++lane) {
 		vertex->mlHeroLaneThroughput[lane] = initial;
@@ -1568,11 +2345,17 @@ static void MLHeroInitLaneThroughput(PathVertexVM *vertex, const Spectrum &initi
 			(1.f / (400.f * sampleWeight15bh)) : 0.f;
 		vertex->mlHeroLaneGlassEventPdfProduct[lane] = 1.0;
 		vertex->mlHeroLaneDiracSupportPdfProduct[lane] = 1.0;
+		vertex->mlHeroLaneRoughPathLogPdf[lane] = 0.0;
+		vertex->mlHeroLaneRoughPathLogEstimator[lane] = 0.0;
+		vertex->mlHeroLaneRoughActiveLogMultiplier[lane] = 0.0;
 	}
 	for (u_int lane = vertex->mlHeroLaneCount; lane < 8u; ++lane) {
 		vertex->mlHeroLaneWaveLengthPdf[lane] = 0.f;
 		vertex->mlHeroLaneGlassEventPdfProduct[lane] = 0.0;
 		vertex->mlHeroLaneDiracSupportPdfProduct[lane] = 0.0;
+		vertex->mlHeroLaneRoughPathLogPdf[lane] = -INFINITY;
+		vertex->mlHeroLaneRoughPathLogEstimator[lane] = -INFINITY;
+		vertex->mlHeroLaneRoughActiveLogMultiplier[lane] = -INFINITY;
 	}
 	vertex->mlHeroSecondaryWavelengthsTerminated = false;
 	vertex->mlHeroActiveWavelengthCount = vertex->mlHeroLaneCount;
@@ -1584,6 +2367,7 @@ static void MLHeroInitLaneThroughput(PathVertexVM *vertex, const Spectrum &initi
 	vertex->mlHeroTerminationWavelengthPdf = 0.f;
 	vertex->mlHeroTerminationCurrentScale = 0.f;
 	vertex->mlHero15buReferenceThroughput = 0.0;
+	vertex->mlHeroTraceCount15ge = 0u;
 	vertex->mlHeroDebugTracked = false;
 	vertex->mlHeroDebugLoggedBounces = 0u;
 }
@@ -1597,6 +2381,9 @@ static void MLHeroInitLaneThroughput(PathVertexVM *vertex, const Spectrum &initi
 // accidentally re-introduces color into a wavelength lane.
 static void MLHeroInitSpectralLightLaneThroughput(PathVertexVM *vertex,
 		const Spectrum &rawEmit, const float lightEmitPdfW) {
+    vertex->mlHeroRREtaValid15fs = true;
+    for (u_int i15fs=0; i15fs<8u; ++i15fs) vertex->mlHeroRREtaScale15fs[i15fs]=1.;
+	vertex->mlHeroSpectralGlassHistory = false;
 	vertex->mlHeroLaneCount = Clamp(GetMLHeroWavelengthCount(), 1u, 8u);
 
 	for (u_int lane = 0; lane < vertex->mlHeroLaneCount; ++lane) {
@@ -1611,11 +2398,17 @@ static void MLHeroInitSpectralLightLaneThroughput(PathVertexVM *vertex,
 			(1.f / (400.f * sampleWeight)) : 0.f;
 		vertex->mlHeroLaneGlassEventPdfProduct[lane] = 1.0;
 		vertex->mlHeroLaneDiracSupportPdfProduct[lane] = 1.0;
+		vertex->mlHeroLaneRoughPathLogPdf[lane] = 0.0;
+		vertex->mlHeroLaneRoughPathLogEstimator[lane] = 0.0;
+		vertex->mlHeroLaneRoughActiveLogMultiplier[lane] = 0.0;
 	}
 	for (u_int lane = vertex->mlHeroLaneCount; lane < 8u; ++lane) {
 		vertex->mlHeroLaneWaveLengthPdf[lane] = 0.f;
 		vertex->mlHeroLaneGlassEventPdfProduct[lane] = 0.0;
 		vertex->mlHeroLaneDiracSupportPdfProduct[lane] = 0.0;
+		vertex->mlHeroLaneRoughPathLogPdf[lane] = -INFINITY;
+		vertex->mlHeroLaneRoughPathLogEstimator[lane] = -INFINITY;
+		vertex->mlHeroLaneRoughActiveLogMultiplier[lane] = -INFINITY;
 	}
 	vertex->mlHeroSecondaryWavelengthsTerminated = false;
 	vertex->mlHeroActiveWavelengthCount = vertex->mlHeroLaneCount;
@@ -1628,6 +2421,7 @@ static void MLHeroInitSpectralLightLaneThroughput(PathVertexVM *vertex,
 	vertex->mlHeroTerminationCurrentScale = 0.f;
 	vertex->mlHero15buReferenceThroughput = 0.0;
 
+	vertex->mlHeroTraceCount15ge = 0u;
 	vertex->mlHeroDebugTracked = false;
 	vertex->mlHeroDebugLoggedBounces = 0u;
 }
@@ -1719,13 +2513,163 @@ static inline float MLHeroGlossy2ReflSampleNonNegative380_780(
 // Coating, Schlick/Fresnel support and residual transport stay unchanged.
 static inline float MLHeroGlossy2BasisCompensatedSample15cp(
 		const Spectrum &kd, const float waveLength) {
-	return MLHeroMatteBasisCompensatedSample15cj(kd, waveLength);
+    return MLHeroUnitReflectance15fx(MLHeroMatteBasisCompensatedSample15cj(
+        kd.Clamp(0.f,1.f), waveLength));
+}
+
+// Actual Kd only. The transport scalar is multiplied afterwards, without a cap.
+static float MLHeroKdReflectance15fx(const Spectrum &kdInput, const float lambda,
+        const bool compensation) {
+    const Spectrum kd=kdInput.Clamp(0.f,1.f);
+    if (kd.c[0]==kd.c[1] && kd.c[1]==kd.c[2]) return kd.c[0];
+    if (compensation)
+        return MLHeroUnitReflectance15fx(MLHeroMatteBasisCompensatedSample15cj(kd,lambda));
+    const RGBReflSPD spd(RGBColor(kd.c[0],kd.c[1],kd.c[2]));
+    return MLHeroUnitReflectance15fx(MLHeroRGBReflSample380_780(spd,lambda));
 }
 
 static bool MLHeroIsScalarSpectrum(const Spectrum &s, const float eps = 1e-6f) {
 	const float m = Max(1.f, Max(fabsf(s.c[0]), Max(fabsf(s.c[1]), fabsf(s.c[2]))));
 	return (fabsf(s.c[0] - s.c[1]) <= eps * m) && (fabsf(s.c[0] - s.c[2]) <= eps * m);
 }
+// 15fd BEGIN diagnostic-only
+static std::atomic<unsigned long long> mlHero15fdEvents[6], mlHero15fdRawRGB[6],
+    mlHero15fdIntroduced[6], mlHero15fdInherited[6], mlHero15fdWeakOnly[6],
+    mlHero15fdFits[6], mlHero15fdRejected[6], mlHero15fdDetails[6];
+static const char *MLHeroCase15fd(u_int c) {
+    static const char *names[6] = {"EYE_REFLECT", "EYE_TRANSMIT", "LIGHT_REFLECT",
+        "LIGHT_TRANSMIT", "EYE_MIRROR", "LIGHT_MIRROR"};
+    return names[c];
+}
+static void MLHeroReset15fd() {
+    for (u_int c = 0u; c < 6u; ++c) {
+        mlHero15fdEvents[c].store(0ull, std::memory_order_relaxed);
+        mlHero15fdRawRGB[c].store(0ull, std::memory_order_relaxed);
+        mlHero15fdIntroduced[c].store(0ull, std::memory_order_relaxed);
+        mlHero15fdInherited[c].store(0ull, std::memory_order_relaxed);
+        mlHero15fdWeakOnly[c].store(0ull, std::memory_order_relaxed);
+        mlHero15fdFits[c].store(0ull, std::memory_order_relaxed);
+        mlHero15fdRejected[c].store(0ull, std::memory_order_relaxed);
+        mlHero15fdDetails[c].store(0ull, std::memory_order_relaxed);
+    }
+}
+static bool MLHeroFiniteNonnegative15fd(const Spectrum &v) {
+    for (u_int c = 0u; c < 3u; ++c)
+        if (!std::isfinite(v.c[c]) || v.c[c] < 0.f) return false;
+    return true;
+}
+// Validate a common scalar multiplier. Also used by the 15fx Matte Kd split.
+static bool MLHeroFit15fd(const Spectrum &color, const Spectrum &sample,
+        double *factor, double *relativeError) {
+    *factor = 0.0; *relativeError = 0.0;
+    if (!MLHeroFiniteNonnegative15fd(color) || !MLHeroFiniteNonnegative15fd(sample))
+        return false;
+    double denominator = 0.0, numerator = 0.0, scale = 0.0;
+    for (u_int c = 0u; c < 3u; ++c) {
+        denominator += double(color.c[c]) * color.c[c];
+        numerator += double(color.c[c]) * sample.c[c];
+        scale = std::max(scale, double(sample.c[c]));
+    }
+    if (denominator <= 0.0) return false;
+    *factor = numerator / denominator;
+    if (!std::isfinite(*factor) || *factor < 0.0) return false;
+    for (u_int c = 0u; c < 3u; ++c)
+        *relativeError = std::max(*relativeError,
+            std::fabs(double(color.c[c]) * *factor - sample.c[c]) / std::max(1e-30, scale));
+    return std::isfinite(*relativeError) && *relativeError <= 1e-5;
+}
+static float MLHeroUnitColor15fd(const Spectrum &rgb, float lambda, bool compensation) {
+    if (MLHeroStrictNeutral15fb(rgb)) return Clamp(rgb.c[0], 0.f, 1.f);
+    const RGBReflSPD spd(RGBColor(rgb.c[0], rgb.c[1], rgb.c[2]));
+    const float value = compensation ? MLHeroGenericBasisCompensatedSample15cn(rgb, lambda) :
+        MLHeroRGBReflSample380_780(spd, lambda);
+    return Clamp(value, 0.f, 1.f);
+}
+static void MLHeroAuditBounce15fd(const PathVertexVM &v, BSDFEvent event,
+        const Spectrum &sample, float pdf, float rr, const Spectrum before[8],
+        bool generic, bool explicitMetal, bool compensation) {
+    if (!MLHeroCurrentDiagnosticsEnabled15cq()) return;
+    const u_int type = v.bsdf.GetMaterialType();
+    if (type != MATTETRANSLUCENT && type != MIRROR) return;
+    const u_int n = v.mlHeroLaneCount;
+    if (n == 0u || n > 8u) return;
+    const bool transmit = (event & TRANSMIT) != 0;
+    const u_int c = type == MIRROR ? (v.bsdf.hitPoint.fromLight ? 5u : 4u) :
+        (v.bsdf.hitPoint.fromLight ? 2u : 0u) + (transmit ? 1u : 0u);
+    const unsigned long long ticket = mlHero15fdEvents[c].fetch_add(1ull, std::memory_order_relaxed);
+    if (!MLHeroIsScalarSpectrum(sample)) mlHero15fdRawRGB[c].fetch_add(1ull, std::memory_order_relaxed);
+    bool introduced = false, inherited = false, weakOnly = false;
+    for (u_int i = 0u; i < n; ++i) {
+        const bool b = MLHeroIsScalarSpectrum(before[i]);
+        const bool a = MLHeroIsScalarSpectrum(v.mlHeroLaneThroughput[i]);
+        introduced |= b && !a; inherited |= !b;
+        weakOnly |= a && !MLHeroStrictNeutral15fb(v.mlHeroLaneThroughput[i]);
+    }
+    if (introduced) mlHero15fdIntroduced[c].fetch_add(1ull, std::memory_order_relaxed);
+    if (inherited) mlHero15fdInherited[c].fetch_add(1ull, std::memory_order_relaxed);
+    if (weakOnly) mlHero15fdWeakOnly[c].fetch_add(1ull, std::memory_order_relaxed);
+    if (ticket >= 12ull) return;
+    Spectrum kr, kt, selected;
+    bool inputs = type == MATTETRANSLUCENT && v.bsdf.GetMLHeroMatteTranslucentInputs15fd(&kr, &kt);
+    if (inputs) inputs = MLHeroFiniteNonnegative15fd(kr) && MLHeroFiniteNonnegative15fd(kt);
+    if (inputs) selected = transmit ? kt * (Spectrum(1.f) - kr) : kr;
+    double factor = 0.0, error = 0.0;
+    const bool fit = inputs && MLHeroFit15fd(selected, sample, &factor, &error);
+    if (type == MATTETRANSLUCENT) {
+        if (fit) mlHero15fdFits[c].fetch_add(1ull, std::memory_order_relaxed);
+        else mlHero15fdRejected[c].fetch_add(1ull, std::memory_order_relaxed);
+    }
+    std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
+    FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+    if (!f) return;
+    mlHero15fdDetails[c].fetch_add(1ull, std::memory_order_relaxed);
+    fprintf(f, "phase15fd BOUNCE_DETAIL case=%s ticket=%llu materialID=%u depth=%u event=%u lanes=%u active=%u genericSPD=%u explicitMetal2=%u rawRGB=%u introducedRGB=%u inheritedRGB=%u weakScalarOnly=%u pdf=%.9g rr=%.9g sampleRGB=(%.9g,%.9g,%.9g) inputsOK=%u fitOK=%u factor=%.12g fitRelativeError=%.12g candidateApplied=0\n",
+        MLHeroCase15fd(c), ticket, v.bsdf.GetMaterialID(), v.depth, u_int(event), n,
+        v.mlHeroActiveWavelengthCount, generic ? 1u : 0u, explicitMetal ? 1u : 0u,
+        MLHeroIsScalarSpectrum(sample) ? 0u : 1u, introduced ? 1u : 0u,
+        inherited ? 1u : 0u, weakOnly ? 1u : 0u, pdf, rr,
+        sample.c[0], sample.c[1], sample.c[2], inputs ? 1u : 0u, fit ? 1u : 0u, factor, error);
+    if (inputs) fprintf(f, "phase15fd INPUTS case=%s Kr=(%.9g,%.9g,%.9g) Kt=(%.9g,%.9g,%.9g) selectedRGB=(%.9g,%.9g,%.9g) compensation=%u spectralUnitClamped=1\n",
+        MLHeroCase15fd(c), kr.c[0], kr.c[1], kr.c[2], kt.c[0], kt.c[1], kt.c[2],
+        selected.c[0], selected.c[1], selected.c[2], compensation ? 1u : 0u);
+    const RGBReflSPD wholeSPD(RGBColor(sample.c[0], sample.c[1], sample.c[2]));
+    for (u_int i = 0u; i < n; ++i) {
+        const float lambda = v.mlHeroLaneWaveLength[i];
+        double candidate = 0.0, productUpsample = 0.0;
+        bool candidateOK = fit && std::isfinite(lambda) && lambda >= 380.f && lambda <= 780.f;
+        if (candidateOK) {
+            const float r = MLHeroUnitColor15fd(kr, lambda, compensation);
+            const float t = MLHeroUnitColor15fd(kt, lambda, compensation);
+            candidate = factor * (transmit ? t * (1.f - r) : r);
+            productUpsample = factor * MLHeroUnitColor15fd(selected, lambda, compensation);
+            candidateOK = std::isfinite(candidate) && candidate >= 0.0;
+        }
+        float observedMultiplier = 0.f;
+        if (generic) observedMultiplier = compensation ? MLHeroGenericBasisCompensatedSample15cn(sample, lambda) :
+            MLHeroRGBReflSample380_780(wholeSPD, lambda);
+        else if (MLHeroIsScalarSpectrum(sample)) observedMultiplier = (sample.c[0] + sample.c[1] + sample.c[2]) / 3.f;
+        const Spectrum nativeMultiplier = generic || MLHeroIsScalarSpectrum(sample) ? Spectrum(observedMultiplier) : sample;
+        double closure = 0.0;
+        if (std::isfinite(rr) && rr > 0.f) for (u_int k = 0u; k < 3u; ++k)
+            closure = std::max(closure, std::fabs(double(before[i].c[k] / rr * nativeMultiplier.c[k]) - v.mlHeroLaneThroughput[i].c[k]));
+        const Spectrum &after = v.mlHeroLaneThroughput[i];
+        fprintf(f, "phase15fd LANE case=%s lane=%u lambda=%.9g before=(%.9g,%.9g,%.9g) after=(%.9g,%.9g,%.9g) baseline15fdClosureAbs=%.12g candidateOK=%u separateSpectralMultiplier=%.12g productRGBUpsampleMultiplier=%.12g candidateNeverApplied=1\n",
+            MLHeroCase15fd(c), i, lambda, before[i].c[0], before[i].c[1], before[i].c[2],
+            after.c[0], after.c[1], after.c[2], closure, candidateOK ? 1u : 0u, candidate, productUpsample);
+    }
+    fclose(f);
+}
+static void MLHeroSummary15fd(FILE *f) {
+    for (u_int c = 0u; c < 6u; ++c)
+        fprintf(f, "phase15fd BOUNCE_SUMMARY case=%s events=%llu rawRGB=%llu introducedRGB=%llu inheritedRGB=%llu weakScalarOnly=%llu boundedFits=%llu boundedFitRejected=%llu detailsWritten=%llu physicsChanged=0\n",
+            MLHeroCase15fd(c), mlHero15fdEvents[c].load(std::memory_order_relaxed),
+            mlHero15fdRawRGB[c].load(std::memory_order_relaxed), mlHero15fdIntroduced[c].load(std::memory_order_relaxed),
+            mlHero15fdInherited[c].load(std::memory_order_relaxed), mlHero15fdWeakOnly[c].load(std::memory_order_relaxed),
+            mlHero15fdFits[c].load(std::memory_order_relaxed), mlHero15fdRejected[c].load(std::memory_order_relaxed),
+            mlHero15fdDetails[c].load(std::memory_order_relaxed));
+}
+// 15fd END diagnostic-only
+
 
 // ML HERO phase 15df: Glass packet branches used to collapse a chromatic RGB
 // BSDF multiplier with Spectrum::Filter()/RGB average before applying it to
@@ -1740,6 +2684,183 @@ static inline float MLHeroGlassLaneColorSample15df(
 		return (rgb.c[0] + rgb.c[1] + rgb.c[2]) / 3.f;
 
 	return MLHeroGenericBasisCompensatedSample15cn(rgb, waveLength);
+}
+
+// 15ff BEGIN
+// Test calibration for MatteTranslucent ONLY. Reference: the existing HERO
+// white RGB illuminant, 380..780 nm, CIE + DefaultColorSystem, relative to the
+// same incident white RGB. Fixed offline coefficients, never fitted per path
+// or adapted to the current lamp. Signed unit-primary spectra are combined
+// first, then nonnegative-clamped; the material helper additionally clamps 1.
+// Exact gray still bypasses spectral reconstruction in TranslucentUnit15fe.
+static inline float MLHeroTranslucentBasisSample15ff(const Spectrum &rgb,
+        const float lambda) {
+    const float r = 0.92828033230552f * rgb.c[0] +
+        0.057298551042327f * rgb.c[1] + 0.015214109441961f * rgb.c[2];
+    const float g = 0.022022679206621f * rgb.c[0] +
+        0.96221704129375f * rgb.c[1] + 0.018368484576659f * rgb.c[2];
+    const float b = -0.0043974443528483f * rgb.c[0] -
+        0.020504057940599f * rgb.c[1] + 1.0229715165802f * rgb.c[2];
+    static const RGBReflSPD red(RGBColor(1.f, 0.f, 0.f));
+    static const RGBReflSPD green(RGBColor(0.f, 1.f, 0.f));
+    static const RGBReflSPD blue(RGBColor(0.f, 0.f, 1.f));
+    return Max(0.f, r * MLHeroRGBReflSample380_780(red, lambda) +
+        g * MLHeroRGBReflSample380_780(green, lambda) +
+        b * MLHeroRGBReflSample380_780(blue, lambda));
+}
+static std::atomic<unsigned long long> mlHero15ffDetails(0ull);
+static void MLHeroLogTranslucentBasis15ff(FILE *f, u_int materialID,
+        const Spectrum &kr, const Spectrum &kt, bool compensation);
+// 15ff END
+
+// 15fe BEGIN
+struct MLHeroTranslucent15fe {
+    Spectrum kr, kt;
+    std::unique_ptr<RGBReflSPD> rSPD, tSPD;
+    float wrapper = 0.f;
+    bool transmit = false, compensation = false, valid = false;
+};
+static std::atomic<unsigned long long> mlHero15feCalls[10], mlHero15feReject[10],
+    mlHero15feApplied[10], mlHero15feTickets[10];
+static void MLHeroReset15fe() {
+// 15ff BEGIN
+    mlHero15ffDetails.store(0ull, std::memory_order_relaxed);
+// 15ff END
+    for (u_int i = 0u; i < 10u; ++i) {
+        mlHero15feCalls[i].store(0ull, std::memory_order_relaxed);
+        mlHero15feReject[i].store(0ull, std::memory_order_relaxed);
+        mlHero15feApplied[i].store(0ull, std::memory_order_relaxed);
+        mlHero15feTickets[i].store(0ull, std::memory_order_relaxed);
+    }
+}
+static bool MLHeroPrepareTranslucent15fe(const BSDF &bsdf, const Vector &dir,
+        const BSDFEvent event, bool sampled, bool compensation, u_int stage,
+        MLHeroTranslucent15fe *out) {
+    if (!out || bsdf.GetMaterialType() != MATTETRANSLUCENT) return false;
+    out->valid = false;
+    out->rSPD.reset(); out->tSPD.reset();
+    out->transmit = (event & TRANSMIT) != 0;
+    out->compensation = compensation;
+    const u_int index = stage * 2u + (out->transmit ? 1u : 0u);
+    bool ok = bsdf.GetMLHeroMatteTranslucentFactors15fe(dir, event, sampled,
+        &out->kr, &out->kt, &out->wrapper) &&
+        MLHeroFiniteNonnegative15fd(out->kr) && MLHeroFiniteNonnegative15fd(out->kt) &&
+        std::isfinite(out->wrapper) && out->wrapper >= 0.f;
+    // A native RGB-black transmission lobe can acquire spectral support when
+    // BOTH inputs are colored. Do not use a proposal with zero support there.
+    // Retain the entire existing material route until its proposal is extended.
+    if (ok) {
+        const Spectrum nativeTransmission = out->kt * (Spectrum(1.f) - out->kr);
+        const bool fullyReflecting = MLHeroStrictNeutral15fb(out->kr) && out->kr.c[0] == 1.f;
+        if (nativeTransmission.Black() && !out->kt.Black() && !fullyReflecting) ok = false;
+    }
+    if (ok) {
+        if (!MLHeroStrictNeutral15fb(out->kr))
+            out->rSPD.reset(new RGBReflSPD(RGBColor(out->kr.c[0], out->kr.c[1], out->kr.c[2])));
+        if (!MLHeroStrictNeutral15fb(out->kt))
+            out->tSPD.reset(new RGBReflSPD(RGBColor(out->kt.c[0], out->kt.c[1], out->kt.c[2])));
+        out->valid = true;
+    }
+    if (MLHeroCurrentDiagnosticsEnabled15cq()) {
+        mlHero15feCalls[index].fetch_add(1ull, std::memory_order_relaxed);
+        if (!ok) mlHero15feReject[index].fetch_add(1ull, std::memory_order_relaxed);
+        if (mlHero15feTickets[index].fetch_add(1ull, std::memory_order_relaxed) < 12ull) {
+            std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
+            FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+            if (f) {
+                fprintf(f, "phase15fe TRANSLUCENT_FACTORS stage=%u transmit=%u materialID=%u fromLight=%u sampleMultiplier=%u helperOK=%u wrapper=%.9g Kr=(%.9g,%.9g,%.9g) Kt=(%.9g,%.9g,%.9g) compensation=%u applicationCount=SUMMARY_only\n",
+                    stage, out->transmit ? 1u : 0u, bsdf.GetMaterialID(), bsdf.hitPoint.fromLight ? 1u : 0u,
+                    sampled ? 1u : 0u, ok ? 1u : 0u, out->wrapper,
+                    out->kr.c[0], out->kr.c[1], out->kr.c[2], out->kt.c[0], out->kt.c[1], out->kt.c[2], compensation ? 1u : 0u);
+// 15ff BEGIN
+                if (ok && mlHero15ffDetails.fetch_add(1ull, std::memory_order_relaxed) < 4ull)
+                    MLHeroLogTranslucentBasis15ff(f, bsdf.GetMaterialID(), out->kr, out->kt, compensation);
+// 15ff END
+                fclose(f);
+            }
+        }
+    }
+    return ok;
+}
+static float MLHeroTranslucentUnit15fe(const Spectrum &rgb, const RGBReflSPD *spd,
+        float lambda, bool compensation) {
+    if (!spd) return Clamp(rgb.c[0], 0.f, 1.f);
+    const float x = compensation ? MLHeroTranslucentBasisSample15ff(rgb, lambda) :
+        MLHeroRGBReflSample380_780(*spd, lambda);
+    return Clamp(x, 0.f, 1.f);
+}
+static bool MLHeroTranslucentValue15fe(const MLHeroTranslucent15fe &p,
+        float lambda, Spectrum *value) {
+    if (!p.valid || !value || !std::isfinite(lambda) || lambda < 380.f || lambda > 780.f)
+        return false;
+    const float r = MLHeroTranslucentUnit15fe(p.kr, p.rSPD.get(), lambda, p.compensation);
+    const float t = p.transmit ? MLHeroTranslucentUnit15fe(p.kt, p.tSPD.get(), lambda, p.compensation) : 0.f;
+    const float x = p.wrapper * (p.transmit ? t * (1.f - r) : r);
+    if (!std::isfinite(x) || x < 0.f) return false;
+    *value = Spectrum(x);
+    return true;
+}
+static void MLHeroApplied15fe(u_int stage, BSDFEvent event) {
+    if (MLHeroCurrentDiagnosticsEnabled15cq())
+        mlHero15feApplied[stage * 2u + ((event & TRANSMIT) ? 1u : 0u)].fetch_add(1ull, std::memory_order_relaxed);
+}
+// New connection permission: supported endpoints only and an exact clean packet.
+static bool MLHeroTranslucentPacket15fe(const PathVertexVM &eye, const PathVertexVM &light,
+        const Spectrum &connection) {
+    const u_int et = eye.bsdf.GetMaterialType(), lt = light.bsdf.GetMaterialType();
+    if ((et != MATTE && et != MATTETRANSLUCENT) || (lt != MATTE && lt != MATTETRANSLUCENT) ||
+            (et != MATTETRANSLUCENT && lt != MATTETRANSLUCENT) || !MLHeroStrictNeutral15fb(connection)) return false;
+    const u_int n = eye.mlHeroLaneCount;
+    if ((n != 2u && n != 4u && n != 8u) || n != light.mlHeroLaneCount) return false;
+    for (u_int i = 0u; i < n; ++i) {
+        const float l = eye.mlHeroLaneWaveLength[i], w = eye.mlHeroLaneSampleWeight[i];
+        if (!std::isfinite(l) || l < 380.f || l > 780.f || l != light.mlHeroLaneWaveLength[i] ||
+                !std::isfinite(w) || w < 0.f || w != light.mlHeroLaneSampleWeight[i] ||
+                !MLHeroStrictNeutral15fb(eye.mlHeroLaneThroughput[i]) ||
+                !MLHeroStrictNeutral15fb(light.mlHeroLaneThroughput[i])) return false;
+    }
+    return true;
+}
+static void MLHeroSummary15fe(FILE *f) {
+    for (u_int stage = 0u; stage < 5u; ++stage) for (u_int tx = 0u; tx < 2u; ++tx) {
+        const u_int i = stage * 2u + tx;
+        fprintf(f, "phase15fe TRANSLUCENT_SUMMARY stage=%u transmit=%u preparations=%llu helperRejected=%llu applied=%llu stageNames=eyeBounce,lightBounce,DLS,ConnectVertices,ConnectToEye countsNotEnergy=1\n",
+            stage, tx, mlHero15feCalls[i].load(std::memory_order_relaxed),
+            mlHero15feReject[i].load(std::memory_order_relaxed), mlHero15feApplied[i].load(std::memory_order_relaxed));
+    }
+}
+// 15fe END
+
+// 15et stages: eye bounce, light bounce, DLS, vertex connection, camera connection.
+static std::atomic<unsigned long long> mlHero15etCalls[5];
+static std::atomic<unsigned long long> mlHero15etRejected[5];
+static std::atomic<unsigned long long> mlHero15etLogTickets[5];
+static std::atomic<unsigned long long> mlHero15etApplied[5];
+
+static bool MLHeroRoughValue15et(const BSDF &bsdf, const Vector &dir,
+        const BSDFEvent event, const float lambda, Spectrum *value, const u_int stage) {
+    if (bsdf.GetMaterialType() != ROUGHGLASS || !value) return false;
+    Spectrum rgb;
+    const bool valid = bsdf.EvaluateMLHeroRoughGlassAtWaveLength(dir, event, lambda, &rgb);
+    const float scalar = valid ? MLHeroGlassLaneColorSample15df(rgb, lambda) : 0.f;
+    const bool ok = valid && std::isfinite(scalar) && scalar >= 0.f;
+    if (ok) *value = Spectrum(scalar);
+    mlHero15etCalls[stage].fetch_add(1ull, std::memory_order_relaxed);
+    if (!ok) mlHero15etRejected[stage].fetch_add(1ull, std::memory_order_relaxed);
+    if (MLHeroCurrentDiagnosticsEnabled15cq() &&
+            mlHero15etLogTickets[stage].fetch_add(1ull, std::memory_order_relaxed) < 64ull) {
+        std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
+        FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+        if (f) {
+            fprintf(f, "phase15et ROUGHGLASS_VALUE stage=%u materialID=%u name=\"%s\" fromLight=%u event=%u dispersion=%u lambda=%.9g helperOK=%u rgb=(%.9g,%.9g,%.9g) spectral=%.9g\n",
+                stage, bsdf.GetMaterialID(), bsdf.GetMaterialName().c_str(),
+                bsdf.hitPoint.fromLight ? 1u : 0u, (u_int)event,
+                bsdf.HasMLHeroRoughGlassDispersion() ? 1u : 0u, lambda, ok ? 1u : 0u,
+                rgb.c[0], rgb.c[1], rgb.c[2], scalar);
+            fclose(f);
+        }
+    }
+    return ok;
 }
 
 // ML HERO phase 15al:
@@ -1957,6 +3078,45 @@ static Spectrum MLHeroIntegrateMatteReflectance15cf(const RGBReflSPD &spd,
 	}
 	return sum15cf;
 }
+
+// 15ff BEGIN diagnostic-only
+static void MLHeroLogTranslucentBasis15ff(FILE *f, u_int materialID,
+        const Spectrum &kr, const Spectrum &kt, bool compensation) {
+    const Spectrum inputs[2] = { kr, kt };
+    for (u_int input = 0u; input < 2u; ++input) {
+        const Spectrum &c = inputs[input];
+        const bool gray = c.c[0] == c.c[1] && c.c[1] == c.c[2];
+        const RGBReflSPD spd(RGBColor(c.c[0], c.c[1], c.c[2]));
+        Spectrum white(0.f), off(0.f), legacy(0.f), test(0.f);
+        for (u_int i = 0u; i <= 400u; ++i) {
+            const float lambda = 380.f + (float)i;
+            const float trap = (i == 0u || i == 400u) ? .5f : 1.f;
+            const float illumination = MLHeroRGBIllumSample380_780(RGBColor(1.f, 1.f, 1.f), lambda);
+            const Spectrum w = MLHeroCIENormalizedReflectanceEstimatorColor(lambda, 1.f) *
+                (illumination * trap / 400.f);
+            const float a = gray ? c.c[0] : MLHeroRGBReflSample380_780(spd, lambda);
+            const float b = gray ? c.c[0] : MLHeroGenericBasisCompensatedSample15cn(c, lambda);
+            const float t = MLHeroTranslucentUnit15fe(c, gray ? nullptr : &spd, lambda, true);
+            white += w;
+            off += w * Clamp(a, 0.f, 1.f);
+            legacy += w * Clamp(b, 0.f, 1.f);
+            test += w * t;
+        }
+        bool valid = true;
+        for (u_int j = 0u; j < 3u; ++j)
+            valid = valid && std::isfinite(white.c[j]) && white.c[j] > 0.f &&
+                std::isfinite(off.c[j]) && std::isfinite(legacy.c[j]) && std::isfinite(test.c[j]);
+        if (valid) for (u_int j = 0u; j < 3u; ++j) {
+            off.c[j] /= white.c[j]; legacy.c[j] /= white.c[j]; test.c[j] /= white.c[j];
+        }
+        fprintf(f, "phase15ff BASIS_WHITE_REFERENCE materialID=%u input=%s compensation=%u grayBypass=%u valid=%u target=(%.9g,%.9g,%.9g) OFF=(%.9g,%.9g,%.9g) LEGACY15fe=(%.9g,%.9g,%.9g) TEST15ff=(%.9g,%.9g,%.9g) live=%s reference=existing_HERO_white_relative_RGB singleCoefficientOnly=1 notFilmEnergy=1 noPathWrites=1\n",
+            materialID, input == 0u ? "Kr" : "Kt", compensation ? 1u : 0u, gray ? 1u : 0u, valid ? 1u : 0u,
+            c.c[0], c.c[1], c.c[2], off.c[0], off.c[1], off.c[2],
+            legacy.c[0], legacy.c[1], legacy.c[2], test.c[0], test.c[1], test.c[2],
+            compensation ? "TEST15ff" : "OFF");
+    }
+}
+// 15ff END diagnostic-only
 
 // ML HERO phase 15cg:
 // Decompose the same deterministic Matte reconstruction one stage earlier,
@@ -2315,6 +3475,70 @@ SampleResult &BiDirCPURenderThread::AddResult(vector<SampleResult> &sampleResult
 	return sampleResult;
 }
 
+// 15gd: top-32 spectral RoughGlass connection records. Observation only.
+// This shared selection is protected across BIDIR workers and dumped after join.
+struct MLHeroRoughLane15gd {
+    float lambda, weight, eyeTP, eyeBSDF, lightTP, lightBSDF, scalar;
+    float rgb[3];
+};
+struct MLHeroRoughCandidate15gd {
+    float peak, filmX, filmY, mis, geometry, dist2, eyePdf, eyeRevPdf, lightPdf, lightRevPdf;
+    float before[3], applied[3], eyeClassic[3], lightClassic[3], connectionScalar;
+    unsigned eyeDepth, lightDepth, eyeType, lightType, eyeTerm, lightTerm, laneCount;
+    MLHeroRoughLane15gd lanes[8];
+    unsigned eyeTraceCount15ge, lightTraceCount15ge;
+    PathVertexVM::MLHeroBounceTrace15ge eyeTrace15ge[12], lightTrace15ge[12];
+};
+static std::mutex mlHeroRoughTopMutex15gd;
+static std::vector<MLHeroRoughCandidate15gd> mlHeroRoughTop15gd;
+static unsigned long long mlHeroRoughObserved15gd = 0;
+static unsigned long long mlHeroRoughEligible15gd = 0;
+
+// Called from BIDIR StopLockLess after CPU worker threads have joined.
+void MLHeroFlushRoughTop15gd() {
+    std::lock_guard<std::mutex> lock(mlHeroRoughTopMutex15gd);
+    if (mlHeroRoughObserved15gd == 0) return;
+    std::sort(mlHeroRoughTop15gd.begin(), mlHeroRoughTop15gd.end(),
+        [](const MLHeroRoughCandidate15gd &a, const MLHeroRoughCandidate15gd &b) { return a.peak > b.peak; });
+    std::lock_guard<std::recursive_mutex> logLock(mlHeroDebugLogMutex);
+    FILE *f = MLHeroOpenCurrentLog15cq("a");
+    if (f) {
+        fprintf(f, "phase15gd ROUGH_TOP_SUMMARY observed=%llu threshold64=%llu selected=%u ranking=MAX_ABS_RGB_CONTRIBUTION source=CONNECT_SPECTRAL filmCoords=rendererFilm notFinalPixel=1\n",
+            mlHeroRoughObserved15gd, mlHeroRoughEligible15gd, (unsigned)mlHeroRoughTop15gd.size());
+        for (unsigned rank = 0; rank < mlHeroRoughTop15gd.size(); ++rank) {
+            const auto &r = mlHeroRoughTop15gd[rank];
+            fprintf(f, "phase15gd ROUGH_TOP rank=%u peak=%.9g filmX=%.9g filmY=%.9g eyeDepth=%u lightDepth=%u eyeType=%u lightType=%u eyeTerm=%u lightTerm=%u lanes=%u beforeDual=(%.9g,%.9g,%.9g) applied=(%.9g,%.9g,%.9g) MIS=%.9g geometry=%.9g dist2=%.9g eyePdfW=%.9g eyeRevPdfW=%.9g lightPdfW=%.9g lightRevPdfW=%.9g eyeClassic=(%.9g,%.9g,%.9g) lightClassic=(%.9g,%.9g,%.9g) connectionScalar=%.9g\n",
+                rank+1, r.peak, r.filmX, r.filmY, r.eyeDepth, r.lightDepth, r.eyeType, r.lightType, r.eyeTerm, r.lightTerm, r.laneCount,
+                r.before[0],r.before[1],r.before[2],r.applied[0],r.applied[1],r.applied[2],r.mis,r.geometry,r.dist2,
+                r.eyePdf,r.eyeRevPdf,r.lightPdf,r.lightRevPdf,r.eyeClassic[0],r.eyeClassic[1],r.eyeClassic[2],
+                r.lightClassic[0],r.lightClassic[1],r.lightClassic[2],r.connectionScalar);
+            // 15gg records angles on the *already selected* top-contributing
+            // BIDIR connections, not on arbitrarily early sample events.
+            for (unsigned side=0; side<2; ++side) {
+                const unsigned count = side ? r.lightTraceCount15ge : r.eyeTraceCount15ge;
+                const auto *trace = side ? r.lightTrace15ge : r.eyeTrace15ge;
+                for (unsigned i=0; i<count; ++i) {
+                    const auto &b=trace[i];
+                    fprintf(f,"phase15ge BOUNCE_TRACE rank=%u side=%s index=%u depth=%u materialType=%u event=%u active=%u collapsed=%u pdfW=%.9g rr=%.9g cosine=%.9g\n", rank+1,side?"LIGHT":"EYE",i,b.depth,b.materialType,b.event,b.active,b.collapsed,b.pdf,b.rr,b.cosine);
+                    if (b.materialType == (u_int)ROUGHGLASS)
+                        fprintf(f,"phase15gg ROUGH_ANGLE rank=%u side=%s index=%u depth=%u event=%u incidentShadeCos=%.9g exitShadeCos=%.9g incidentGeomCos=%.9g exitGeomCos=%.9g pdfW=%.9g rr=%.9g throughputRatioLane0=%.9g rawConnectionPeak=%.9g diagnosticOnly=1\n",
+                            rank+1,side?"LIGHT":"EYE",i,b.depth,b.event,b.incidentShadeCos,b.exitShadeCos,b.incidentGeomCos,b.exitGeomCos,b.pdf,b.rr,b.ratio[0],r.peak);
+                    for (unsigned lane=0; lane<8; ++lane)
+                        fprintf(f,"phase15ge BOUNCE_LANE rank=%u side=%s index=%u lane=%u before=%.9g after=%.9g ratio=%.9g\n",rank+1,side?"LIGHT":"EYE",i,lane,b.pre[lane],b.post[lane],b.ratio[lane]);
+                }
+            }
+            for (unsigned lane = 0; lane < r.laneCount; ++lane) {
+                const auto &l = r.lanes[lane];
+                fprintf(f, "phase15gd ROUGH_TOP_LANE rank=%u lane=%u lambda=%.9g sampleWeight=%.9g eyeTP=%.9g eyeBSDF=%.9g lightTP=%.9g lightBSDF=%.9g pathScalar=%.9g avgRGB=(%.9g,%.9g,%.9g)\n",
+                    rank+1, lane, l.lambda,l.weight,l.eyeTP,l.eyeBSDF,l.lightTP,l.lightBSDF,l.scalar,l.rgb[0],l.rgb[1],l.rgb[2]);
+            }
+        }
+        fclose(f);
+    }
+    mlHeroRoughTop15gd.clear();
+    mlHeroRoughObserved15gd = mlHeroRoughEligible15gd = 0;
+}
+
 void BiDirCPURenderThread::ConnectVertices(const float time,
 		const PathVertexVM &eyeVertex, const PathVertexVM &lightVertex,
 		SampleResult &eyeSampleResult, const float u0) const {
@@ -2389,14 +3613,25 @@ void BiDirCPURenderThread::ConnectVertices(const float time,
 						mlHero15bhVisibleNeitherTerminated.fetch_add(1ull, std::memory_order_relaxed);
 				}
 
-				if (eyeVertex.depth >= engine->rrDepth) {
+
+    const float rawEyeForward15fn=eyeBsdfPdfW, rawEyeReverse15fn=eyeBsdfRevPdfW;
+    const float rawLightForward15fn=lightBsdfPdfW, rawLightReverse15fn=lightBsdfRevPdfW;
+    if (mlHeroState15fh.enabled) MLHeroRRAudit15fk(2,eyeVertex.depth,eyeVertex.bsdf.GetMaterialType(),eyeEvent,eyeBsdfEval,eyeBsdfPdfW,eyeBsdfRevPdfW,engine->rrImportanceCap,RenderEngine::RussianRouletteProb(eyeBsdfEval,engine->rrImportanceCap),((engine->GetType() != slg::BIDIRCPU) && (eyeVertex.depth >= engine->rrDepth)),((engine->GetType() != slg::BIDIRCPU) && (eyeVertex.depth >= engine->rrDepth)),false);
+
+    // 15fo: BIDIRCPU raw local MIS PDF policy 0.
+				if ((engine->GetType() != slg::BIDIRCPU) && (eyeVertex.depth >= engine->rrDepth)) {
 					// Russian Roulette
 					const float prob = RenderEngine::RussianRouletteProb(eyeBsdfEval, engine->rrImportanceCap);
 					eyeBsdfPdfW *= prob;
 					eyeBsdfRevPdfW *= prob;
 				}
 
-				if (lightVertex.depth >= engine->rrDepth) {
+
+    if (mlHeroState15fh.enabled) MLHeroRRAudit15fk(3,lightVertex.depth,lightVertex.bsdf.GetMaterialType(),lightEvent,lightBsdfEval,lightBsdfPdfW,lightBsdfRevPdfW,engine->rrImportanceCap,RenderEngine::RussianRouletteProb(lightBsdfEval,engine->rrImportanceCap),((engine->GetType() != slg::BIDIRCPU) && (lightVertex.depth >= engine->rrDepth)),((engine->GetType() != slg::BIDIRCPU) && (lightVertex.depth >= engine->rrDepth)),false);
+			
+
+    // 15fo: BIDIRCPU raw local MIS PDF policy 1.
+	if ((engine->GetType() != slg::BIDIRCPU) && (lightVertex.depth >= engine->rrDepth)) {
 					// Russian Roulette
 					const float prob = RenderEngine::RussianRouletteProb(lightBsdfEval, engine->rrImportanceCap);
 					lightBsdfPdfW *= prob;
@@ -2414,6 +3649,14 @@ void BiDirCPURenderThread::ConnectVertices(const float time,
 					(misVmWeightFactor + eyeVertex.dVCM + eyeVertex.dVC * MIS(eyeBsdfRevPdfW));
 
 				const float misWeight = 1.f / (lightWeight + 1.f + eyeWeight);
+                if(mlHeroState15fh.enabled) MLHeroCandidate15fn(0u,eyeVertex.depth,lightVertex.depth,
+                    eyeVertex.bsdf.GetMaterialType(),misWeight,
+                    MLHeroConnectionWeight15fn(PdfWtoA(rawEyeForward15fn,p2pDistance,cosThetaAtLight),
+                        PdfWtoA(rawLightForward15fn,p2pDistance,cosThetaAtCamera),rawEyeReverse15fn,
+                        rawLightReverse15fn,eyeVertex.dVCM,eyeVertex.dVC,lightVertex.dVCM,lightVertex.dVC,misVmWeightFactor),
+                    rawEyeForward15fn,rawEyeReverse15fn,
+                    !eyeVertex.bsdf.IsVolume() && !lightVertex.bsdf.IsVolume() && !eyeTerm15bi && !lightTerm15bi && misVmWeightFactor==0.f);
+
 
 				// ML HERO phase 15bo: if a stored eye/light subpath already crossed
 				// a perfect dispersive HERO-only event, test an upper-bound MIS
@@ -2717,6 +3960,13 @@ void BiDirCPURenderThread::ConnectVertices(const float time,
 				// Activate the spectral CIE ConnectVertices contribution ONLY when the
 				// packet is clean and every factor can be evaluated as a scalar lane.
 				// Otherwise fall back to the original classic RGB contribution.
+// 15fa BEGIN diagnostic-only
+                const bool auditConnection15fa = MLHeroCurrentDiagnosticsEnabled15cq();
+                u_int failureMask15fa = 0u, failedLane15fa = 8u, checkedLanes15fa = 0u;
+                Spectrum failedEyeEval15fa, failedLightEval15fa;
+                if (auditConnection15fa && ((eyeVertex.mlHeroLaneCount <= 1u) || (lightVertex.mlHeroLaneCount <= 1u)))
+                    failureMask15fa |= ML15FA_NO_PACKET;
+// 15fa END diagnostic-only
 				bool mlHero15oUsedSpectral = false;
 
 				if ((eyeVertex.mlHeroLaneCount > 1u) && (lightVertex.mlHeroLaneCount > 1u)) {
@@ -2735,15 +3985,36 @@ void BiDirCPURenderThread::ConnectVertices(const float time,
 						packetMatch = (dLambda < 1e-4f) && (dWeight < 1e-6f);
 					}
 
+// 15fa BEGIN diagnostic-only
+                    if (auditConnection15fa) {
+                        if (!packetMatch) failureMask15fa |= ML15FA_PACKET_MISMATCH;
+                        if (!eyeTPScalar) failureMask15fa |= ML15FA_EYE_TP;
+                        if (!lightTPScalar) failureMask15fa |= ML15FA_LIGHT_TP;
+                        if (!connectionScalar) failureMask15fa |= ML15FA_CONNECTION;
+                    }
+// 15fa END diagnostic-only
 					bool endpointsUsable = true;
 					bool anyExplicitMetal2 = false;
+                    bool anyRoughEndpoint15et = false;
+// 15fe BEGIN
+                    MLHeroTranslucent15fe eyeTranslucent15fe, lightTranslucent15fe;
+                    const bool eyeIsTranslucent15fe = eyeVertex.bsdf.GetMaterialType() == MATTETRANSLUCENT;
+                    const bool lightIsTranslucent15fe = lightVertex.bsdf.GetMaterialType() == MATTETRANSLUCENT;
+                    const bool eyeReady15fe = !eyeIsTranslucent15fe ||
+                        MLHeroPrepareTranslucent15fe(eyeVertex.bsdf, p2pDir, eyeEvent, false,
+                            engine->mlHeroGenericReflectanceCompensation, 3u, &eyeTranslucent15fe);
+                    const bool lightReady15fe = !lightIsTranslucent15fe ||
+                        MLHeroPrepareTranslucent15fe(lightVertex.bsdf, -p2pDir, lightEvent, false,
+                            engine->mlHeroGenericReflectanceCompensation, 3u, &lightTranslucent15fe);
+// 15fe END
 					float eyeBsdfScalar[8] = { 0.f };
 					float lightBsdfScalar[8] = { 0.f };
 
 					for (u_int lane = 0; lane < laneCount; ++lane) {
 						const float waveLength = eyeVertex.mlHeroLaneWaveLength[lane];
 
-						Spectrum eyeLaneBsdf = eyeBsdfEval;
+						bool roughEndpointOK15et = true;
+                        Spectrum eyeLaneBsdf = eyeBsdfEval;
 						Spectrum explicitEyeBsdf;
 						if (eyeVertex.bsdf.EvaluateMLHeroMetal2AtWaveLength(
 								p2pDir, waveLength, &explicitEyeBsdf)) {
@@ -2759,8 +4030,41 @@ void BiDirCPURenderThread::ConnectVertices(const float time,
 							anyExplicitMetal2 = true;
 						}
 
-						if (!MLHeroIsScalarSpectrum(eyeLaneBsdf) ||
+						if (eyeVertex.bsdf.GetMaterialType() == ROUGHGLASS) {
+                            anyRoughEndpoint15et = true;
+                            roughEndpointOK15et = MLHeroRoughValue15et(eyeVertex.bsdf, p2pDir,
+                                eyeEvent, waveLength, &eyeLaneBsdf, 3u) && roughEndpointOK15et;
+                        }
+                        if (lightVertex.bsdf.GetMaterialType() == ROUGHGLASS) {
+                            anyRoughEndpoint15et = true;
+                            roughEndpointOK15et = MLHeroRoughValue15et(lightVertex.bsdf, -p2pDir,
+                                lightEvent, waveLength, &lightLaneBsdf, 3u) && roughEndpointOK15et;
+                        }
+// 15fe BEGIN
+                        const bool eyeOK15fe = eyeReady15fe && (!eyeIsTranslucent15fe ||
+                            MLHeroTranslucentValue15fe(eyeTranslucent15fe, waveLength, &eyeLaneBsdf));
+                        const bool lightOK15fe = lightReady15fe && (!lightIsTranslucent15fe ||
+                            MLHeroTranslucentValue15fe(lightTranslucent15fe, waveLength, &lightLaneBsdf));
+                        if (auditConnection15fa) {
+                            if (!eyeOK15fe) failureMask15fa |= ML15FA_EYE_ENDPOINT;
+                            if (!lightOK15fe) failureMask15fa |= ML15FA_LIGHT_ENDPOINT;
+                        }
+// 15fe END
+// 15fa BEGIN diagnostic-only
+                        if (auditConnection15fa) checkedLanes15fa = lane + 1u;
+// 15fa END diagnostic-only
+                        if (!roughEndpointOK15et || !eyeOK15fe || !lightOK15fe || !MLHeroIsScalarSpectrum(eyeLaneBsdf) ||
 								!MLHeroIsScalarSpectrum(lightLaneBsdf)) {
+// 15fa BEGIN diagnostic-only
+                            if (auditConnection15fa) {
+                                failedLane15fa = lane;
+                                failedEyeEval15fa = eyeLaneBsdf;
+                                failedLightEval15fa = lightLaneBsdf;
+                                if (!roughEndpointOK15et) failureMask15fa |= ML15FA_ROUGH_HELPER;
+                                if (!MLHeroIsScalarSpectrum(eyeLaneBsdf)) failureMask15fa |= ML15FA_EYE_ENDPOINT;
+                                if (!MLHeroIsScalarSpectrum(lightLaneBsdf)) failureMask15fa |= ML15FA_LIGHT_ENDPOINT;
+                            }
+// 15fa END diagnostic-only
 							endpointsUsable = false;
 							break;
 						}
@@ -2769,8 +4073,27 @@ void BiDirCPURenderThread::ConnectVertices(const float time,
 						lightBsdfScalar[lane] = lightLaneBsdf.c[0];
 					}
 
+// 15fb BEGIN
+                    const bool legacyActivation15fb = anyExplicitMetal2 || anyRoughEndpoint15et ||
+                        eyeVertex.mlHeroSpectralGlassHistory || lightVertex.mlHeroSpectralGlassHistory;
+                    const bool neutralMattePermission15fb = !legacyActivation15fb &&
+                        MLHeroNeutralMattePair15fb(eyeVertex, lightVertex, eyeBsdfEval, lightBsdfEval, connectionThroughput);
+// 15fb END
+// 15fc BEGIN
+                    const bool neutralTranslucentPermission15fc = !legacyActivation15fb &&
+                        MLHeroNeutralTranslucentPair15fc(eyeVertex, lightVertex, eyeBsdfEval, lightBsdfEval, connectionThroughput);
+// 15fc END
+// 15fe BEGIN
+                    const bool translucentPermission15fe =
+                        (eyeIsTranslucent15fe || lightIsTranslucent15fe) &&
+                        MLHeroTranslucentPacket15fe(eyeVertex, lightVertex, connectionThroughput);
+// 15fe END
+// 15fa BEGIN diagnostic-only
+                    if (auditConnection15fa && !(legacyActivation15fb || neutralMattePermission15fb || neutralTranslucentPermission15fc || translucentPermission15fe))
+                        failureMask15fa |= ML15FA_ACTIVATION;
+// 15fa END diagnostic-only
 					if (packetMatch && eyeTPScalar && lightTPScalar &&
-							connectionScalar && endpointsUsable && anyExplicitMetal2) {
+							connectionScalar && endpointsUsable && (legacyActivation15fb || neutralMattePermission15fb || neutralTranslucentPermission15fc || translucentPermission15fe)) {
 						const float connectionScalarValue = connectionThroughput.c[0];
 
 						Spectrum ciePacket;
@@ -2792,20 +4115,123 @@ void BiDirCPURenderThread::ConnectVertices(const float time,
 						}
 
 						ciePacket /= (float)laneCount;
+						const Spectrum beforeDual15eu = ciePacket;
 						if (engine->mlHeroGlassMode == 1) {
 							MLHeroRecordConnectContribution15bi(ciePacket, eyeTerm15bi, lightTerm15bi);
 							MLHeroRecordDualTermination15by(ciePacket, eyeVertex, lightVertex, laneCount, true);
-							if (engine->mlHeroDualTerminationCompensation)
-								MLHeroApplyDualTerminationCompensation15bz(ciePacket, eyeVertex, lightVertex, laneCount);
 						}
+                        const bool eligibleDual15eu = MLHeroDualSpectralEligible15eu(eyeVertex, lightVertex, laneCount);
+                        const bool appliedDual15eu = eligibleDual15eu && engine->mlHeroDualTerminationCompensation &&
+                            MLHeroApplyDualTerminationCompensation15bz(ciePacket, eyeVertex, lightVertex, laneCount);
+                        MLHeroRecordDualSpectral15eu(beforeDual15eu, ciePacket, eyeVertex, lightVertex, laneCount,
+                            engine->mlHeroGlassMode, engine->mlHeroDualTerminationCompensation, eligibleDual15eu, appliedDual15eu);
 							MLHeroRecordEstimatorContribution15bj(0u, ciePacket, eyeTerm15bi, lightTerm15bi, true, false);
 							if (MLHeroLegacyHeavyDiagnosticsEnabled15cq()) { const unsigned long long read15bq = mlHero15bqReadCount[0].fetch_add(1ull, std::memory_order_relaxed); MLHeroLogState15bq("READ_EYE", read15bq, 0u, eyeVertex); MLHeroLogState15bq("READ_LIGHT", read15bq, 0u, lightVertex); const unsigned long long snap15bq = mlHero15bqSnapshotTicket.fetch_add(1ull, std::memory_order_relaxed); MLHeroWriteSnapshot15bq(snap15bq); }
 							MLHeroRecordContributionWeightedBias15bp(0u, ciePacket, eyeTerm15bi, lightTerm15bi,
 								eyeVertex.mlHeroTerminationBrightnessRatio, lightVertex.mlHeroTerminationBrightnessRatio);
 							MLHeroRecordWavelengthBias15bs(0u, 0u, eyeVertex, ciePacket);
 							MLHeroRecordWavelengthBias15bs(0u, 1u, lightVertex, ciePacket);
-						eyeSampleResult.radiance[lightVertex.lightID] += ciePacket;
+	// 15fb BEGIN
+                        if (neutralMattePermission15fb && MLHeroCurrentDiagnosticsEnabled15cq()) {
+                            Spectrum classicReference15fb;
+                            // Counterfactual only, and only for the bounded example budget.
+                            if (mlHero15fbDetailTicket.load(std::memory_order_relaxed) < 12ull) {
+                                classicReference15fb = (misWeight * geometryTerm) *
+                                    eyeVertex.throughput * eyeBsdfEval * connectionThroughput *
+                                    lightBsdfEval * lightVertex.throughput;
+                                if (engine->mlHeroGlassMode == 1 && engine->mlHeroDualTerminationCompensation)
+                                    MLHeroApplyDualTerminationCompensation15bz(classicReference15fb, eyeVertex, lightVertex, laneCount);
+                            }
+                            MLHeroRecordMatte15fb(eyeVertex, lightVertex, ciePacket, classicReference15fb);
+                        }
+// 15fb END
+// 15fc BEGIN
+                        if (neutralTranslucentPermission15fc && MLHeroCurrentDiagnosticsEnabled15cq()) {
+                            Spectrum classicReference15fc;
+                            // Counterfactual only, and only for the bounded example budget.
+                            if (mlHero15fcDetailTicket.load(std::memory_order_relaxed) < 12ull) {
+                                classicReference15fc = (misWeight * geometryTerm) *
+                                    eyeVertex.throughput * eyeBsdfEval * connectionThroughput *
+                                    lightBsdfEval * lightVertex.throughput;
+                                if (engine->mlHeroGlassMode == 1 && engine->mlHeroDualTerminationCompensation)
+                                    MLHeroApplyDualTerminationCompensation15bz(classicReference15fc, eyeVertex, lightVertex, laneCount);
+                            }
+                            MLHeroRecordTranslucent15fc(eyeVertex, lightVertex, ciePacket, classicReference15fc);
+                        }
+// 15fc END
+// 15fa BEGIN diagnostic-only
+                        MLHeroRecordConnection15fa(true, failureMask15fa, eyeVertex, lightVertex,
+                            eyeBsdfEval, lightBsdfEval, connectionThroughput, failedLane15fa, checkedLanes15fa,
+                            failedEyeEval15fa, failedLightEval15fa);
+// 15fa END diagnostic-only
+                        MLHeroFiniteConnection15fw(ciePacket,beforeDual15eu,eyeVertex,lightVertex,
+                            eyeBsdfScalar,lightBsdfScalar,connectionScalarValue,
+                            misWeight,geometryTerm,eyeBsdfPdfW,lightBsdfPdfW);
+                        // 15gd: retain only the 32 strongest observed RoughGlass spectral connections.
+                        // Heavy/current/master gating keeps normal render overhead unchanged.
+                        if (anyRoughEndpoint15et && MLHeroCurrentHeavyDiagnosticsEnabled15cq()) {
+                            const float peak15gd = Max(fabsf(ciePacket.c[0]),
+                                Max(fabsf(ciePacket.c[1]), fabsf(ciePacket.c[2])));
+                            std::lock_guard<std::mutex> selectLock15gd(mlHeroRoughTopMutex15gd);
+                            ++mlHeroRoughObserved15gd;
+                            if (!std::isfinite(peak15gd) || peak15gd >= 64.f) {
+                                ++mlHeroRoughEligible15gd;
+                                if (mlHeroRoughTop15gd.size() < 32u ||
+                                        peak15gd > mlHeroRoughTop15gd.back().peak) {
+                                    MLHeroRoughCandidate15gd r = {};
+                                    r.peak = peak15gd; r.filmX = eyeSampleResult.filmX; r.filmY = eyeSampleResult.filmY;
+                                    r.eyeDepth = eyeVertex.depth; r.lightDepth = lightVertex.depth;
+                                    r.eyeType = (unsigned)eyeVertex.bsdf.GetMaterialType();
+                                    r.lightType = (unsigned)lightVertex.bsdf.GetMaterialType();
+                                    r.eyeTerm = eyeTerm15bi ? 1u : 0u;
+                                    r.lightTerm = lightTerm15bi ? 1u : 0u;
+                                    r.laneCount = std::min((unsigned)laneCount, 8u);
+                                    r.mis = misWeight; r.geometry = geometryTerm; r.dist2 = p2pDistance2;
+                                    r.eyePdf = eyeBsdfPdfW; r.eyeRevPdf = eyeBsdfRevPdfW;
+                                    r.lightPdf = lightBsdfPdfW; r.lightRevPdf = lightBsdfRevPdfW;
+                                    r.connectionScalar = connectionScalarValue;
+                                    r.eyeTraceCount15ge = std::min((unsigned)eyeVertex.mlHeroTraceCount15ge, 12u);
+                                    r.lightTraceCount15ge = std::min((unsigned)lightVertex.mlHeroTraceCount15ge, 12u);
+                                    for (unsigned t=0; t<r.eyeTraceCount15ge; ++t) r.eyeTrace15ge[t]=eyeVertex.mlHeroTrace15ge[t];
+                                    for (unsigned t=0; t<r.lightTraceCount15ge; ++t) r.lightTrace15ge[t]=lightVertex.mlHeroTrace15ge[t];
+                                    for (unsigned c = 0; c < 3; ++c) {
+                                        r.before[c] = beforeDual15eu.c[c]; r.applied[c] = ciePacket.c[c];
+                                        r.eyeClassic[c] = eyeBsdfEval.c[c]; r.lightClassic[c] = lightBsdfEval.c[c];
+                                    }
+                                    for (unsigned lane = 0; lane < r.laneCount; ++lane) {
+                                        auto &l = r.lanes[lane];
+                                        l.lambda = eyeVertex.mlHeroLaneWaveLength[lane];
+                                        l.weight = eyeVertex.mlHeroLaneSampleWeight[lane];
+                                        l.eyeTP = eyeVertex.mlHeroLaneThroughput[lane].c[0];
+                                        l.eyeBSDF = eyeBsdfScalar[lane];
+                                        l.lightTP = lightVertex.mlHeroLaneThroughput[lane].c[0];
+                                        l.lightBSDF = lightBsdfScalar[lane];
+                                        l.scalar = l.eyeTP*l.eyeBSDF*l.lightTP*l.lightBSDF*
+                                            connectionScalarValue*(misWeight*geometryTerm);
+                                        const Spectrum rgb = MLHeroCIEEstimatorColor(l.lambda,l.weight) *
+                                            (l.scalar/(float)laneCount);
+                                        for (unsigned c = 0; c < 3; ++c) l.rgb[c] = rgb.c[c];
+                                    }
+                                    const auto insertion = std::lower_bound(mlHeroRoughTop15gd.begin(),
+                                        mlHeroRoughTop15gd.end(), peak15gd,
+                                        [](const MLHeroRoughCandidate15gd &a, const float peak) {
+                                            return a.peak > peak;
+                                        });
+                                    mlHeroRoughTop15gd.insert(insertion,r);
+                                    if (mlHeroRoughTop15gd.size() > 32u) mlHeroRoughTop15gd.pop_back();
+                                }
+                            }
+                        }
+					MLHeroAddAudit15ew(eyeSampleResult.radiance[lightVertex.lightID], ciePacket,
+                            0u, &eyeVertex, &lightVertex, misWeight, eyeBsdfPdfW, geometryTerm);
 						mlHero15oUsedSpectral = true;
+                        if (anyRoughEndpoint15et) mlHero15etApplied[3].fetch_add(1ull, std::memory_order_relaxed);
+// 15fe BEGIN
+                        if (eyeIsTranslucent15fe) MLHeroApplied15fe(3u, eyeEvent);
+                        if (lightIsTranslucent15fe) MLHeroApplied15fe(3u, lightEvent);
+// 15fe END
+                        if (eyeVertex.mlHeroSpectralGlassHistory || lightVertex.mlHeroSpectralGlassHistory)
+                            mlHero15evConnections.fetch_add(1ull, std::memory_order_relaxed);
 
 						static std::atomic<bool> mlHeroPhase15pLogged(false);
 						bool expected = false;
@@ -2914,7 +4340,13 @@ void BiDirCPURenderThread::ConnectVertices(const float time,
 							eyeVertex.mlHeroTerminationBrightnessRatio, lightVertex.mlHeroTerminationBrightnessRatio);
 						MLHeroRecordWavelengthBias15bs(0u, 0u, eyeVertex, classicConnectContribution15bi);
 						MLHeroRecordWavelengthBias15bs(0u, 1u, lightVertex, classicConnectContribution15bi);
-					eyeSampleResult.radiance[lightVertex.lightID] += classicConnectContribution15bi;
+// 15fa BEGIN diagnostic-only
+                    MLHeroRecordConnection15fa(false, failureMask15fa, eyeVertex, lightVertex,
+                        eyeBsdfEval, lightBsdfEval, connectionThroughput, failedLane15fa, checkedLanes15fa,
+                        failedEyeEval15fa, failedLightEval15fa);
+// 15fa END diagnostic-only
+					MLHeroAddAudit15ew(eyeSampleResult.radiance[lightVertex.lightID], classicConnectContribution15bi,
+                        1u, &eyeVertex, &lightVertex, misWeight, eyeBsdfPdfW, geometryTerm);
 				}
 			}
 		}
@@ -2997,7 +4429,11 @@ void BiDirCPURenderThread::ConnectToEye(const float time,
 	if (shadowIntersection)
 		return;
 
-	if (lightVertex.depth >= engine->rrDepth) {
+    const float rawCameraReverse15fn=bsdfRevPdfW;
+    if (mlHeroState15fh.enabled) MLHeroRRAudit15fk(4,lightVertex.depth,lightVertex.bsdf.GetMaterialType(),event,bsdfEval,bsdfPdfW,bsdfRevPdfW,engine->rrImportanceCap,RenderEngine::RussianRouletteProb(bsdfEval,engine->rrImportanceCap),((engine->GetType() != slg::BIDIRCPU) && (lightVertex.depth >= engine->rrDepth)),((engine->GetType() != slg::BIDIRCPU) && (lightVertex.depth >= engine->rrDepth)),false);
+
+    // 15fo: BIDIRCPU raw local MIS PDF policy 2.
+	if ((engine->GetType() != slg::BIDIRCPU) && (lightVertex.depth >= engine->rrDepth)) {
 		// Russian Roulette
 		const float prob = RenderEngine::RussianRouletteProb(bsdfEval, engine->rrImportanceCap);
 		bsdfRevPdfW *= prob;
@@ -3020,6 +4456,12 @@ void BiDirCPURenderThread::ConnectToEye(const float time,
 	const float weightLight = MIS(cameraPdfA) *
 		(misVmWeightFactor + lightVertex.dVCM + lightVertex.dVC * MIS(bsdfRevPdfW));
 	const float misWeight = 1.f / (weightLight + 1.f);
+    if(mlHeroState15fh.enabled) MLHeroCandidate15fn(1u,lightVertex.depth,0u,
+        lightVertex.bsdf.GetMaterialType(),misWeight,
+        MLHeroCameraWeight15fn(cameraPdfA,rawCameraReverse15fn,lightVertex.dVCM,lightVertex.dVC,misVmWeightFactor),
+        bsdfPdfW,rawCameraReverse15fn,
+        !lightVertex.bsdf.IsVolume() && !lightVertex.mlHeroSecondaryWavelengthsTerminated && misVmWeightFactor==0.f);
+
 
 	// ML HERO phase 15bo: connection-to-eye alternate strategies live on the
 	// stored light subpath.  If that subpath is HERO-terminated, compare with
@@ -3046,6 +4488,13 @@ void BiDirCPURenderThread::ConnectToEye(const float time,
 		bool endpointUsable = true;
 		bool explicitMetal2 = false;
 		float laneBsdfScalar[8] = { 0.f };
+// 15fe BEGIN
+        MLHeroTranslucent15fe cameraTranslucent15fe;
+        const bool cameraIsTranslucent15fe = lightVertex.bsdf.GetMaterialType() == MATTETRANSLUCENT;
+        const bool cameraReady15fe = !cameraIsTranslucent15fe ||
+            MLHeroPrepareTranslucent15fe(lightVertex.bsdf, -eyeDir, event, false,
+                engine->mlHeroGenericReflectanceCompensation, 4u, &cameraTranslucent15fe);
+// 15fe END
 
 		for (u_int lane = 0; lane < laneCount; ++lane) {
 			const float waveLength = lightVertex.mlHeroLaneWaveLength[lane];
@@ -3058,7 +4507,15 @@ void BiDirCPURenderThread::ConnectToEye(const float time,
 				explicitMetal2 = true;
 			}
 
-			if (!MLHeroIsScalarSpectrum(laneBsdf)) {
+			bool roughEndpointOK15et = true;
+            if (lightVertex.bsdf.GetMaterialType() == ROUGHGLASS)
+                roughEndpointOK15et = MLHeroRoughValue15et(lightVertex.bsdf, -eyeDir,
+                    event, waveLength, &laneBsdf, 4u);
+// 15fe BEGIN
+            const bool cameraOK15fe = cameraReady15fe && (!cameraIsTranslucent15fe ||
+                MLHeroTranslucentValue15fe(cameraTranslucent15fe, waveLength, &laneBsdf));
+// 15fe END
+            if (!roughEndpointOK15et || !cameraOK15fe || !MLHeroIsScalarSpectrum(laneBsdf)) {
 				endpointUsable = false;
 				break;
 			}
@@ -3088,6 +4545,10 @@ void BiDirCPURenderThread::ConnectToEye(const float time,
 			ciePacket /= (float)laneCount;
 			radiance = ciePacket;
 			mlHero15sUsedSpectral = true;
+            if (lightVertex.bsdf.GetMaterialType() == ROUGHGLASS) mlHero15etApplied[4].fetch_add(1ull, std::memory_order_relaxed);
+// 15fe BEGIN
+            if (cameraIsTranslucent15fe) MLHeroApplied15fe(4u, event);
+// 15fe END
 
 			static std::atomic<bool> mlHeroPhase15sLogged(false);
 			bool expected = false;
@@ -3193,6 +4654,8 @@ void BiDirCPURenderThread::ConnectToEye(const float time,
 
 	// Add radiance from the light source
 	sampleResult.radiance[lightVertex.lightID] = radiance;
+    MLHeroAudit15ew(3u, "CONTRIBUTION", radiance, nullptr, &lightVertex,
+        0.f, 0.f, 0.f, filmX, filmY, lightVertex.lightID);
 }
 
 void BiDirCPURenderThread::DirectLightSampling(const float time,
@@ -3240,12 +4703,17 @@ void BiDirCPURenderThread::DirectLightSampling(const float time,
 						// I'm ignoring volume emission because it is not sampled in
 						// direct light step.
 
+
+    if (mlHeroState15fh.enabled) MLHeroRRAudit15fk(5,eyeVertex.depth,eyeVertex.bsdf.GetMaterialType(),event,bsdfEval,bsdfPdfW,bsdfRevPdfW,engine->rrImportanceCap,RenderEngine::RussianRouletteProb(bsdfEval,engine->rrImportanceCap),((engine->GetType() != slg::BIDIRCPU) && (eyeVertex.depth + 1 >= engine->rrDepth)),((engine->GetType() != slg::BIDIRCPU) && (eyeVertex.depth >= engine->rrDepth)),false);
+                        const float rawForwardPdf15fl=bsdfPdfW,rawReversePdf15fl=bsdfRevPdfW;
 						// If the light source is not intersectable, it can not be
 						// sampled with BSDF
 						bsdfPdfW *= (light->IsEnvironmental() || light->IsIntersectable()) ? 1.f : 0.f;
+    // 15fo: BIDIRCPU raw local MIS PDF policy 3.
+
 
 						// The +1 is there to account the current path vertex used for DL
-						if (eyeVertex.depth + 1 >= engine->rrDepth) {
+						if ((engine->GetType() != slg::BIDIRCPU) && (eyeVertex.depth + 1 >= engine->rrDepth)) {
 							// Russian Roulette
 							const float prob = RenderEngine::RussianRouletteProb(bsdfEval, engine->rrImportanceCap);
 							bsdfPdfW *= prob;
@@ -3257,12 +4725,41 @@ void BiDirCPURenderThread::DirectLightSampling(const float time,
 
 						// emissionPdfA / directPdfA = emissionPdfW / directPdfW
 						const float weightLight = MIS(bsdfPdfW / directLightSamplingPdfW);
-						const float weightCamera = MIS(emissionPdfW * cosThetaToLight / (directPdfW * cosThetaAtLight)) *
-								(misVmWeightFactor + eyeVertex.dVCM + eyeVertex.dVC * MIS(bsdfRevPdfW));
+						const float cameraHistory15ey =
+                            misVmWeightFactor + eyeVertex.dVCM + eyeVertex.dVC * MIS(bsdfRevPdfW);
+                        const float weightCamera = MLHeroDLSCameraWeight15ey(
+                            emissionPdfW, cosThetaToLight, directPdfW, cosThetaAtLight, cameraHistory15ey);
 						// Disable MIS if we have gone trough a shadow transparent object
 						const float misWeight = shadowBsdf.hitPoint.throughShadowTransparency ?
 							1.f : (1.f / (weightLight + 1.f + weightCamera));
 
+
+                        if(mlHeroState15fh.enabled) {
+                            const double rawSupportedForward15fn=(light->IsEnvironmental() || light->IsIntersectable()) ? rawForwardPdf15fl : 0.;
+                            const float rawCameraHistory15fn=misVmWeightFactor+eyeVertex.dVCM+eyeVertex.dVC*MIS(rawReversePdf15fl);
+                            const float rawCameraTerm15fn=MLHeroDLSCameraWeight15ey(emissionPdfW,cosThetaToLight,
+                                directPdfW,cosThetaAtLight,rawCameraHistory15fn);
+                            const double candidate15fn=1./(1.+MLHeroSquare15fn(rawSupportedForward15fn/directLightSamplingPdfW)+rawCameraTerm15fn);
+                            MLHeroCandidate15fn(2u,eyeVertex.depth,0u,eyeVertex.bsdf.GetMaterialType(),misWeight,candidate15fn,
+                                rawSupportedForward15fn,rawReversePdf15fl,
+                                !shadowBsdf.hitPoint.throughShadowTransparency && !eyeVertex.bsdf.IsVolume() &&
+                                !eyeVertex.mlHeroSecondaryWavelengthsTerminated && misVmWeightFactor==0.f);
+                        }
+                        if(mlHeroState15fh.enabled) {
+                            unsigned skip15fl=MLHeroTerminalLightGuard15fl(*light,time);
+                                if(eyeVertex.bsdf.GetMaterialType()!=MATTE && eyeVertex.bsdf.GetMaterialType()!=MATTETRANSLUCENT)skip15fl=3u;
+                            if(shadowBsdf.hitPoint.throughShadowTransparency || (event&SPECULAR) ||
+                                    (!(event&DIFFUSE)&&!(event&GLOSSY)) ||
+                                    ((event&DIFFUSE)&&!light->IsVisibleIndirectDiffuse()) ||
+                                    ((event&GLOSSY)&&!light->IsVisibleIndirectGlossy()))skip15fl=1u;
+                            else if(eyeVertex.depth>=engine->maxEyePathDepth)skip15fl=2u;
+                            else if(scene.GetLightSources().GetEmitLightStrategy().GetType()==TYPE_DLS_CACHE)skip15fl=4u;
+                            else if(eyeVertex.bsdf.IsVolume() || misVmWeightFactor!=0.f)skip15fl=5u;
+                            MLHeroTerminalMIS15fl(1u,eyeVertex.depth,eyeVertex.bsdf.GetMaterialType(),event,
+                                light->GetID(),skip15fl,misWeight,rawForwardPdf15fl,bsdfPdfW,directPdfW,
+                                emissionPdfW,cosThetaToLight,cosThetaAtLight,eyeVertex.dVCM,eyeVertex.dVC,
+                                rawReversePdf15fl,lightPickPdf);
+                        }
 						// ML HERO phase 15bo: for a HERO-terminated eye subpath, the
 						// camera-side history term is the part that can cross the prior
 						// dispersive Dirac event.  Keep the local BSDF-vs-light competitor.
@@ -3278,6 +4775,19 @@ void BiDirCPURenderThread::DirectLightSampling(const float time,
 						// but now BSDF::Evaluate() follows LuxRender habit to return the
 						// result multiplied by cosThetaToLight
 						const float factor = 1.f / directLightSamplingPdfW;
+                        if (cameraHistory15ey == 0.f)
+                            MLHeroRecordMISFix15ey(eyeVertex, light->GetID(), (u_int)light->GetType(),
+                                emissionPdfW, directPdfW, lightPickPdf, cosThetaToLight, cosThetaAtLight,
+                                bsdfPdfW, bsdfRevPdfW, misVmWeightFactor, weightLight, misWeight,
+                                factor, shadowBsdf.hitPoint.throughShadowTransparency,
+                                eyeSampleResult.filmX, eyeSampleResult.filmY);
+                        if (MLHeroCurrentDiagnosticsEnabled15cq() &&
+                                (!std::isfinite(misWeight) || std::isnan(weightCamera) || std::isnan(weightLight)))
+                            MLHeroLogDLSMIS15ex(eyeVertex, light->GetID(), (u_int)light->GetType(),
+                                emissionPdfW, directPdfW, lightPickPdf, cosThetaToLight, cosThetaAtLight,
+                                bsdfPdfW, bsdfRevPdfW, misVmWeightFactor, weightLight, weightCamera, misWeight,
+                                factor, shadowBsdf.hitPoint.throughShadowTransparency,
+                                eyeSampleResult.filmX, eyeSampleResult.filmY);
 
 						// ML HERO phase 15q:
 						// DirectLightSampling now follows the same spectral architecture
@@ -3302,6 +4812,13 @@ void BiDirCPURenderThread::DirectLightSampling(const float time,
 							bool endpointUsable = true;
 							bool anyExplicitMetal2 = false;
 							float laneBsdfScalar[8] = { 0.f };
+// 15fe BEGIN
+                            MLHeroTranslucent15fe directTranslucent15fe;
+                            const bool directIsTranslucent15fe = eyeVertex.bsdf.GetMaterialType() == MATTETRANSLUCENT;
+                            const bool directReady15fe = !directIsTranslucent15fe ||
+                                MLHeroPrepareTranslucent15fe(eyeVertex.bsdf, shadowRay.d, event, false,
+                                    engine->mlHeroGenericReflectanceCompensation, 2u, &directTranslucent15fe);
+// 15fe END
 
 							for (u_int lane = 0; lane < laneCount; ++lane) {
 								const float waveLength = eyeVertex.mlHeroLaneWaveLength[lane];
@@ -3314,7 +4831,15 @@ void BiDirCPURenderThread::DirectLightSampling(const float time,
 									anyExplicitMetal2 = true;
 								}
 
-								if (!MLHeroIsScalarSpectrum(laneBsdfEval)) {
+								bool roughEndpointOK15et = true;
+                                if (eyeVertex.bsdf.GetMaterialType() == ROUGHGLASS)
+                                    roughEndpointOK15et = MLHeroRoughValue15et(eyeVertex.bsdf, shadowRay.d,
+                                        event, waveLength, &laneBsdfEval, 2u);
+// 15fe BEGIN
+                                const bool directOK15fe = directReady15fe && (!directIsTranslucent15fe ||
+                                    MLHeroTranslucentValue15fe(directTranslucent15fe, waveLength, &laneBsdfEval));
+// 15fe END
+                                if (!roughEndpointOK15et || !directOK15fe || !MLHeroIsScalarSpectrum(laneBsdfEval)) {
 									endpointUsable = false;
 									break;
 								}
@@ -3352,6 +4877,10 @@ void BiDirCPURenderThread::DirectLightSampling(const float time,
 								ciePacket /= (float)laneCount;
 								mlHeroDirectLightRadiance = ciePacket;
 								mlHero15qUsedSpectral = true;
+                            if (eyeVertex.bsdf.GetMaterialType() == ROUGHGLASS) mlHero15etApplied[2].fetch_add(1ull, std::memory_order_relaxed);
+// 15fe BEGIN
+                            if (directIsTranslucent15fe) MLHeroApplied15fe(2u, event);
+// 15fe END
 
 								static std::atomic<bool> mlHeroPhase15qLogged(false);
 								bool expected = false;
@@ -3464,7 +4993,12 @@ void BiDirCPURenderThread::DirectLightSampling(const float time,
 							eyeVertex.mlHeroTerminationBrightnessRatio, 1.f);
 						MLHeroRecordWavelengthBias15bs(1u, 0u, eyeVertex, mlHeroDirectLightRadiance);
 
-						eyeSampleResult.radiance[light->GetID()] += mlHeroDirectLightRadiance;
+// 15fh BEGIN diagnostic-only
+                        MLHeroRecord15fh(eyeVertex.depth==1u?0u:1u,
+                            mlHeroDirectLightRadiance,mlHero15qUsedSpectral,eyeVertex.depth);
+// 15fh END
+						MLHeroAddAudit15ew(eyeSampleResult.radiance[light->GetID()], mlHeroDirectLightRadiance,
+                            2u, &eyeVertex, nullptr, misWeight);
 
 						assert (eyeSampleResult.IsValid());
 					}
@@ -3517,7 +5051,7 @@ void BiDirCPURenderThread::DirectHitLight(
 				eyeVertex.mlHeroSecondaryWavelengthsTerminated, false,
 				eyeVertex.mlHeroTerminationBrightnessRatio, 1.f);
 			MLHeroRecordWavelengthBias15bs(3u, 0u, eyeVertex, ciePacket);
-			*radiance += ciePacket;
+			MLHeroAddAudit15ew(*radiance, ciePacket, 4u, &eyeVertex);
 
 			static std::atomic<bool> mlHeroPhase15rDepth1Logged(false);
 			bool expected = false;
@@ -3596,7 +5130,7 @@ void BiDirCPURenderThread::DirectHitLight(
 				eyeVertex.mlHeroSecondaryWavelengthsTerminated, false,
 				eyeVertex.mlHeroTerminationBrightnessRatio, 1.f);
 			MLHeroRecordWavelengthBias15bs(3u, 0u, eyeVertex, mlHero15bjContribution);
-			*radiance += mlHero15bjContribution;
+			MLHeroAddAudit15ew(*radiance, mlHero15bjContribution, 5u, &eyeVertex);
 		}
 
 		return;
@@ -3657,7 +5191,7 @@ void BiDirCPURenderThread::DirectHitLight(
 			eyeVertex.mlHeroSecondaryWavelengthsTerminated, false,
 			eyeVertex.mlHeroTerminationBrightnessRatio, 1.f);
 		MLHeroRecordWavelengthBias15bs(3u, 0u, eyeVertex, ciePacket);
-		*radiance += ciePacket;
+		MLHeroAddAudit15ew(*radiance, ciePacket, 4u, &eyeVertex);
 
 		static std::atomic<bool> mlHeroPhase15rLogged(false);
 		bool expected = false;
@@ -3740,7 +5274,7 @@ void BiDirCPURenderThread::DirectHitLight(
 			eyeVertex.mlHeroSecondaryWavelengthsTerminated, false,
 			eyeVertex.mlHeroTerminationBrightnessRatio, 1.f);
 		MLHeroRecordWavelengthBias15bs(3u, 0u, eyeVertex, mlHero15bjContribution);
-		*radiance += mlHero15bjContribution;
+		MLHeroAddAudit15ew(*radiance, mlHero15bjContribution, 5u, &eyeVertex);
 	}
 
 	assert (radiance->IsValid());
@@ -3968,6 +5502,63 @@ bool BiDirCPURenderThread::TraceLightPath(const float time,
 	}
 	
 	return true;
+}
+
+// 15fs: evaluate a scalar wavelength-domain RR candidate at the SAME
+// native decision boundary, including the current Glass sample. No CIE/RGB
+// reconstruction. The live candidate is NEVER used as a survival probability.
+static void MLHeroRRCandidate15fs(PathVertexVM *v, const Vector &direction,
+        BSDFEvent event, float pdf, bool *valid, double *beta,
+        bool *etaValid, double *etaBeta) {
+    *valid=false;*etaValid=false;*beta=0.;*etaBeta=0.;
+    const bool transmit=(event & TRANSMIT)!=0;
+    if(v->bsdf.GetMaterialType()!=GLASS || !(event & SPECULAR)) {
+        // Other transmissive shaders need their own IOR convention audit.
+        if(transmit)v->mlHeroRREtaValid15fs=false;
+        return;
+    }
+    const unsigned n=v->mlHeroLaneCount;
+    if(n<2u||n>8u||!std::isfinite(pdf)||pdf<=0.f)return;
+    const bool collapse=transmit && v->bsdf.HasMLHeroGlassDispersion();
+    const bool heroOnly=v->mlHeroSecondaryWavelengthsTerminated || collapse;
+    const unsigned count=heroOnly?1u:n;
+    // The stored HERO lane contains xN AFTER a previous collapse. Cancel
+    // that estimator bookkeeping. At the first collapse live xN and /N
+    // cancel, so pre-collapse lane 0 is already correctly normalized here.
+    const double normalization=v->mlHeroSecondaryWavelengthsTerminated?1./n:1.;
+    bool ok=true,etaOK=v->mlHeroRREtaValid15fs && !v->bsdf.hitPoint.fromLight;
+    double nextEta[8];for(unsigned i=0;i<8;++i)nextEta[i]=v->mlHeroRREtaScale15fs[i];
+    for(unsigned lane=0;lane<count;++lane) {
+        const Spectrum &pre=v->mlHeroLaneThroughput[lane];
+        if(!MLHeroStrictNeutral15fb(pre)||pre.c[0]<0.f){ok=false;continue;}
+        if(pre.Black())continue;
+        Spectrum value;float delta=0.f;
+        if(!v->bsdf.EvaluateMLHeroGlassSampleAtWaveLength(direction,event,pdf,
+                v->mlHeroLaneWaveLength[lane],&value,&delta)){ok=false;continue;}
+        const double multiplier=MLHeroGlassLaneColorSample15df(value,v->mlHeroLaneWaveLength[lane]);
+        const double b=double(pre.c[0])*multiplier*normalization;
+        if(!std::isfinite(b)||b<0.){ok=false;continue;}
+        if(b>*beta)*beta=b;
+        if(transmit && etaOK) {
+            float nc=0,nt=0,ntLambda=0,fresnel=0,eta=0,eta2=0,transport=0,dirDelta=0;
+            Spectrum debug;
+            if(!v->bsdf.EvaluateMLHeroGlassDebugAtWaveLength(direction,event,pdf,
+                    v->mlHeroLaneWaveLength[lane],&nc,&nt,&ntLambda,&fresnel,
+                    &eta,&eta2,&transport,&dirDelta,&debug) ||
+                    !std::isfinite(eta2)||eta2<=0.f)etaOK=false;
+            else nextEta[lane]/=double(eta2); // eye native transmission carries eta²
+        }
+        const double eb=b*nextEta[lane];
+        if(!std::isfinite(eb)||eb<0.)etaOK=false;
+        else if(eb>*etaBeta)*etaBeta=eb;
+    }
+    *valid=ok;*etaValid=ok&&etaOK;
+    // Diagnostic history only, including paths on which native RR now kills.
+    // A skipped/rejected IOR reconstruction permanently invalidates eta history.
+    if(!v->bsdf.hitPoint.fromLight) {
+        v->mlHeroRREtaValid15fs=ok&&etaOK;
+        if(v->mlHeroRREtaValid15fs)for(unsigned i=0;i<8;++i)v->mlHeroRREtaScale15fs[i]=nextEta[i];
+    }
 }
 
 bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
@@ -4406,15 +5997,70 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 	else
 		pathVertex->bsdf.Pdf(sampledDir, NULL, &bsdfRevPdfW);
 
-	if (pathVertex->depth >= engine->rrDepth) {
-		// Russian Roulette
-		const float prob = RenderEngine::RussianRouletteProb(bsdfSample, engine->rrImportanceCap);
-		if (prob < sampler->GetSample(sampleOffset + 2))
-			return false;
 
-		pathVertex->throughput /= prob;
-		MLHeroDivideLaneThroughput(pathVertex, prob);
-	}
+    if (mlHeroState15fh.enabled) MLHeroRRAudit15fk(pathVertex->bsdf.hitPoint.fromLight ? 1u : 0u,pathVertex->depth,pathVertex->bsdf.GetMaterialType(),event,bsdfSample,bsdfPdfW,bsdfRevPdfW,engine->rrImportanceCap,RenderEngine::RussianRouletteProb(bsdfSample,engine->rrImportanceCap),pathVertex->depth >= engine->rrDepth,pathVertex->depth >= engine->rrDepth,true);
+    // 15fs candidate has no transport outputs and consumes no sampler values.
+    const bool audit15fs=mlHeroState15fh.enabled && engine->GetType()==slg::BIDIRCPU;
+    bool valid15fs=false,etaValid15fs=false;
+    double beta15fs=0.,etaBeta15fs=0.;
+    const bool experiment15ft=engine->GetType()==slg::BIDIRCPU &&
+        engine->mlHeroEnabled && engine->mlHeroWavelengthCount>1 && engine->mlHeroRRGlassEtaExperiment;
+    // Eta history is needed before RR start, and with diagnostics OFF too.
+    if(audit15fs || ((experiment15ft || (engine->GetType()==slg::BIDIRCPU && engine->mlHeroEnabled && engine->mlHeroWavelengthCount>1 && engine->mlHeroRRMaterialExperiment)) && !pathVertex->bsdf.hitPoint.fromLight))MLHeroRRCandidate15fs(pathVertex,sampledDir,event,bsdfPdfW,
+        &valid15fs,&beta15fs,&etaValid15fs,&etaBeta15fs);
+    // 15fu: use the live material update for killed diagnostic bounces too.
+    // No continuation is generated; the discarded vertex returns immediately
+    // after its lane multiplication. Surviving paths keep the original order.
+    const MaterialType material15fu=pathVertex->bsdf.GetMaterialType();
+    const int bucket15fu=material15fu==MATTE?0:(material15fu==METAL2?1:(material15fu==GLOSSY2?2:-1));
+    const bool audit15fu=audit15fs && engine->mlHeroEnabled &&
+        pathVertex->mlHeroLaneCount>=2u && pathVertex->mlHeroLaneCount<=8u && bucket15fu>=0;
+    const bool scope15fv=engine->GetType()==slg::BIDIRCPU && engine->mlHeroEnabled &&
+        engine->mlHeroWavelengthCount>1 && !pathVertex->bsdf.hitPoint.fromLight &&
+        pathVertex->mlHeroLaneCount>=2u && pathVertex->mlHeroLaneCount<=8u && bucket15fu>=0;
+    const bool defer15fv=scope15fv && engine->mlHeroRRMaterialExperiment &&
+        pathVertex->depth>=engine->rrDepth;
+    bool killed15fu=false;
+    double random15fu=0.;
+    double pre15fu[8][3]={};
+    unsigned routes15fu[8]={};
+    if(audit15fu)for(unsigned i=0;i<pathVertex->mlHeroLaneCount;++i)
+        for(unsigned c=0;c<3;++c)pre15fu[i][c]=pathVertex->mlHeroLaneThroughput[i].c[c];
+	float mlHeroRrProb15et = 1.f;
+	if (pathVertex->depth >= engine->rrDepth && !defer15fv) {
+        const float baseline15ft=RenderEngine::RussianRouletteProb(bsdfSample,engine->rrImportanceCap);
+        const bool scope15ft=!pathVertex->bsdf.hitPoint.fromLight &&
+            pathVertex->bsdf.GetMaterialType()==GLASS && (event & SPECULAR);
+        bool selected15ft=false;
+        const float prob=MLHeroRRSelect15ft(baseline15ft,experiment15ft,scope15ft,
+            valid15fs&&etaValid15fs,etaBeta15fs,engine->rrImportanceCap,&selected15ft);
+        const float random15fs=sampler->GetSample(sampleOffset + 2);
+        // A selected zero-probability candidate must not divide by zero when u=0.
+        const bool killed15fs=(selected15ft && prob<=0.f) || prob < random15fs;
+        if(audit15fs)MLHeroRRLiveRecord15ft(pathVertex->bsdf.hitPoint.fromLight?1u:0u,
+            pathVertex->depth,selected15ft,baseline15ft,prob,random15fs,killed15fs);
+        if(audit15fs)MLHeroRRRecord15fs(pathVertex->bsdf.hitPoint.fromLight?1u:0u,
+            pathVertex->depth,(event & SPECULAR)!=0,true,prob,random15fs,killed15fs,
+            pathVertex->bsdf.GetMaterialType()==GLASS && (event & SPECULAR),
+            valid15fs,beta15fs,etaValid15fs,etaBeta15fs,engine->rrImportanceCap);
+        if(audit15fu && scope15fv)MLHeroMaterialLiveRecord15fv(
+            static_cast<unsigned>(bucket15fu),pathVertex->depth,false,
+            baseline15ft,prob,random15fs,killed15fs);
+        if (killed15fs && !audit15fu) return false;
+        killed15fu=killed15fs;
+        random15fu=random15fs;
+        if(!killed15fu) {
+            mlHeroRrProb15et = prob;
+            pathVertex->throughput /= prob;
+            MLHeroDivideLaneThroughput(pathVertex, prob);
+        }
+	} else if(audit15fs && !defer15fv) {
+        MLHeroRRRecord15fs(pathVertex->bsdf.hitPoint.fromLight?1u:0u,
+            pathVertex->depth,(event & SPECULAR)!=0,false,
+            RenderEngine::RussianRouletteProb(bsdfSample,engine->rrImportanceCap),0.,false,
+            pathVertex->bsdf.GetMaterialType()==GLASS && (event & SPECULAR),
+            valid15fs,beta15fs,etaValid15fs,etaBeta15fs,engine->rrImportanceCap);
+    }
 
 	// Was:
 	//  pathVertex->throughput *= bsdfSample * (cosSampledDir / bsdfPdfW);
@@ -4462,8 +6108,21 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 		// reflectance multiplier to a Smits reflectance SPD and sample it at
 		// each lane wavelength. Keep specular events out of this first step so
 		// Glass/Fresnel remains on its dedicated spectral path.
+// 15fe BEGIN
+        MLHeroTranslucent15fe bounceTranslucent15fe;
+        const u_int bounceStage15fe = pathVertex->bsdf.hitPoint.fromLight ? 1u : 0u;
+        bool bounceReady15fe = pathVertex->bsdf.GetMaterialType() == MATTETRANSLUCENT &&
+            pathVertex->mlHeroLaneCount > 0u && pathVertex->mlHeroLaneCount <= 8u &&
+            MLHeroPrepareTranslucent15fe(pathVertex->bsdf, sampledDir, event, true,
+                engine->mlHeroGenericReflectanceCompensation, bounceStage15fe, &bounceTranslucent15fe);
+        Spectrum bounceValues15fe[8];
+        for (u_int lane = 0u; bounceReady15fe && lane < pathVertex->mlHeroLaneCount; ++lane)
+            bounceReady15fe = MLHeroTranslucentValue15fe(bounceTranslucent15fe,
+                pathVertex->mlHeroLaneWaveLength[lane], &bounceValues15fe[lane]);
+// 15fe END
 		const bool genericReflectanceCandidate =
 			(event & REFLECT) && !(event & SPECULAR) &&
+            !bounceReady15fe &&
 			!MLHeroIsScalarSpectrum(bsdfSample);
 
 		// ML HERO phase 15ad: the 15ac one-shot was consumed by an achromatic
@@ -5102,598 +6761,106 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 			}
 		}
 
-		// ML HERO phase 15ay: optionally replace only the Glass packet weights.
-		// The classic path throughput, sampled event, PDF and direction stay exactly
-		// as LuxCore sampled them. Only the parallel HERO lane throughput receives
-		// the wavelength-specific Glass multiplier.
-		const bool glassSpecularCandidate15bx =
-			(pathVertex->bsdf.GetMaterialType() == GLASS) && (event & SPECULAR);
-		const bool glassPerLaneWeightActive15ay =
-			engine->mlHeroGlassPerLaneWeight && glassSpecularCandidate15bx;
-		// ML HERO phase 15ca: Mode 2 lane-PDF correction is an independent mode,
-		// not a side effect of the per-lane Glass-weight switch.  When PLW is OFF,
-		// Mode 2 still evaluates the wavelength-specific event PDF but starts from
-		// the shared HERO Glass multiplier.
-		const bool mode2LanePdfActive15ca =
-			(engine->mlHeroGlassMode == 2) && glassSpecularCandidate15bx;
-		const bool glassLaneEvalActive15ca =
-			glassPerLaneWeightActive15ay || mode2LanePdfActive15ca;
-		// ML HERO phase 15cs: all Glass modes must collapse to the sampled HERO
-		// wavelength after a truly dispersive perfect-specular transmission.
-		// If no per-lane Glass evaluation is active (notably Mode 0 with PLW off),
-		// perform a lightweight wavelength scan only for dispersion detection.
-		// This does not alter throughput, PDF, sampled direction or event.
-		const bool glassNeedsIndependentDispersionDetection15cs =
-			glassSpecularCandidate15bx && (event & TRANSMIT) &&
-			!glassLaneEvalActive15ca;
-		float glassAdjointCorrection15ay = 1.f;
-		if (glassPerLaneWeightActive15ay && pathVertex->bsdf.hitPoint.fromLight) {
-			const float absDotFixedNG15ay = AbsDot(pathVertex->bsdf.hitPoint.fixedDir,
-				pathVertex->bsdf.hitPoint.geometryN);
-			const float absDotSampledNG15ay = AbsDot(sampledDir,
-				pathVertex->bsdf.hitPoint.geometryN);
-			glassAdjointCorrection15ay = (absDotFixedNG15ay > 1e-20f) ?
-				(absDotSampledNG15ay / absDotFixedNG15ay) : 0.f;
-		}
+        // 15fx: Matte sampled value = true Kd * scalar transport.
+        // Albedo is the Matte Kd; accept only a validated scalar decomposition.
+        Spectrum matteKd15fx;
+        double matteScalar15fx=0.,matteFitError15fx=0.;
+        bool matteReady15fx=false;
+        if (genericReflectanceSPD && pathVertex->bsdf.GetMaterialType()==MATTE) {
+            matteKd15fx=pathVertex->bsdf.Albedo().Clamp(0.f,1.f);
+            matteReady15fx=MLHeroFit15fd(matteKd15fx,bsdfSample,
+                &matteScalar15fx,&matteFitError15fx);
+        }
 
-		// ML HERO phase 15az: collect full-render correction statistics while
-		// leaving the 15ay weighting behavior unchanged.
-		float minCorrection15az = 1e30f;
-		float maxCorrection15az = -1e30f;
-		float maxAbsDelta15az = 0.f;
-		float extremeCorrection15az = 1.f;
-		float extremeLambda15az = 0.f;
-		u_int evaluatedLanes15az = 0u;
-		u_int lanesOver5Pct15az = 0u;
-		u_int lanesOver10Pct15az = 0u;
-		u_int lanesOver25Pct15az = 0u;
-		u_int tirLanes15ba = 0u;
-		u_int nearTir95Lanes15ba = 0u;
-		u_int nearTir99Lanes15ba = 0u;
-		u_int pdfMismatch20PctLanes15ba = 0u;
-		u_int baseHeroTirMismatchLanes15bb = 0u;
-		u_int heroLaneTirMismatchLanes15bb = 0u;
-		u_int baseLaneTirMismatchLanes15bb = 0u;
-		u_int allThreeTirAgreeLanes15bb = 0u;
-		u_int nearHero99TransmitLanes15bc = 0u;
-		u_int rawOver25NearHero99_15bc = 0u;
-		u_int lanePdfAdjustedOver25NearHero99_15bc = 0u;
-		u_int spectralMixAdjustedOver25NearHero99_15bc = 0u;
-		float maxRawCorrectionNearHero99_15bc = 1.f;
-		float maxLanePdfAdjustedCorrectionNearHero99_15bc = 1.f;
-		float maxSpectralMixAdjustedCorrectionNearHero99_15bc = 1.f;
-		u_int eyeTransmitNearHero99Lanes15bd = 0u;
-		u_int eyeTransmitNearHero99SupportMatch15bd = 0u;
-		u_int eyeTransmitNearHero99SupportMismatch15bd = 0u;
-		u_int eyeTransmitNearHero99LanePdfOver25Supported15bd = 0u;
-		u_int eyeTransmitSupportMismatchTotal15bd = 0u;
-		u_int lightTransmitSupportMismatchTotal15bd = 0u;
-		float maxEyeTransmitNearHero99LanePdfSupported15bd = 1.f;
-		MLHeroGlassOutlier15ba localOutlier15ba;
-		const float heroLambda15ba = (pathVertex->mlHeroLaneCount > 0u) ?
-			pathVertex->mlHeroLaneWaveLength[0] : 0.f;
-
-		float heroNc15bb = 0.f, heroNtBase15bb = 0.f, heroNtLambda15bb = 0.f;
-		float heroFresnel15bb = 0.f, heroEta15bb = 0.f, heroEta2_15bb = 0.f;
-		float heroTransport15bb = 0.f, heroDirDelta15bb = 0.f;
-		float heroCosFixed15bb = 0.f, heroSinI2_15bb = 0.f, heroSinT2_15bb = 0.f;
-		float heroEventPdfW15bb = 0.f;
-		bool heroTir15bb = false;
-		Spectrum heroMultiplier15bb;
-		bool heroGlassEvalOk15bx = false;
-		if ((glassLaneEvalActive15ca || glassNeedsIndependentDispersionDetection15cs) &&
-				(heroLambda15ba > 0.f))
-			heroGlassEvalOk15bx = pathVertex->bsdf.EvaluateMLHeroGlassDebugAtWaveLength(
-				sampledDir, event, bsdfPdfW, heroLambda15ba,
-				&heroNc15bb, &heroNtBase15bb, &heroNtLambda15bb,
-				&heroFresnel15bb, &heroEta15bb, &heroEta2_15bb, &heroTransport15bb,
-				&heroDirDelta15bb, &heroMultiplier15bb,
-				&heroCosFixed15bb, &heroSinI2_15bb, &heroSinT2_15bb, &heroTir15bb,
-				&heroEventPdfW15bb);
-
-		const Vector localFixed15bb = pathVertex->bsdf.GetFrame().ToLocal(pathVertex->bsdf.hitPoint.fixedDir);
-		const Vector localSampled15bb = pathVertex->bsdf.GetFrame().ToLocal(sampledDir);
-
-		// ML HERO phase 15dk: compare three ownership models at the exact same Glass
-		// event before any lane throughput is changed. Diagnostic only.
-		if (glassSpecularCandidate15bx && MLHeroCurrentDiagnosticsEnabled15cq())
-			MLHero15dkRecordEvent(pathVertex->bsdf.hitPoint.fromLight, event, *pathVertex, bsdfSample);
-
-		// ML HERO phase 15dj: evaluate the same wavelength-specific ideal-Glass helper
-		// for every Glass mode without changing renderer state.
-		if (glassSpecularCandidate15bx && (pathVertex->mlHeroLaneCount > 0u) &&
-				MLHeroCurrentDiagnosticsEnabled15cq()) {
-			const float fixedNg15dj = AbsDot(pathVertex->bsdf.hitPoint.fixedDir, pathVertex->bsdf.hitPoint.geometryN);
-			const float diagCallerAdjoint15dj = (pathVertex->bsdf.hitPoint.fromLight && (fixedNg15dj > 1e-20f)) ?
-				(AbsDot(sampledDir, pathVertex->bsdf.hitPoint.geometryN) / fixedNg15dj) : 1.f;
-			for (u_int lane15dj = 0u; lane15dj < pathVertex->mlHeroLaneCount; ++lane15dj) {
-				float nc15dj = 0.f, ntBase15dj = 0.f, ntLambda15dj = 0.f;
-				float fresnel15dj = 0.f, eta15dj = 0.f, eta2_15dj = 0.f;
-				float transport15dj = 0.f, dirDelta15dj = 0.f;
-				float cosFixed15dj = 0.f, sinI2_15dj = 0.f, sinT2_15dj = 0.f;
-				float lanePdf15dj = 0.f;
-				bool tir15dj = false;
-				Spectrum materialMultiplier15dj;
-				const float lambda15dj = pathVertex->mlHeroLaneWaveLength[lane15dj];
-				const bool ok15dj = pathVertex->bsdf.EvaluateMLHeroGlassDebugAtWaveLength(
-					sampledDir, event, bsdfPdfW, lambda15dj,
-					&nc15dj, &ntBase15dj, &ntLambda15dj,
-					&fresnel15dj, &eta15dj, &eta2_15dj, &transport15dj,
-					&dirDelta15dj, &materialMultiplier15dj,
-					&cosFixed15dj, &sinI2_15dj, &sinT2_15dj, &tir15dj,
-					&lanePdf15dj);
-				const float sharedLane15dj = MLHeroGlassLaneColorSample15df(bsdfSample, lambda15dj);
-				float modeApplied15dj = sharedLane15dj;
-				if (engine->mlHeroGlassPerLaneWeight && ok15dj)
-					modeApplied15dj = MLHeroGlassLaneColorSample15df(materialMultiplier15dj * diagCallerAdjoint15dj, lambda15dj);
-#if !ML_HERO_MODE2_SHARED_HERO_PDF_15DI
-				if ((engine->mlHeroGlassMode == 2) && ok15dj && (lanePdf15dj > 1e-20f))
-					modeApplied15dj *= bsdfPdfW / lanePdf15dj;
-#endif
-				MLHero15djRecord(pathVertex->bsdf.hitPoint.fromLight, event, lambda15dj,
-					ok15dj, materialMultiplier15dj, fresnel15dj, transport15dj,
-					bsdfPdfW, lanePdf15dj, diagCallerAdjoint15dj, sharedLane15dj,
-					modeApplied15dj, eta15dj, ntLambda15dj, dirDelta15dj);
-			}
-		}
-
-		// ML HERO phase 15bc: counterfactual equal-weight spectral mixture density.
-		// This is diagnostic only. The renderer still samples the event with the HERO
-		// wavelength PDF. A future unbiased implementation would have to sample from
-		// the same mixture (or use the corresponding MIS construction).
-		float spectralMixEventPdfW15bc = 0.f;
-		if (glassPerLaneWeightActive15ay && (pathVertex->mlHeroLaneCount > 0u)) {
-			for (u_int mixLane15bc = 0u; mixLane15bc < pathVertex->mlHeroLaneCount; ++mixLane15bc) {
-				float mixNc15bc = 0.f, mixNtBase15bc = 0.f, mixNtLambda15bc = 0.f;
-				float mixFresnel15bc = 0.f, mixEta15bc = 0.f, mixEta2_15bc = 0.f;
-				float mixTransport15bc = 0.f, mixDirDelta15bc = 0.f;
-				float mixCosFixed15bc = 0.f, mixSinI2_15bc = 0.f, mixSinT2_15bc = 0.f;
-				float mixEventPdf15bc = 0.f;
-				bool mixTir15bc = false;
-				Spectrum mixMultiplier15bc;
-				pathVertex->bsdf.EvaluateMLHeroGlassDebugAtWaveLength(
-					sampledDir, event, bsdfPdfW, pathVertex->mlHeroLaneWaveLength[mixLane15bc],
-					&mixNc15bc, &mixNtBase15bc, &mixNtLambda15bc,
-					&mixFresnel15bc, &mixEta15bc, &mixEta2_15bc, &mixTransport15bc,
-					&mixDirDelta15bc, &mixMultiplier15bc,
-					&mixCosFixed15bc, &mixSinI2_15bc, &mixSinT2_15bc, &mixTir15bc,
-					&mixEventPdf15bc);
-				spectralMixEventPdfW15bc += mixEventPdf15bc;
-			}
-			spectralMixEventPdfW15bc /= (float)pathVertex->mlHeroLaneCount;
-		}
-
-		bool dispersiveSpecularTransmit15be = false;
-		// ML HERO phase 15cs: when no per-lane Glass evaluation is active, do the
-		// lightweight scan here so Mode 0/1/2 all detect the same physical boundary.
-		if (glassNeedsIndependentDispersionDetection15cs && heroGlassEvalOk15bx &&
-				(event & TRANSMIT) && (pathVertex->mlHeroLaneCount > 1u)) {
-			for (u_int lane15bx = 1u; lane15bx < pathVertex->mlHeroLaneCount; ++lane15bx) {
-				float nc15bx = 0.f, ntBase15bx = 0.f, ntLambda15bx = 0.f;
-				float fresnel15bx = 0.f, eta15bx = 0.f, eta2_15bx = 0.f;
-				float transport15bx = 0.f, dirDelta15bx = 0.f;
-				float cosFixed15bx = 0.f, sinI2_15bx = 0.f, sinT2_15bx = 0.f;
-				float laneEventPdfW15bx = 0.f;
-				bool tir15bx = false;
-				Spectrum multiplier15bx;
-				const bool ok15bx = pathVertex->bsdf.EvaluateMLHeroGlassDebugAtWaveLength(
-					sampledDir, event, bsdfPdfW, pathVertex->mlHeroLaneWaveLength[lane15bx],
-					&nc15bx, &ntBase15bx, &ntLambda15bx,
-					&fresnel15bx, &eta15bx, &eta2_15bx, &transport15bx,
-					&dirDelta15bx, &multiplier15bx,
-					&cosFixed15bx, &sinI2_15bx, &sinT2_15bx, &tir15bx,
-					&laneEventPdfW15bx);
-				if (ok15bx && (fabsf(ntLambda15bx - heroNtLambda15bb) > 1e-5f)) {
-					dispersiveSpecularTransmit15be = true;
-					break;
-				}
-			}
-		}
-
-		// Phase 15br keeps the pre-Glass lane throughput and the exact multiplier
-		// applied to each lane.  This is diagnostic-only and lets us reconstruct a
-		// shared-weight counterfactual at the same bounce without a second render.
-		float lanePreGlassScalar15br[8] = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+		// 15ez: one spectral Glass/RoughGlass transport, independent of legacy modes.
 		Spectrum lanePreGlassSpectrum15dm[8];
-		float laneAppliedGlassMultiplier15br[8] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f };
-		const float sharedGlassMultiplier15br =
-			(bsdfSample.c[0] + bsdfSample.c[1] + bsdfSample.c[2]) / 3.f;
 
-		// ML HERO phase 15db: first real RoughGlass Mode-2 render experiment.
-		// Sample() keeps one shared HERO direction. Continuous RoughGlass TRANSMIT
-		// evaluates that direction at each vertex-owned wavelength and uses the
-		// 25% partial Balance correction selected by the 15da diagnostic.
-		const bool roughGlassMode2Transmit15db =
-			(engine->mlHeroGlassMode == 2) &&
-			(pathVertex->bsdf.GetMaterialType() == ROUGHGLASS) &&
-			(event & TRANSMIT) && (event & GLOSSY) && !(event & SPECULAR) &&
-			(pathVertex->mlHeroLaneCount > 1u);
-		Spectrum roughGlassLaneEval15db[8];
-		float roughGlassLanePdf15db[8] = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
-		bool roughGlassLaneValid15db[8] = { false, false, false, false, false, false, false, false };
-		double roughGlassPdfSum15db = 0.0;
-		u_int roughGlassValidCount15db = 0u;
-		if (roughGlassMode2Transmit15db) {
-			const float savedWaveLength15db = mlDispersionWaveLength;
-			const bool savedDispersionUsed15db = mlDispersionUsed;
-			const u_int laneCount15db = Min(pathVertex->mlHeroLaneCount, 8u);
-			for (u_int lane15db = 0u; lane15db < laneCount15db; ++lane15db) {
-				mlDispersionWaveLength = pathVertex->mlHeroLaneWaveLength[lane15db];
-				mlDispersionUsed = false;
-				BSDFEvent laneEvent15db = NONE;
-				float lanePdf15db = 0.f, laneRevPdf15db = 0.f;
-				const Spectrum laneEval15db = pathVertex->bsdf.Evaluate(sampledDir,
-					&laneEvent15db, &lanePdf15db, &laneRevPdf15db);
-				const bool eventMatches15db =
-					((event & TRANSMIT) == (laneEvent15db & TRANSMIT)) &&
-					((event & REFLECT) == (laneEvent15db & REFLECT));
-				const bool valid15db = !laneEval15db.Black() && (lanePdf15db > 1e-20f) && eventMatches15db;
-				roughGlassLaneEval15db[lane15db] = laneEval15db;
-				roughGlassLanePdf15db[lane15db] = lanePdf15db;
-				roughGlassLaneValid15db[lane15db] = valid15db;
-				if (valid15db) {
-					roughGlassPdfSum15db += (double)lanePdf15db;
-					++roughGlassValidCount15db;
-				}
-			}
-			mlDispersionWaveLength = savedWaveLength15db;
-			mlDispersionUsed = savedDispersionUsed15db;
-			if ((roughGlassValidCount15db > 0u) && (roughGlassPdfSum15db > 1e-30))
-				mlHero15dbAppliedEvents.fetch_add(1ull, std::memory_order_relaxed);
-		}
+        const bool glassSpectralActive15ev =
+            pathVertex->bsdf.GetMaterialType() == GLASS && (event & SPECULAR);
+        const bool glassDispersiveTx15ev = glassSpectralActive15ev &&
+            (event & TRANSMIT) && pathVertex->bsdf.HasMLHeroGlassDispersion();
+        float glassFactor15ev[8] = {};
+        const u_int glassSide15ev = pathVertex->bsdf.hitPoint.fromLight ? 1u : 0u;
+        u_int glassRejected15ev = 0u;
+        float glassHeroDelta15ev = 0.f;
+        if (glassSpectralActive15ev) {
+            const u_int evaluateCount = glassDispersiveTx15ev ? 1u : pathVertex->mlHeroLaneCount;
+            for (u_int lane = 0u; lane < evaluateCount; ++lane) {
+                if (pathVertex->mlHeroLaneThroughput[lane].Black()) continue;
+                Spectrum value;
+                float delta = 0.f;
+                const bool ok = pathVertex->bsdf.EvaluateMLHeroGlassSampleAtWaveLength(
+                    sampledDir, event, bsdfPdfW, pathVertex->mlHeroLaneWaveLength[lane], &value, &delta);
+                mlHero15evCalls[glassSide15ev].fetch_add(1ull, std::memory_order_relaxed);
+                if (!ok) {
+                    ++glassRejected15ev;
+                    mlHero15evRejected[glassSide15ev].fetch_add(1ull, std::memory_order_relaxed);
+                }
+                if (lane == 0u) glassHeroDelta15ev = delta;
+                glassFactor15ev[lane] = MLHeroGlassLaneColorSample15df(
+                    ok ? value : bsdfSample, pathVertex->mlHeroLaneWaveLength[lane]);
+            }
+            pathVertex->mlHeroSpectralGlassHistory = true;
+        }
+
+        const bool roughSpectralActive15et =
+            pathVertex->bsdf.GetMaterialType() == ROUGHGLASS &&
+            (event & GLOSSY) && !(event & SPECULAR);
+        float roughFactor15et[8] = {};
+        const u_int roughStage15et = pathVertex->bsdf.hitPoint.fromLight ? 1u : 0u;
+        if (roughSpectralActive15et) {
+            const u_int evaluateCount15et = ((event & TRANSMIT) &&
+                pathVertex->bsdf.HasMLHeroRoughGlassDispersion()) ? 1u : pathVertex->mlHeroLaneCount;
+            for (u_int lane = 0; lane < evaluateCount15et; ++lane) {
+                if (pathVertex->mlHeroLaneThroughput[lane].Black()) continue;
+                Spectrum value;
+                const bool ok = MLHeroRoughValue15et(pathVertex->bsdf, sampledDir,
+                    event, pathVertex->mlHeroLaneWaveLength[lane], &value, roughStage15et) &&
+                    std::isfinite(bsdfPdfW) && bsdfPdfW > 0.f;
+                // Retain a wavelength-domain native Sample multiplier only for
+                // rejected boundary evaluations; no RGB lane multiplier.
+                roughFactor15et[lane] = ok ? value.c[0] / bsdfPdfW :
+                    MLHeroGlassLaneColorSample15df(bsdfSample, pathVertex->mlHeroLaneWaveLength[lane]);
+            }
+        }
+
+        // Keep the original live-packet/dispersion boundary for RoughGlass.
+        const bool roughGlassLivePacketTransmit15er =
+            (pathVertex->bsdf.GetMaterialType() == ROUGHGLASS) &&
+            (event & TRANSMIT) && (event & GLOSSY) && !(event & SPECULAR) &&
+            (pathVertex->mlHeroLaneCount > 1u) &&
+            !pathVertex->mlHeroSecondaryWavelengthsTerminated &&
+            (pathVertex->mlHeroActiveWavelengthCount > 1u);
+        const bool roughGlassDispersiveTransmit15dv =
+            roughGlassLivePacketTransmit15er && mlDispersionUsed;
 
 		for (u_int lane = 0; lane < pathVertex->mlHeroLaneCount; ++lane) {
-			lanePreGlassScalar15br[lane] = pathVertex->mlHeroLaneThroughput[lane].c[0];
 			if (lane < 8u) lanePreGlassSpectrum15dm[lane] = pathVertex->mlHeroLaneThroughput[lane];
 			Spectrum laneSample;
-			if (glassLaneEvalActive15ca) {
-				float nc15ay = 0.f, ntBase15ay = 0.f, ntLambda15ay = 0.f;
-				float fresnel15ay = 0.f, eta15ay = 0.f, eta2_15ay = 0.f;
-				float transport15ay = 0.f, dirDelta15ay = 0.f;
-				float cosFixed15ba = 0.f, sinI2_15ba = 0.f, sinT2_15ba = 0.f;
-				float laneEventPdfW15ba = 0.f;
-				bool tir15ba = false;
-				Spectrum materialIdealMultiplier15ay;
-				const float laneLambda15ba = pathVertex->mlHeroLaneWaveLength[lane];
-				const bool ok15ay = pathVertex->bsdf.EvaluateMLHeroGlassDebugAtWaveLength(
-					sampledDir, event, bsdfPdfW, laneLambda15ba,
-					&nc15ay, &ntBase15ay, &ntLambda15ay,
-					&fresnel15ay, &eta15ay, &eta2_15ay, &transport15ay,
-					&dirDelta15ay, &materialIdealMultiplier15ay,
-					&cosFixed15ba, &sinI2_15ba, &sinT2_15ba, &tir15ba,
-					&laneEventPdfW15ba);
-
-				if (ok15ay && (event & TRANSMIT) &&
-						(fabsf(ntLambda15ay - heroNtLambda15bb) > 1e-5f))
-					dispersiveSpecularTransmit15be = true;
-
-				// Phase 15ba diagnostics are evaluated even if the lane itself
-				// would be TIR and therefore falls back to shared-HERO weighting.
-				if (tir15ba) ++tirLanes15ba;
-				if ((sinT2_15ba >= .95f) && (sinT2_15ba < 1.f)) ++nearTir95Lanes15ba;
-				if ((sinT2_15ba >= .99f) && (sinT2_15ba < 1.f)) ++nearTir99Lanes15ba;
-				if ((bsdfPdfW > 1e-20f) && (laneEventPdfW15ba > 1e-20f) &&
-						(fabsf(laneEventPdfW15ba / bsdfPdfW - 1.f) > .20f))
-					++pdfMismatch20PctLanes15ba;
-
-				// 15bb: compare path support at base, HERO and lane IOR.
-				const bool entering15bb = (cosFixed15ba > 0.f);
-				const float baseEta15bb = (nc15ay > 1e-20f && ntBase15ay > 1e-20f) ?
-					(entering15bb ? (nc15ay / ntBase15ay) : (ntBase15ay / nc15ay)) : 0.f;
-				const float baseSinT2_15bb = baseEta15bb * baseEta15bb * sinI2_15ba;
-				const bool baseTir15bb = (baseSinT2_15bb >= 1.f);
-
-				if (baseTir15bb != heroTir15bb) ++baseHeroTirMismatchLanes15bb;
-				if (heroTir15bb != tir15ba) ++heroLaneTirMismatchLanes15bb;
-				if (baseTir15bb != tir15ba) ++baseLaneTirMismatchLanes15bb;
-				if ((baseTir15bb == heroTir15bb) && (heroTir15bb == tir15ba))
-					++allThreeTirAgreeLanes15bb;
-
-				float baseDirDelta15bb = 0.f, baseDirAngle15bb = 0.f;
-				float heroDirAngle15bb = 0.f, laneDirAngle15bb = 0.f;
-				if (event & TRANSMIT) {
-					if (!baseTir15bb) {
-						const float baseCost15bb = sqrtf(Max(0.f, 1.f - baseSinT2_15bb)) * (entering15bb ? -1.f : 1.f);
-						const Vector baseExpected15bb(-baseEta15bb * localFixed15bb.x, -baseEta15bb * localFixed15bb.y, baseCost15bb);
-						baseDirDelta15bb = (baseExpected15bb - localSampled15bb).Length();
-						baseDirAngle15bb = acosf(Clamp(Dot(baseExpected15bb, localSampled15bb), -1.f, 1.f));
-					}
-					if (!heroTir15bb) {
-						const float heroCost15bb = sqrtf(Max(0.f, 1.f - heroSinT2_15bb)) * (heroCosFixed15bb > 0.f ? -1.f : 1.f);
-						const Vector heroExpected15bb(-heroEta15bb * localFixed15bb.x, -heroEta15bb * localFixed15bb.y, heroCost15bb);
-						heroDirAngle15bb = acosf(Clamp(Dot(heroExpected15bb, localSampled15bb), -1.f, 1.f));
-					}
-					if (!tir15ba) {
-						const float laneCost15bb = sqrtf(Max(0.f, 1.f - sinT2_15ba)) * (cosFixed15ba > 0.f ? -1.f : 1.f);
-						const Vector laneExpected15bb(-eta15ay * localFixed15bb.x, -eta15ay * localFixed15bb.y, laneCost15bb);
-						laneDirAngle15bb = acosf(Clamp(Dot(laneExpected15bb, localSampled15bb), -1.f, 1.f));
-					}
-				}
-
-				// Phase 15bn: accumulate the wavelength-dependent Glass event probability
-				// along this path.  For a perfect specular transmission, also track whether
-				// this exact sampled HERO direction has Dirac support at each lane.  This is
-				// the distinction made by the spectral MIS derivation: event probability
-				// alone is not the probability of generating the same perfect-specular path.
-				if (ok15ay) {
-					const double laneEventP15bn = (laneEventPdfW15ba > 0.f) ? (double)laneEventPdfW15ba : 0.0;
-					pathVertex->mlHeroLaneGlassEventPdfProduct[lane] *= laneEventP15bn;
-					bool diracSupport15bn = (laneEventP15bn > 0.0);
-					if (event & TRANSMIT)
-						diracSupport15bn = diracSupport15bn && !tir15ba && (dirDelta15ay <= 1e-5f);
-					if (diracSupport15bn)
-						pathVertex->mlHeroLaneDiracSupportPdfProduct[lane] *= laneEventP15bn;
-					else
-						pathVertex->mlHeroLaneDiracSupportPdfProduct[lane] = 0.0;
-				}
-
-				if (ok15ay) {
-					const Spectrum wrappedIdealMultiplier15ay =
-						materialIdealMultiplier15ay * glassAdjointCorrection15ay;
-					// ML HERO phase 15df: do not collapse chromatic Glass RGB to a
-					// single gray scalar. Sample the RGB multiplier at this lane's
-					// wavelength so Reflection/Transmission Color survives packet mode.
-					const float laneGlassMultiplier15ay =
-						MLHeroGlassLaneColorSample15df(wrappedIdealMultiplier15ay, laneLambda15ba);
-
-					const float sharedGlassMultiplier15az =
-						(bsdfSample.c[0] + bsdfSample.c[1] + bsdfSample.c[2]) / 3.f;
-					if (fabsf(sharedGlassMultiplier15az) > 1e-20f) {
-						const float correction15az = laneGlassMultiplier15ay / sharedGlassMultiplier15az;
-						const float lanePdfAdjustedCorrection15bc =
-							(laneEventPdfW15ba > 1e-20f) ?
-							(correction15az * bsdfPdfW / laneEventPdfW15ba) : 0.f;
-						const float spectralMixAdjustedCorrection15bc =
-							(spectralMixEventPdfW15bc > 1e-20f) ?
-							(correction15az * bsdfPdfW / spectralMixEventPdfW15bc) : 0.f;
-
-						// ML HERO phase 15bd: a transmission lane only shares the HERO event support
-						// when both HERO and lane agree about TIR/non-TIR.  We do not apply any
-						// correction here; this merely classifies lanes before evaluating the
-						// already promising lane-PDF candidate.  A support mismatch would require
-						// a different sampling/MIS construction, not a throughput clamp.
-						const bool supportMatch15bd = !(event & TRANSMIT) ||
-							(heroTir15bb == tir15ba);
-						const float supportAwareCorrection15bd = supportMatch15bd ?
-							lanePdfAdjustedCorrection15bc : 0.f;
-						const bool eyeTransmit15bd = (event & TRANSMIT) &&
-							!pathVertex->bsdf.hitPoint.fromLight;
-						if (eyeTransmit15bd && !supportMatch15bd)
-							++eyeTransmitSupportMismatchTotal15bd;
-						else if ((event & TRANSMIT) && pathVertex->bsdf.hitPoint.fromLight && !supportMatch15bd)
-							++lightTransmitSupportMismatchTotal15bd;
-
-						if (eyeTransmit15bd && !heroTir15bb &&
-							(heroSinT2_15bb >= .99f) && (heroSinT2_15bb < 1.f)) {
-							++eyeTransmitNearHero99Lanes15bd;
-							if (supportMatch15bd) {
-								++eyeTransmitNearHero99SupportMatch15bd;
-								if (fabsf(lanePdfAdjustedCorrection15bc - 1.f) > .25f)
-									++eyeTransmitNearHero99LanePdfOver25Supported15bd;
-								maxEyeTransmitNearHero99LanePdfSupported15bd = Max(
-									maxEyeTransmitNearHero99LanePdfSupported15bd, lanePdfAdjustedCorrection15bc);
-							} else {
-								++eyeTransmitNearHero99SupportMismatch15bd;
-							}
-						}
-						const float absDelta15az = fabsf(correction15az - 1.f);
-
-						if ((event & TRANSMIT) && !heroTir15bb &&
-								(heroSinT2_15bb >= .99f) && (heroSinT2_15bb < 1.f)) {
-							++nearHero99TransmitLanes15bc;
-							if (fabsf(correction15az - 1.f) > .25f) ++rawOver25NearHero99_15bc;
-							if (fabsf(lanePdfAdjustedCorrection15bc - 1.f) > .25f) ++lanePdfAdjustedOver25NearHero99_15bc;
-							if (fabsf(spectralMixAdjustedCorrection15bc - 1.f) > .25f) ++spectralMixAdjustedOver25NearHero99_15bc;
-							maxRawCorrectionNearHero99_15bc = Max(maxRawCorrectionNearHero99_15bc, correction15az);
-							maxLanePdfAdjustedCorrectionNearHero99_15bc = Max(maxLanePdfAdjustedCorrectionNearHero99_15bc, lanePdfAdjustedCorrection15bc);
-							maxSpectralMixAdjustedCorrectionNearHero99_15bc = Max(maxSpectralMixAdjustedCorrectionNearHero99_15bc, spectralMixAdjustedCorrection15bc);
-						}
-						minCorrection15az = Min(minCorrection15az, correction15az);
-						maxCorrection15az = Max(maxCorrection15az, correction15az);
-						++evaluatedLanes15az;
-						if (absDelta15az > .05f) ++lanesOver5Pct15az;
-						if (absDelta15az > .10f) ++lanesOver10Pct15az;
-						if (absDelta15az > .25f) ++lanesOver25Pct15az;
-						if (absDelta15az > maxAbsDelta15az) {
-							maxAbsDelta15az = absDelta15az;
-							extremeCorrection15az = correction15az;
-							extremeLambda15az = laneLambda15ba;
-
-							localOutlier15ba.valid = true;
-							localOutlier15ba.correction = correction15az;
-							localOutlier15ba.absDelta = absDelta15az;
-							localOutlier15ba.lambda = laneLambda15ba;
-							localOutlier15ba.heroLambda = heroLambda15ba;
-							localOutlier15ba.depth = pathVertex->depth;
-							localOutlier15ba.caseIndex = MLHeroGlassCaseIndex15az(
-								pathVertex->bsdf.hitPoint.fromLight, event);
-							localOutlier15ba.heroEventPdfW = bsdfPdfW;
-							localOutlier15ba.laneEventPdfW = laneEventPdfW15ba;
-							localOutlier15ba.pdfRatioHeroOverLane =
-								(laneEventPdfW15ba > 1e-20f) ?
-								(bsdfPdfW / laneEventPdfW15ba) : 0.f;
-							localOutlier15ba.pdfAdjustedCorrection = lanePdfAdjustedCorrection15bc;
-							localOutlier15ba.spectralMixPdfW = spectralMixEventPdfW15bc;
-							localOutlier15ba.spectralMixAdjustedCorrection = spectralMixAdjustedCorrection15bc;
-							localOutlier15ba.supportMatch = supportMatch15bd;
-							localOutlier15ba.supportAwareCorrection = supportAwareCorrection15bd;
-							localOutlier15ba.nc = nc15ay;
-							localOutlier15ba.ntBase = ntBase15ay;
-							localOutlier15ba.ntLambda = ntLambda15ay;
-							localOutlier15ba.eta = eta15ay;
-							localOutlier15ba.eta2 = eta2_15ay;
-							localOutlier15ba.cosFixed = cosFixed15ba;
-							localOutlier15ba.sinI2 = sinI2_15ba;
-							localOutlier15ba.sinT2 = sinT2_15ba;
-							localOutlier15ba.tir = tir15ba;
-							localOutlier15ba.heroIOR = heroNtLambda15bb;
-							localOutlier15ba.baseSinT2 = baseSinT2_15bb;
-							localOutlier15ba.heroSinT2 = heroSinT2_15bb;
-							localOutlier15ba.baseTir = baseTir15bb;
-							localOutlier15ba.heroTir = heroTir15bb;
-							localOutlier15ba.heroDirDelta = heroDirDelta15bb;
-							localOutlier15ba.baseDirDelta = baseDirDelta15bb;
-							localOutlier15ba.laneDirAngle = laneDirAngle15bb;
-							localOutlier15ba.heroDirAngle = heroDirAngle15bb;
-							localOutlier15ba.baseDirAngle = baseDirAngle15bb;
-							localOutlier15ba.fresnelR = fresnel15ay;
-							localOutlier15ba.transport = transport15ay;
-							localOutlier15ba.dirDelta = dirDelta15ay;
-							localOutlier15ba.sharedMultiplier = sharedGlassMultiplier15az;
-							localOutlier15ba.laneMultiplier = laneGlassMultiplier15ay;
-						}
-					}
-
-					// 15di: PLW controls only the base Glass multiplier. Mode 2 keeps its
-					// experiment independent; this build tests shared HERO-PDF ownership.
-					const float sharedGlassLaneMultiplier15df =
-						MLHeroGlassLaneColorSample15df(bsdfSample, laneLambda15ba);
-					const float baseGlassMultiplier15dg = engine->mlHeroGlassPerLaneWeight ?
-						laneGlassMultiplier15ay : sharedGlassLaneMultiplier15df;
-					float appliedGlassMultiplier15be = baseGlassMultiplier15dg;
-					bool supportMismatch15dg = false;
-					if (engine->mlHeroGlassMode == 2) {
-						const bool sameEventSupport15be = !(event & TRANSMIT) ||
-							(heroTir15bb == tir15ba);
-
-#if ML_HERO_MODE2_SHARED_HERO_PDF_15DI
-						// 15di candidate: the path direction/event was sampled with the HERO
-						// PDF (bsdfPdfW). The wavelength-specific Glass helper already returns
-						// f(lambda_i) / p_HERO for the shared sampled event, so companion lanes
-						// must not be divided a second time by p_i. This intentionally removes
-						// the legacy bsdfPdfW/laneEventPdfW reweighting for Mode 2 only.
-						// Event-support mismatches still use the established 15df fallback.
-						if (!sameEventSupport15be) {
-							appliedGlassMultiplier15be = sharedGlassLaneMultiplier15df;
-							supportMismatch15dg = true;
-						}
-#else
-						// Legacy Mode 2 experimental approximation retained for A/B builds.
-						if (sameEventSupport15be && (laneEventPdfW15ba > 1e-20f))
-							appliedGlassMultiplier15be *= bsdfPdfW / laneEventPdfW15ba;
-						else {
-							appliedGlassMultiplier15be = sharedGlassLaneMultiplier15df;
-							supportMismatch15dg = true;
-						}
-#endif
-					}
-
-					// ML HERO phase 15dg: diagnostic-only same-direction control.
-					MLHero15dgRecord(MLHero15dgGlassCase(pathVertex->bsdf.hitPoint.fromLight, event),
-						laneLambda15ba, (double)pathVertex->mlHeroLaneThroughput[lane].Filter(),
-						(double)baseGlassMultiplier15dg, (double)appliedGlassMultiplier15be, supportMismatch15dg);
-
-					laneAppliedGlassMultiplier15br[lane] = appliedGlassMultiplier15be;
-					pathVertex->mlHeroLaneThroughput[lane] *= Spectrum(appliedGlassMultiplier15be);
-				} else {
-					// ML HERO phase 15df safety fallback: keep the shared HERO Glass
-					// result, but do not destroy chroma by reducing it to RGB average.
-					const float scalarBsdf15df = MLHeroGlassLaneColorSample15df(
-						bsdfSample, pathVertex->mlHeroLaneWaveLength[lane]);
-					laneAppliedGlassMultiplier15br[lane] = scalarBsdf15df;
-					pathVertex->mlHeroLaneThroughput[lane] *= Spectrum(scalarBsdf15df);
-				}
-			} else if (roughGlassMode2Transmit15db && (lane < 8u) &&
-					(roughGlassValidCount15db > 0u) && (roughGlassPdfSum15db > 1e-30) &&
-					roughGlassLaneValid15db[lane]) {
-				const double lanePdf15db = (double)roughGlassLanePdf15db[lane];
-				const double balanceWeight15db = lanePdf15db / roughGlassPdfSum15db;
-				const double fullBalanceRatio15db =
-					(double)roughGlassValidCount15db * balanceWeight15db;
-				const double blendRatio15db = .75 + .25 * fullBalanceRatio15db;
-				// ML HERO phase 15df: RoughGlass Mode 2 had the same chroma-loss
-				// pattern as ideal Glass because Filter() reduced a chromatic lane
-				// evaluation to one gray scalar. Reconstruct the lane evaluation at
-				// its own wavelength before the existing PDF/blend logic.
-				const double rawMultiplier15db =
-					(double)MLHeroGlassLaneColorSample15df(roughGlassLaneEval15db[lane],
-						pathVertex->mlHeroLaneWaveLength[lane]) / lanePdf15db;
-				const double appliedMultiplier15db = rawMultiplier15db * blendRatio15db;
-
-				// ML HERO phase 15dg: same-direction raw-vs-Blend25 energy audit.
-				MLHero15dgRecord(MLHero15dgRoughTransmitCase(pathVertex->bsdf.hitPoint.fromLight),
-					pathVertex->mlHeroLaneWaveLength[lane],
-					(double)pathVertex->mlHeroLaneThroughput[lane].Filter(),
-					rawMultiplier15db, appliedMultiplier15db, false);
-
-				// ML HERO phase 15dc: observe full-render tails before throughput update.
-				const u_int transportCase15dc = pathVertex->bsdf.hitPoint.fromLight ? 1u : 0u;
-				const double absRaw15dc = fabs(rawMultiplier15db);
-				const double absApplied15dc = fabs(appliedMultiplier15db);
-				const unsigned long long laneOrdinal15dc =
-					mlHero15dcCaseLanes[transportCase15dc].fetch_add(1ull, std::memory_order_relaxed) + 1ull;
-				for (u_int bin15dc = 0u; bin15dc < MLHERO_15DC_TAIL_BINS; ++bin15dc) {
-					if (absRaw15dc > mlHero15dcTailThreshold[bin15dc])
-						mlHero15dcRawTailCount[transportCase15dc][bin15dc].fetch_add(1ull, std::memory_order_relaxed);
-					if (absApplied15dc > mlHero15dcTailThreshold[bin15dc])
-						mlHero15dcAppliedTailCount[transportCase15dc][bin15dc].fetch_add(1ull, std::memory_order_relaxed);
-				}
-
-				const double mixPdf15dc = roughGlassPdfSum15db / (double)roughGlassValidCount15db;
-				const float heroPdf15dc = roughGlassLanePdf15db[0];
-				const double heroRaw15dc = (roughGlassLaneValid15db[0] && (heroPdf15dc > 1e-20f)) ?
-					((double)MLHeroGlassLaneColorSample15df(roughGlassLaneEval15db[0],
-						pathVertex->mlHeroLaneWaveLength[0]) / (double)heroPdf15dc) : 0.0;
-				auto fillTail15dc = [&](MLHero15dcTailOutlier &out15dc) {
-					out15dc.valid = true;
-					out15dc.absRaw = absRaw15dc;
-					out15dc.absApplied = absApplied15dc;
-					out15dc.rawMultiplier = rawMultiplier15db;
-					out15dc.appliedMultiplier = appliedMultiplier15db;
-					out15dc.blendRatio = blendRatio15db;
-					out15dc.balanceWeight = balanceWeight15db;
-					out15dc.mixPdf = mixPdf15dc;
-					out15dc.heroPdf = heroPdf15dc;
-					out15dc.lanePdf = roughGlassLanePdf15db[lane];
-					out15dc.heroRawMultiplier = heroRaw15dc;
-					out15dc.heroLambda = pathVertex->mlHeroLaneWaveLength[0];
-					out15dc.laneLambda = pathVertex->mlHeroLaneWaveLength[lane];
-					out15dc.cosFixed = localFixed15bb.z;
-					out15dc.cosSampled = localSampled15bb.z;
-					out15dc.lane = lane;
-					out15dc.depth = pathVertex->depth;
-					out15dc.laneOrdinal = laneOrdinal15dc;
-				};
-				if (MLHeroAtomicClaimMax15dc(mlHero15dcRawMaxHint[transportCase15dc], absRaw15dc)) {
-					std::lock_guard<std::mutex> lock15dc(mlHero15dcTailMutex);
-					if (!mlHero15dcWorstRaw[transportCase15dc].valid ||
-							absRaw15dc > mlHero15dcWorstRaw[transportCase15dc].absRaw)
-						fillTail15dc(mlHero15dcWorstRaw[transportCase15dc]);
-				}
-				if (MLHeroAtomicClaimMax15dc(mlHero15dcAppliedMaxHint[transportCase15dc], absApplied15dc)) {
-					std::lock_guard<std::mutex> lock15dc(mlHero15dcTailMutex);
-					if (!mlHero15dcWorstApplied[transportCase15dc].valid ||
-							absApplied15dc > mlHero15dcWorstApplied[transportCase15dc].absApplied)
-						fillTail15dc(mlHero15dcWorstApplied[transportCase15dc]);
-				}
-
-				pathVertex->mlHeroLaneThroughput[lane] *= Spectrum((float)appliedMultiplier15db);
-				mlHero15dbAppliedLanes.fetch_add(1ull, std::memory_order_relaxed);
-				mlHero15dbAppliedMultiplierAbsSum.fetch_add(fabs(appliedMultiplier15db), std::memory_order_relaxed);
-				MLHeroAtomicMax15co(mlHero15dbAppliedMultiplierAbsMax, fabs(appliedMultiplier15db));
-				mlHero15dbAppliedOverRawSum.fetch_add(fabs(blendRatio15db), std::memory_order_relaxed);
-				MLHeroAtomicMax15co(mlHero15dbAppliedOverRawMax, fabs(blendRatio15db));
-			} else if (roughGlassMode2Transmit15db) {
-				// ML HERO phase 15df: conservative shared-physics fallback, now with
-				// wavelength-domain color preservation instead of RGB averaging.
-				const float scalarBsdf15db = MLHeroGlassLaneColorSample15df(
-					bsdfSample, pathVertex->mlHeroLaneWaveLength[lane]);
-				pathVertex->mlHeroLaneThroughput[lane] *= Spectrum(scalarBsdf15db);
-				mlHero15dbFallbackLanes.fetch_add(1ull, std::memory_order_relaxed);
+// 15fe BEGIN
+            if (bounceReady15fe) {
+                pathVertex->mlHeroLaneThroughput[lane] *= bounceValues15fe[lane];
+            } else
+// 15fe END
+            if (roughSpectralActive15et) {
+                pathVertex->mlHeroLaneThroughput[lane] *= Spectrum(roughFactor15et[lane]);
+            } else if (glassSpectralActive15ev) {
+                pathVertex->mlHeroLaneThroughput[lane] *= Spectrum(glassFactor15ev[lane]);
 			} else if (pathVertex->bsdf.EvaluateMLHeroMetal2SampleAtWaveLength(sampledDir,
 					pathVertex->mlHeroLaneWaveLength[lane], &laneSample)) {
 				pathVertex->mlHeroLaneThroughput[lane] *= laneSample;
+                routes15fu[lane]=0u;
 				usedExplicitMetal2 = true;
 			} else if (glossy2SpectralActive15ae && glossy2KdSPD15ae) {
 				const float lambda15ae = pathVertex->mlHeroLaneWaveLength[lane];
-				const float kdSpectral15ae = engine->mlHeroGlossy2BasisCompensation ?
-					MLHeroGlossy2BasisCompensatedSample15cp(glossy2Kd15ae, lambda15ae) :
-					MLHeroGlossy2ReflSampleNonNegative380_780(*glossy2KdSPD15ae, lambda15ae);
+				const float kdSpectral15ae = MLHeroKdReflectance15fx(
+                    glossy2Kd15ae,lambda15ae,engine->mlHeroGlossy2BasisCompensation);
 				const float laneGlossy215ae =
 					glossy2CoatingScalar15ae +
 					glossy2ResidualScalar15ae +
 					glossy2BaseFactor15ae * kdSpectral15ae;
 
+                routes15fu[lane]=1u;
 				pathVertex->mlHeroLaneThroughput[lane] *= Spectrum(laneGlossy215ae);
 			} else if (genericReflectanceSPD) {
 				const float lambda15cc = pathVertex->mlHeroLaneWaveLength[lane];
@@ -5707,7 +6874,11 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 					(engine->mlHeroGenericReflectanceCompensation ?
 						MLHeroGenericBasisCompensatedSample15cn(bsdfSample, lambda15cc) :
 						laneReflectanceRaw15cc);
-				pathVertex->mlHeroLaneThroughput[lane] *= Spectrum(laneReflectance15cc);
+                routes15fu[lane]=2u;
+				const float applied15fx=matteReady15fx ? static_cast<float>(matteScalar15fx) *
+                    MLHeroKdReflectance15fx(matteKd15fx,lambda15cc,engine->mlHeroMatteBasisCompensation) :
+                    laneReflectance15cc;
+                pathVertex->mlHeroLaneThroughput[lane] *= Spectrum(applied15fx);
 				usedGenericReflectanceSPD = true;
 			} else {
 				// ML HERO phase 15y:
@@ -5719,13 +6890,61 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 				if (MLHeroIsScalarSpectrum(bsdfSample)) {
 					const float scalarBsdf =
 						(bsdfSample.c[0] + bsdfSample.c[1] + bsdfSample.c[2]) / 3.f;
+                    routes15fu[lane]=3u;
 					pathVertex->mlHeroLaneThroughput[lane] *= Spectrum(scalarBsdf);
 				} else {
+                    routes15fu[lane]=4u;
 					pathVertex->mlHeroLaneThroughput[lane] *= bsdfSample;
 				}
 			}
 		}
 
+        // 15fv: post-material candidate, before any current RR 1/q.
+        if(defer15fv) {
+            double post15fv[8][3]={};
+            for(unsigned i=0;i<pathVertex->mlHeroLaneCount;++i)
+                for(unsigned c=0;c<3;++c)post15fv[i][c]=pathVertex->mlHeroLaneThroughput[i].c[c];
+            double beta15fv=0.;
+            const bool valid15fv=MLHeroMaterialBeta15fv(pathVertex->mlHeroLaneCount,
+                pathVertex->mlHeroSecondaryWavelengthsTerminated,post15fv,
+                pathVertex->mlHeroRREtaValid15fs,pathVertex->mlHeroRREtaScale15fs,&beta15fv);
+            const float baseline15fv=RenderEngine::RussianRouletteProb(bsdfSample,engine->rrImportanceCap);
+            bool selected15fv=false;
+            const float prob15fv=MLHeroRRSelect15ft(baseline15fv,true,true,
+                valid15fv,beta15fv,engine->rrImportanceCap,&selected15fv);
+            random15fu=sampler->GetSample(sampleOffset+2);
+            killed15fu=(selected15fv && prob15fv<=0.f) || prob15fv<random15fu;
+            if(audit15fs) {
+                MLHeroMaterialLiveRecord15fv(static_cast<unsigned>(bucket15fu),
+                    pathVertex->depth,selected15fv,baseline15fv,prob15fv,random15fu,killed15fu);
+                MLHeroRRLiveRecord15ft(0u,pathVertex->depth,false,
+                    baseline15fv,prob15fv,random15fu,killed15fu);
+                MLHeroRRRecord15fs(0u,pathVertex->depth,(event & SPECULAR)!=0,
+                    true,prob15fv,random15fu,killed15fu,false,false,0.,false,0.,engine->rrImportanceCap);
+            }
+            if(!killed15fu) {
+                mlHeroRrProb15et=prob15fv;
+                pathVertex->throughput/=prob15fv;
+                MLHeroDivideLaneThroughput(pathVertex,prob15fv);
+            }
+        }
+        if(audit15fu) {
+            double post15fu[8][3]={};
+            for(unsigned i=0;i<pathVertex->mlHeroLaneCount;++i)
+                for(unsigned c=0;c<3;++c)post15fu[i][c]=
+                    double(pathVertex->mlHeroLaneThroughput[i].c[c])*mlHeroRrProb15et;
+            MLHeroMaterialRRRecord15fu(pathVertex->bsdf.hitPoint.fromLight?1u:0u,
+                static_cast<unsigned>(bucket15fu),pathVertex->depth,
+                pathVertex->depth>=engine->rrDepth,killed15fu,random15fu,
+                engine->rrImportanceCap,pathVertex->mlHeroLaneCount,
+                pathVertex->mlHeroSecondaryWavelengthsTerminated,pre15fu,post15fu,
+                routes15fu,pathVertex->mlHeroRREtaValid15fs,pathVertex->mlHeroRREtaScale15fs);
+        }
+        if(killed15fu)return false;
+
+// 15fe BEGIN
+        if (bounceReady15fe) MLHeroApplied15fe(bounceStage15fe, event);
+// 15fe END
 		if (MLHeroCurrentDiagnosticsEnabled15cq() && usedGenericReflectanceSPD && engine->mlHeroMatteBasisCompensation &&
 				(pathVertex->bsdf.GetMaterialType() == MATTE) &&
 				(materialType15cl < MLHERO_MATERIAL_TYPE_COUNT_15CL))
@@ -5820,336 +7039,104 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
             }
         }
 
-		// ML HERO phase 15cs: after a truly dispersive, perfectly-specular
-		// transmission bounce, Mode 0/1/2 all keep only the sampled HERO wavelength
-		// (lane 0). Before this boundary each mode retains its own packet weighting
-		// and PDF logic. Since packet radiance is reconstructed as 1/N, scale the
-		// surviving lane by N once before zeroing the secondary lanes.
-
-#if ML_HERO_MODE2_RGB_OWNERSHIP_15DM
-		// ML HERO phase 15dm: regular Mode-2 ideal-Glass RGB-ownership path.
-		// LuxCore Glass Sample() already returns the RGB multiplier for the sampled
-		// HERO event/direction. Keep that RGB result owned as RGB instead of
-		// reconstructing the same chromatic multiplier again per companion wavelength.
-		// This applies to every multi-lane ideal-Glass SPECULAR TRANSMIT with PLW off,
-		// including ordinary non-dispersive Glass. For dispersive Delta Glass the
-		// existing packet-to-single-HERO collapse below is unchanged; without
-		// dispersion the RGB-owned packet simply continues with all lanes.
-		const bool mode2RgbOwnership15dm =
-			(engine->mlHeroGlassMode == 2) && glassSpecularCandidate15bx &&
-			(event & TRANSMIT) && !engine->mlHeroGlassPerLaneWeight &&
-			(pathVertex->mlHeroLaneCount > 1u);
-		if (mode2RgbOwnership15dm) {
-			const u_int laneCount15dm = Min(pathVertex->mlHeroLaneCount, 8u);
-			for (u_int lane15dm = 0u; lane15dm < laneCount15dm; ++lane15dm)
-				pathVertex->mlHeroLaneThroughput[lane15dm] = lanePreGlassSpectrum15dm[lane15dm] * bsdfSample;
-		}
-#endif
-
-		if ((event & TRANSMIT) && dispersiveSpecularTransmit15be &&
-				(pathVertex->mlHeroLaneCount > 1u)) {
-			const u_int packetCount15be = pathVertex->mlHeroLaneCount;
-			bool hadLiveSecondary15be = false;
-			for (u_int lane15be = 1u; lane15be < packetCount15be; ++lane15be) {
-				if (!pathVertex->mlHeroLaneThroughput[lane15be].Black()) {
-					hadLiveSecondary15be = true;
+		// ML HERO phase 15dw: controlled HERO-only reference for dispersive
+		// continuous RoughGlass transmission in all modes (15er). The transition is
+		// explicitly one-shot: require a real live companion lane and an
+		// un-terminated packet, then restore lane 0 to the unblended HERO f/p
+		// estimator, apply packet->single xN exactly once, and mark the vertex
+		// HERO-only. Later RoughGlass bounces use the same spectral transport.
+		if (roughGlassDispersiveTransmit15dv && (pathVertex->mlHeroLaneCount > 1u)) {
+			const u_int packetCount15dv = pathVertex->mlHeroLaneCount;
+			bool hadLiveSecondary15dw = false;
+			for (u_int lane15dw = 1u; lane15dw < packetCount15dv; ++lane15dw) {
+				if (!mlHeroBeforeTP[lane15dw].Black()) {
+					hadLiveSecondary15dw = true;
 					break;
 				}
 			}
 
-			float packetScalarSum15bf = 0.f;
-			for (u_int lane15bf = 0u; lane15bf < packetCount15be; ++lane15bf)
-				packetScalarSum15bf += pathVertex->mlHeroLaneThroughput[lane15bf].c[0];
-			const float heroScalar15bf = pathVertex->mlHeroLaneThroughput[0].c[0];
-			const float packetAverage15bf =
-				(packetCount15be > 0u) ? (packetScalarSum15bf / (float)packetCount15be) : 0.f;
-
-			// Phase 15br counterfactual: the exact same pre-Glass lane packet, but
-			// every lane receives LuxCore's shared Glass scalar.  The xN step below
-			// cancels with the existing 1/N reconstruction, so comparing the HERO
-			// scalar here also compares the final reconstructed Mode-1 energy.
-			float sharedPacketScalarSum15br = 0.f;
-			for (u_int lane15br = 0u; lane15br < packetCount15be; ++lane15br)
-				sharedPacketScalarSum15br += lanePreGlassScalar15br[lane15br] * sharedGlassMultiplier15br;
-			const float sharedPacketAverage15br = (packetCount15be > 0u) ?
-				(sharedPacketScalarSum15br / (float)packetCount15be) : 0.f;
-			const float sharedHeroScalar15br = lanePreGlassScalar15br[0] * sharedGlassMultiplier15br;
-			const float heroPerLaneOverShared15br = (fabsf(sharedHeroScalar15br) > 1e-30f) ?
-				(heroScalar15bf / sharedHeroScalar15br) : 0.f;
-			const float packetPerLaneOverShared15br = (fabsf(sharedPacketAverage15br) > 1e-30f) ?
-				(packetAverage15bf / sharedPacketAverage15br) : 0.f;
-
-			const float heroOnlyBrightnessRatio15bf =
-				(packetAverage15bf > 1e-20f) ? (heroScalar15bf / packetAverage15bf) : 0.f;
-			const float idealPacketScale15bf =
-				(heroScalar15bf > 1e-20f) ? (packetScalarSum15bf / heroScalar15bf) : 0.f;
-
-			// Keep these diagnostics in the outer scope because the first-activation
-			// log below is emitted after the termination block.
-			float heroPdfBefore15bh = pathVertex->mlHeroLaneWaveLengthPdf[0];
-			float heroPdfAfter15bh = heroPdfBefore15bh;
-
-			// Phase 15bn: whole-path spectral technique weight, restricted to the
-			// wavelength-dependent Glass probabilities currently available in LuxCore.
-			// Two versions are reported: event-only (known to be insufficient for a
-			// perfect Dirac interface) and exact-direction-support-aware.
-			double eventDenom15bn = 0.0, supportDenom15bn = 0.0;
-			u_int supportCompetitors15bn = 0u;
-			for (u_int lane15bn = 0u; lane15bn < packetCount15be; ++lane15bn) {
-				eventDenom15bn += pathVertex->mlHeroLaneGlassEventPdfProduct[lane15bn];
-				supportDenom15bn += pathVertex->mlHeroLaneDiracSupportPdfProduct[lane15bn];
-				if ((lane15bn > 0u) && (pathVertex->mlHeroLaneDiracSupportPdfProduct[lane15bn] > 0.0))
-					++supportCompetitors15bn;
-			}
-			const double heroEventProduct15bn = pathVertex->mlHeroLaneGlassEventPdfProduct[0];
-			const double heroSupportProduct15bn = pathVertex->mlHeroLaneDiracSupportPdfProduct[0];
-			const double eventWeight15bn = (eventDenom15bn > 0.0) ? heroEventProduct15bn / eventDenom15bn : 0.0;
-			const double supportWeight15bn = (supportDenom15bn > 0.0) ? heroSupportProduct15bn / supportDenom15bn : 0.0;
-
-			if (hadLiveSecondary15be) {
-				// Phase 15br: accumulate the actual per-lane-vs-shared Glass energy shift
-				// at the exact first HERO-only termination.  No value is applied to the render.
-				const bool valid15br = std::isfinite(heroPerLaneOverShared15br) &&
-					std::isfinite(packetPerLaneOverShared15br) &&
-					std::isfinite(heroScalar15bf) && std::isfinite(sharedHeroScalar15br) &&
-					std::isfinite(packetAverage15bf) && std::isfinite(sharedPacketAverage15br);
-				if (valid15br) {
-					mlHero15brTerminationCount.fetch_add(1ull, std::memory_order_relaxed);
-					if (pathVertex->bsdf.hitPoint.fromLight) mlHero15brLightCount.fetch_add(1ull, std::memory_order_relaxed);
-					else mlHero15brEyeCount.fetch_add(1ull, std::memory_order_relaxed);
-					mlHero15brHeroRatioSum.fetch_add((double)heroPerLaneOverShared15br, std::memory_order_relaxed);
-					mlHero15brPacketRatioSum.fetch_add((double)packetPerLaneOverShared15br, std::memory_order_relaxed);
-					mlHero15brActualHeroSum.fetch_add((double)heroScalar15bf, std::memory_order_relaxed);
-					mlHero15brSharedHeroSum.fetch_add((double)sharedHeroScalar15br, std::memory_order_relaxed);
-					mlHero15brActualPacketAvgSum.fetch_add((double)packetAverage15bf, std::memory_order_relaxed);
-					mlHero15brSharedPacketAvgSum.fetch_add((double)sharedPacketAverage15br, std::memory_order_relaxed);
-					if (heroPerLaneOverShared15br > 1.01f) mlHero15brHeroOver101.fetch_add(1ull, std::memory_order_relaxed);
-					if (heroPerLaneOverShared15br > 1.05f) mlHero15brHeroOver105.fetch_add(1ull, std::memory_order_relaxed);
-					if (heroPerLaneOverShared15br > 1.25f) mlHero15brHeroOver125.fetch_add(1ull, std::memory_order_relaxed);
-					if (heroPerLaneOverShared15br > 1.50f) mlHero15brHeroOver150.fetch_add(1ull, std::memory_order_relaxed);
-					if (heroPerLaneOverShared15br < .99f) mlHero15brHeroUnder099.fetch_add(1ull, std::memory_order_relaxed);
-					if (packetPerLaneOverShared15br > 1.01f) mlHero15brPacketOver101.fetch_add(1ull, std::memory_order_relaxed);
-					if (packetPerLaneOverShared15br > 1.05f) mlHero15brPacketOver105.fetch_add(1ull, std::memory_order_relaxed);
-					if (packetPerLaneOverShared15br > 1.25f) mlHero15brPacketOver125.fetch_add(1ull, std::memory_order_relaxed);
-					if (packetPerLaneOverShared15br < .99f) mlHero15brPacketUnder099.fetch_add(1ull, std::memory_order_relaxed);
-
-					const unsigned long long detail15br = mlHero15brDetailCount.fetch_add(1ull, std::memory_order_relaxed);
-					if (detail15br < 16ull) {
-						std::lock_guard<std::recursive_mutex> lock15br(mlHeroDebugLogMutex);
-						FILE *f15br = MLHeroOpenLegacyLog15cq("a");
-						if (f15br) {
-							fprintf(f15br, "ML HERO phase 15br GLASS_WEIGHT_COMPARE: sample=%llu depth=%u fromLight=%u heroLambda=%.9g sharedMultiplier=%.9g heroAppliedMultiplier=%.9g heroPre=%.9g actualHero=%.9g sharedHero=%.9g heroPerLaneOverShared=%.9g actualPacketAvg=%.9g sharedPacketAvg=%.9g packetPerLaneOverShared=%.9g currentXnScale=%u\n",
-								detail15br, pathVertex->depth, pathVertex->bsdf.hitPoint.fromLight ? 1u : 0u,
-								pathVertex->mlHeroLaneWaveLength[0], sharedGlassMultiplier15br,
-								laneAppliedGlassMultiplier15br[0], lanePreGlassScalar15br[0],
-								heroScalar15bf, sharedHeroScalar15br, heroPerLaneOverShared15br,
-								packetAverage15bf, sharedPacketAverage15br, packetPerLaneOverShared15br, packetCount15be);
-							fclose(f15br);
-						}
-					}
-				} else {
-					mlHero15brInvalidCount.fetch_add(1ull, std::memory_order_relaxed);
-				}
-
-				mlHero15bnTerminationCount.fetch_add(1ull, std::memory_order_relaxed);
-				mlHero15bnEventWeightSum.fetch_add(eventWeight15bn, std::memory_order_relaxed);
-				mlHero15bnSupportWeightSum.fetch_add(supportWeight15bn, std::memory_order_relaxed);
-				mlHero15bnEventDenomSum.fetch_add(eventDenom15bn, std::memory_order_relaxed);
-				mlHero15bnSupportDenomSum.fetch_add(supportDenom15bn, std::memory_order_relaxed);
-				if (eventWeight15bn < .99) mlHero15bnEventWeightBelow099.fetch_add(1ull, std::memory_order_relaxed);
-				if (eventWeight15bn < .75) mlHero15bnEventWeightBelow075.fetch_add(1ull, std::memory_order_relaxed);
-				if (eventWeight15bn < .50) mlHero15bnEventWeightBelow050.fetch_add(1ull, std::memory_order_relaxed);
-				if (eventWeight15bn < .25) mlHero15bnEventWeightBelow025.fetch_add(1ull, std::memory_order_relaxed);
-				if (fabs(supportWeight15bn - 1.0) <= 1e-6) mlHero15bnSupportWeightNearOne.fetch_add(1ull, std::memory_order_relaxed);
-				if (supportCompetitors15bn > 0u) mlHero15bnSupportCompetitorCount.fetch_add(1ull, std::memory_order_relaxed);
-
-				const unsigned long long detailIndex15bn = mlHero15bnDetailedLogCount.fetch_add(1ull, std::memory_order_relaxed);
-				if (detailIndex15bn < 8ull) {
-					std::lock_guard<std::recursive_mutex> lock15bn(mlHeroDebugLogMutex);
-					FILE *f15bn = MLHeroOpenLegacyLog15cq("a");
-					if (f15bn) {
-						fprintf(f15bn, "ML HERO phase 15bn PATH_SPECTRAL_MIS: sample=%llu depth=%u fromLight=%u heroLambda=%.9g eventWeight=%.12g supportWeight=%.12g eventDenom=%.12g supportDenom=%.12g supportCompetitors=%u currentXnScale=%u eventCandidateRelativeScale=%.12g diracCandidateRelativeScale=%.12g\n",
-							detailIndex15bn, pathVertex->depth, pathVertex->bsdf.hitPoint.fromLight ? 1u : 0u,
-							pathVertex->mlHeroLaneWaveLength[0], eventWeight15bn, supportWeight15bn, eventDenom15bn, supportDenom15bn,
-							supportCompetitors15bn, packetCount15be, eventWeight15bn, supportWeight15bn);
-						for (u_int lane15bn = 0u; lane15bn < packetCount15be; ++lane15bn)
-							fprintf(f15bn, "phase15bn lane=%u lambda=%.9g eventPdfProduct=%.12g diracSupportPdfProduct=%.12g liveTP=%u\n",
-								lane15bn, pathVertex->mlHeroLaneWaveLength[lane15bn],
-								pathVertex->mlHeroLaneGlassEventPdfProduct[lane15bn], pathVertex->mlHeroLaneDiracSupportPdfProduct[lane15bn],
-								pathVertex->mlHeroLaneThroughput[lane15bn].Black() ? 0u : 1u);
-						fclose(f15bn);
-					}
-				}
-			}
-
-			// Apply the packet-to-single-wavelength normalization only once.  On later
-			// dispersive Glass bounces the secondary lanes are already zero.
-			if (hadLiveSecondary15be) {
-				heroPdfAfter15bh = (packetCount15be > 0u) ?
-					(heroPdfBefore15bh / (float)packetCount15be) : heroPdfBefore15bh;
-				pathVertex->mlHeroLaneWaveLengthPdf[0] = heroPdfAfter15bh;
-				for (u_int lane15bh = 1u; lane15bh < packetCount15be; ++lane15bh)
-					pathVertex->mlHeroLaneWaveLengthPdf[lane15bh] = 0.f;
-				pathVertex->mlHeroSecondaryWavelengthsTerminated = true;
-				pathVertex->mlHeroActiveWavelengthCount = 1u;
-				pathVertex->mlHeroTerminationBrightnessRatio = heroOnlyBrightnessRatio15bf;
-				pathVertex->mlHeroTerminationHeroLambda = pathVertex->mlHeroLaneWaveLength[0];
-				pathVertex->mlHeroTerminationPacketAverage = packetAverage15bf;
-				pathVertex->mlHeroTerminationHeroScalar = heroScalar15bf;
-				pathVertex->mlHeroTerminationLaneSelectionPdf = (packetCount15be > 0u) ? (1.f / (float)packetCount15be) : 0.f;
-				pathVertex->mlHeroTerminationWavelengthPdf = heroPdfBefore15bh;
-				pathVertex->mlHeroTerminationCurrentScale = (float)packetCount15be;
-				pathVertex->mlHero15buReferenceThroughput = (double)packetAverage15bf * (double)packetCount15be;
-
-				// ML HERO phase 15dh: capture the local packet->HERO collapse before the
-				// xN throughput scale is applied. Diagnostic only.
-				MLHero15dhRecordTermination(pathVertex->bsdf.hitPoint.fromLight,
-					pathVertex->mlHeroTerminationHeroLambda, (double)heroScalar15bf,
-					(double)packetAverage15bf);
-
-				// Phase 15bt: first-termination metadata, binned before any later visible
-				// contribution can duplicate this vertex.
-				{
-					const u_int side15bt = pathVertex->bsdf.hitPoint.fromLight ? 1u : 0u;
-					const int wb15bt = MLHeroWavelengthBin15bs(pathVertex->mlHeroTerminationHeroLambda);
-					if ((wb15bt >= 0) && std::isfinite(heroOnlyBrightnessRatio15bf) && (heroOnlyBrightnessRatio15bf > 1e-30f)) {
-						mlHero15btTerminationCount[side15bt][wb15bt].fetch_add(1ull, std::memory_order_relaxed);
-						mlHero15btTerminationRatioSum[side15bt][wb15bt].fetch_add((double)heroOnlyBrightnessRatio15bf, std::memory_order_relaxed);
-						mlHero15btHeroScalarSum[side15bt][wb15bt].fetch_add((double)heroScalar15bf, std::memory_order_relaxed);
-						mlHero15btPacketAverageSum[side15bt][wb15bt].fetch_add((double)packetAverage15bf, std::memory_order_relaxed);
-						mlHero15btLaneSelectionPdfSum[side15bt][wb15bt].fetch_add((double)pathVertex->mlHeroTerminationLaneSelectionPdf, std::memory_order_relaxed);
-						mlHero15btWavelengthPdfSum[side15bt][wb15bt].fetch_add((double)pathVertex->mlHeroTerminationWavelengthPdf, std::memory_order_relaxed);
-						mlHero15btCurrentScaleSum[side15bt][wb15bt].fetch_add((double)pathVertex->mlHeroTerminationCurrentScale, std::memory_order_relaxed);
-						mlHero15btLocalIdealScaleSum[side15bt][wb15bt].fetch_add((double)pathVertex->mlHeroTerminationCurrentScale / (double)heroOnlyBrightnessRatio15bf, std::memory_order_relaxed);
-
-						const unsigned long long detail15bt = mlHero15btDetailCount.fetch_add(1ull, std::memory_order_relaxed);
-						if (detail15bt < 16ull) {
-							std::lock_guard<std::recursive_mutex> lock15bt(mlHeroDebugLogMutex);
-							FILE *f15bt = MLHeroOpenLegacyLog15cq("a");
-							if (f15bt) {
-								fprintf(f15bt, "ML HERO phase 15bt TERMINATION: sample=%llu depth=%u side=%s lambda=%.9g laneSelectionPdf=%.12g wavelengthPdf=%.12g packetAverage=%.12g heroScalar=%.12g heroOverPacket=%.12g currentScale=%.12g localIdealScale=%.12g\n",
-									detail15bt, pathVertex->depth, side15bt ? "light" : "eye",
-									pathVertex->mlHeroTerminationHeroLambda, pathVertex->mlHeroTerminationLaneSelectionPdf,
-									pathVertex->mlHeroTerminationWavelengthPdf, packetAverage15bf, heroScalar15bf,
-									heroOnlyBrightnessRatio15bf, pathVertex->mlHeroTerminationCurrentScale,
-									pathVertex->mlHeroTerminationCurrentScale / heroOnlyBrightnessRatio15bf);
-								fclose(f15bt);
-							}
-						}
-					}
-				}
+			if (pathVertex->mlHeroSecondaryWavelengthsTerminated ||
+					(pathVertex->mlHeroActiveWavelengthCount <= 1u)) {
+				mlHero15dwSuppressedAlreadyHeroOnly.fetch_add(1ull, std::memory_order_relaxed);
+			} else if (!hadLiveSecondary15dw) {
+				mlHero15dwSuppressedNoLiveSecondary.fetch_add(1ull, std::memory_order_relaxed);
+			} else {
+                // The current continuous RoughGlass branch always owns this event.
+                // Its accepted helper factor (or spectral boundary fallback) is f/p_HERO.
                 {
-                    const unsigned long long storeIndex15bq = mlHero15bqStoreCount.fetch_add(1ull, std::memory_order_relaxed);
-                    if (!std::isfinite(pathVertex->mlHeroTerminationBrightnessRatio) ||
-                            (pathVertex->mlHeroTerminationBrightnessRatio < 0.f))
-                        mlHero15bqInvalidRatioCount.fetch_add(1ull, std::memory_order_relaxed);
-                    MLHeroLogState15bq("STORE", storeIndex15bq, 4u, *pathVertex);
-                }
-				mlHero15bhPdfTerminations.fetch_add(1ull, std::memory_order_relaxed);
-				if (pathVertex->bsdf.hitPoint.fromLight)
-					mlHero15bhPdfLightTerminations.fetch_add(1ull, std::memory_order_relaxed);
-				else
-					mlHero15bhPdfEyeTerminations.fetch_add(1ull, std::memory_order_relaxed);
-				{
-					std::lock_guard<std::recursive_mutex> mlHero15bfStatsLock(mlHeroDebugLogMutex);
-					MLHeroGlassCorrectionStats15az &stats15bf = mlHeroGlassCorrectionStats15az;
-					++stats15bf.heroOnlyTerminations;
+                    const float heroRaw15dv = roughFactor15et[0];
+                    const float heroBlend15dv = MLHeroGlassLaneColorSample15df(
+                        bsdfSample, pathVertex->mlHeroLaneWaveLength[0]);
+					// This snapshot already owns the single RR division.
+					pathVertex->mlHeroLaneThroughput[0] = lanePreGlassSpectrum15dm[0] * Spectrum(heroRaw15dv);
+
+					const float heroPdfBefore15dv = pathVertex->mlHeroLaneWaveLengthPdf[0];
+					pathVertex->mlHeroLaneWaveLengthPdf[0] = heroPdfBefore15dv / (float)packetCount15dv;
+					for (u_int lane15dv = 1u; lane15dv < packetCount15dv; ++lane15dv) {
+						pathVertex->mlHeroLaneThroughput[lane15dv] = Spectrum();
+						pathVertex->mlHeroLaneWaveLengthPdf[lane15dv] = 0.f;
+					}
+					pathVertex->mlHeroLaneThroughput[0] *= (float)packetCount15dv;
+					pathVertex->mlHeroSecondaryWavelengthsTerminated = true;
+					pathVertex->mlHeroActiveWavelengthCount = 1u;
+					// Reuse the established ideal-Glass termination metadata semantics
+					// so downstream diagnostics/path accounting see a coherent one-shot state.
+					pathVertex->mlHeroTerminationHeroLambda = pathVertex->mlHeroLaneWaveLength[0];
+					pathVertex->mlHeroTerminationLaneSelectionPdf = 1.f / (float)packetCount15dv;
+					pathVertex->mlHeroTerminationWavelengthPdf = heroPdfBefore15dv;
+					pathVertex->mlHeroTerminationCurrentScale = (float)packetCount15dv;
+
+					mlHero15dvTerminationCount.fetch_add(1ull, std::memory_order_relaxed);
 					if (pathVertex->bsdf.hitPoint.fromLight)
-						++stats15bf.heroOnlyLightTerminations;
+						mlHero15dvLightTerminationCount.fetch_add(1ull, std::memory_order_relaxed);
 					else
-						++stats15bf.heroOnlyEyeTerminations;
-					stats15bf.heroOnlyBrightnessRatioSum += heroOnlyBrightnessRatio15bf;
-					stats15bf.heroOnlyIdealScaleSum += idealPacketScale15bf;
-					stats15bf.heroOnlyPacketAverageSum += packetAverage15bf;
-					stats15bf.heroOnlyHeroLaneSum += heroScalar15bf;
-					if (heroOnlyBrightnessRatio15bf < stats15bf.heroOnlyBrightnessRatioMin)
-						stats15bf.heroOnlyBrightnessRatioMin = heroOnlyBrightnessRatio15bf;
-					if (heroOnlyBrightnessRatio15bf > stats15bf.heroOnlyBrightnessRatioMax)
-						stats15bf.heroOnlyBrightnessRatioMax = heroOnlyBrightnessRatio15bf;
-					if (idealPacketScale15bf < stats15bf.heroOnlyIdealScaleMin)
-						stats15bf.heroOnlyIdealScaleMin = idealPacketScale15bf;
-					if (idealPacketScale15bf > stats15bf.heroOnlyIdealScaleMax)
-						stats15bf.heroOnlyIdealScaleMax = idealPacketScale15bf;
-					if (heroOnlyBrightnessRatio15bf > 1.05f) ++stats15bf.heroOnlyRatioOver105;
-					if (heroOnlyBrightnessRatio15bf > 1.25f) ++stats15bf.heroOnlyRatioOver125;
-					if (heroOnlyBrightnessRatio15bf > 1.50f) ++stats15bf.heroOnlyRatioOver150;
-					if (heroOnlyBrightnessRatio15bf < 0.95f) ++stats15bf.heroOnlyRatioUnder095;
-				}
-				pathVertex->mlHeroLaneThroughput[0] *= (float)packetCount15be;
-			}
-			for (u_int lane15be = 1u; lane15be < packetCount15be; ++lane15be)
-				pathVertex->mlHeroLaneThroughput[lane15be] = Spectrum();
-
-			static std::atomic<bool> mlHero15beFirstTerminationLogged(false);
-			bool expected15be = false;
-			if (hadLiveSecondary15be && mlHero15beFirstTerminationLogged.compare_exchange_strong(expected15be, true)) {
-				std::lock_guard<std::recursive_mutex> mlHero15beLogLock(mlHeroDebugLogMutex);
-				FILE *f15be = MLHeroOpenLegacyLog15cq("a");
-				if (f15be) {
-					fprintf(f15be,
-						"ML HERO phase 15cs HERO_ONLY_ACTIVE: glassMode=%d depth=%u fromLight=%u "
-						"event=%u heroLambda=%.9g packetCount=%u packetScalarSum=%.9g heroScalar=%.9g packetAverage=%.9g brightnessRatio=%.9g idealScale=%.9g "
-						"heroPdfBefore=%.9g heroPdfAfterTerminate=%.9g pdfEstimatorScale=%.9g currentThroughputScale=%u\n",
-						engine->mlHeroGlassMode, pathVertex->depth, pathVertex->bsdf.hitPoint.fromLight ? 1u : 0u,
-						(u_int)event, pathVertex->mlHeroLaneWaveLength[0], packetCount15be,
-						packetScalarSum15bf, heroScalar15bf, packetAverage15bf,
-						heroOnlyBrightnessRatio15bf, idealPacketScale15bf,
-						heroPdfBefore15bh, heroPdfAfter15bh,
-						(heroPdfAfter15bh > 1e-30f) ? (heroPdfBefore15bh / heroPdfAfter15bh) : 0.f,
-						packetCount15be);
-					fclose(f15be);
+						mlHero15dvEyeTerminationCount.fetch_add(1ull, std::memory_order_relaxed);
+					mlHero15dvCompanionLanesTerminated.fetch_add(packetCount15dv - 1u, std::memory_order_relaxed);
+					mlHero15dvHeroRawMultiplierSum.fetch_add((double)heroRaw15dv, std::memory_order_relaxed);
+					mlHero15dvHeroBlendMultiplierSum.fetch_add((double)heroBlend15dv, std::memory_order_relaxed);
+					if (fabsf(heroBlend15dv) > 1e-30f)
+						mlHero15dvHeroRawOverBlendSum.fetch_add((double)heroRaw15dv / (double)heroBlend15dv, std::memory_order_relaxed);
 				}
 			}
 		}
+        if (roughSpectralActive15et) {
+            const unsigned long long ticket = mlHero15etApplied[roughStage15et].fetch_add(1ull, std::memory_order_relaxed);
+            if (MLHeroCurrentDiagnosticsEnabled15cq() && ticket < 64ull) {
+                std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
+                FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+                if (f) {
+                    fprintf(f, "phase15et ROUGHGLASS_BOUNCE stage=%u materialID=%u name=\"%s\" event=%u dispersion=%u collapsed=%u activeCount=%u rrProb=%.9g helperFactor0=%.9g preRR0=%.9g postRRBefore0=%.9g after0=%.9g packetScale=%u colorTransport=SPECTRAL\n",
+                        roughStage15et, pathVertex->bsdf.GetMaterialID(), pathVertex->bsdf.GetMaterialName().c_str(),
+                        (u_int)event, pathVertex->bsdf.HasMLHeroRoughGlassDispersion() ? 1u : 0u,
+                        pathVertex->mlHeroSecondaryWavelengthsTerminated ? 1u : 0u,
+                        pathVertex->mlHeroActiveWavelengthCount, mlHeroRrProb15et, roughFactor15et[0],
+                        mlHeroBeforeTP[0].c[0], lanePreGlassSpectrum15dm[0].c[0],
+                        pathVertex->mlHeroLaneThroughput[0].c[0], pathVertex->mlHeroLaneCount);
+                    fclose(f);
+                }
+            }
+        }
 
-		if (MLHeroLegacyDiagnosticsEnabled15cq() && glassPerLaneWeightActive15ay && (evaluatedLanes15az > 0u)) {
-			const u_int caseIndex15az = MLHeroGlassCaseIndex15az(
-				pathVertex->bsdf.hitPoint.fromLight, event);
-			std::lock_guard<std::recursive_mutex> mlHeroStatsLock15az(mlHeroDebugLogMutex);
-			MLHeroGlassCorrectionStats15az &stats15az = mlHeroGlassCorrectionStats15az;
-			++stats15az.glassBounces;
-			stats15az.evaluatedLanes += evaluatedLanes15az;
-			stats15az.laneOver5Pct += lanesOver5Pct15az;
-			stats15az.laneOver10Pct += lanesOver10Pct15az;
-			stats15az.laneOver25Pct += lanesOver25Pct15az;
-			stats15az.tirLanes += tirLanes15ba;
-			stats15az.nearTir95Lanes += nearTir95Lanes15ba;
-			stats15az.nearTir99Lanes += nearTir99Lanes15ba;
-			stats15az.pdfMismatch20PctLanes += pdfMismatch20PctLanes15ba;
-			stats15az.baseHeroTirMismatchLanes += baseHeroTirMismatchLanes15bb;
-			stats15az.heroLaneTirMismatchLanes += heroLaneTirMismatchLanes15bb;
-			stats15az.baseLaneTirMismatchLanes += baseLaneTirMismatchLanes15bb;
-			stats15az.allThreeTirAgreeLanes += allThreeTirAgreeLanes15bb;
-			stats15az.nearHero99TransmitLanes += nearHero99TransmitLanes15bc;
-			stats15az.rawOver25NearHero99 += rawOver25NearHero99_15bc;
-			stats15az.lanePdfAdjustedOver25NearHero99 += lanePdfAdjustedOver25NearHero99_15bc;
-			stats15az.spectralMixAdjustedOver25NearHero99 += spectralMixAdjustedOver25NearHero99_15bc;
-			stats15az.maxRawCorrectionNearHero99 = Max(stats15az.maxRawCorrectionNearHero99, maxRawCorrectionNearHero99_15bc);
-			stats15az.maxLanePdfAdjustedCorrectionNearHero99 = Max(stats15az.maxLanePdfAdjustedCorrectionNearHero99, maxLanePdfAdjustedCorrectionNearHero99_15bc);
-			stats15az.maxSpectralMixAdjustedCorrectionNearHero99 = Max(stats15az.maxSpectralMixAdjustedCorrectionNearHero99, maxSpectralMixAdjustedCorrectionNearHero99_15bc);
-			stats15az.eyeTransmitNearHero99Lanes += eyeTransmitNearHero99Lanes15bd;
-			stats15az.eyeTransmitNearHero99SupportMatch += eyeTransmitNearHero99SupportMatch15bd;
-			stats15az.eyeTransmitNearHero99SupportMismatch += eyeTransmitNearHero99SupportMismatch15bd;
-			stats15az.eyeTransmitNearHero99LanePdfOver25Supported += eyeTransmitNearHero99LanePdfOver25Supported15bd;
-			stats15az.eyeTransmitSupportMismatchTotal += eyeTransmitSupportMismatchTotal15bd;
-			stats15az.lightTransmitSupportMismatchTotal += lightTransmitSupportMismatchTotal15bd;
-			stats15az.maxEyeTransmitNearHero99LanePdfSupported = Max(
-				stats15az.maxEyeTransmitNearHero99LanePdfSupported, maxEyeTransmitNearHero99LanePdfSupported15bd);
-			if (maxAbsDelta15az > .05f) ++stats15az.bounceOver5Pct;
-			if (maxAbsDelta15az > .10f) ++stats15az.bounceOver10Pct;
-			if (maxAbsDelta15az > .25f) ++stats15az.bounceOver25Pct;
-			++stats15az.caseBounces[caseIndex15az];
-			MLHeroInsertGlassOutlier15ba(&stats15az, localOutlier15ba);
-			stats15az.minCorrection = Min(stats15az.minCorrection, minCorrection15az);
-			stats15az.maxCorrection = Max(stats15az.maxCorrection, maxCorrection15az);
-			if (maxAbsDelta15az > stats15az.maxAbsDelta) {
-				stats15az.maxAbsDelta = maxAbsDelta15az;
-				stats15az.extremeCorrection = extremeCorrection15az;
-				stats15az.extremeLambda = extremeLambda15az;
-				stats15az.extremeDepth = pathVertex->depth;
-				stats15az.extremeCase = caseIndex15az;
-			}
-		}
+        if (glassSpectralActive15ev) {
+            const bool firstCollapse = glassDispersiveTx15ev && MLHeroCollapseGlass15ev(pathVertex);
+            if (firstCollapse) mlHero15evCollapses[glassSide15ev].fetch_add(1ull, std::memory_order_relaxed);
+            const unsigned long long ticket = mlHero15evEvents[glassSide15ev].fetch_add(1ull, std::memory_order_relaxed);
+            if (MLHeroCurrentDiagnosticsEnabled15cq() && ticket < 64ull) {
+                std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
+                FILE *f = fopen(ML_HERO_LOG_FILE, "a");
+                if (f) {
+                    fprintf(f, "phase15ev GLASS_BOUNCE side=%u materialID=%u name=\"%s\" glassMode=%u event=%u dispersion=%u helperRejected=%u firstCollapse=%u collapsed=%u activeCount=%u rrProb=%.9g factor0=%.9g preRR0=%.9g postRRBefore0=%.9g after0=%.9g heroDirectionDelta=%.9g packetScale=%u colorTransport=SPECTRAL\n",
+                        glassSide15ev, pathVertex->bsdf.GetMaterialID(), pathVertex->bsdf.GetMaterialName().c_str(),
+                        engine->mlHeroGlassMode, (u_int)event, pathVertex->bsdf.HasMLHeroGlassDispersion() ? 1u : 0u,
+                        glassRejected15ev, firstCollapse ? 1u : 0u,
+                        pathVertex->mlHeroSecondaryWavelengthsTerminated ? 1u : 0u,
+                        pathVertex->mlHeroActiveWavelengthCount, mlHeroRrProb15et, glassFactor15ev[0],
+                        mlHeroBeforeTP[0].c[0], lanePreGlassSpectrum15dm[0].c[0],
+                        pathVertex->mlHeroLaneThroughput[0].c[0], glassHeroDelta15ev, pathVertex->mlHeroLaneCount);
+                    fclose(f);
+                }
+            }
+        }
 
 		if (MLHeroLegacyHeavyDiagnosticsEnabled15cq() && glossy2SpectralActive15ae && glossy2KdSPD15ae &&
 				(pathVertex->bsdf.GetMaterialType() == GLOSSY2)) {
@@ -7010,6 +7997,11 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 	} else
 		MLHeroMultiplyLaneThroughput(pathVertex, bsdfSample);
 
+// 15fd BEGIN diagnostic-only
+    MLHeroAuditBounce15fd(*pathVertex, event, bsdfSample, bsdfPdfW,
+        mlHeroRrProb15et, mlHeroBeforeTP, usedGenericReflectanceSPD,
+        usedExplicitMetal2, engine->mlHeroGenericReflectanceCompensation);
+// 15fd END diagnostic-only
 	pathVertex->throughput *= bsdfSample;
 	if (GetMLHeroWavelengthCount() > 1u) {
 		bool introducedDivergence = false;
@@ -7106,6 +8098,57 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
         MLHeroLogState15bq("PROPAGATE", propagateIndex15bq, 4u, *pathVertex);
     }
 
+    if (MLHeroCurrentDiagnosticsEnabled15cq()) {
+        pathVertex->mlHeroLastRR15fw=mlHeroRrProb15et;
+        pathVertex->mlHeroLastPdf15fw=bsdfPdfW;
+        pathVertex->mlHeroLastDepth15fw=pathVertex->depth;
+        const PathVertexVM *eye15ew = pathVertex->bsdf.hitPoint.fromLight ? nullptr : pathVertex;
+        const PathVertexVM *light15ew = pathVertex->bsdf.hitPoint.fromLight ? pathVertex : nullptr;
+        MLHeroAudit15ew(9u, "CLASSIC_AFTER_BOUNCE", pathVertex->throughput,
+            eye15ew, light15ew, mlHeroRrProb15et, bsdfPdfW, cosSampledDir);
+        for (u_int lane15ew = 0u; lane15ew < Min(pathVertex->mlHeroLaneCount, 8u); ++lane15ew)
+            if (!MLHeroFinite15ew(pathVertex->mlHeroLaneThroughput[lane15ew]) ||
+                    MLHeroFiniteTailClass15fw(pathVertex->mlHeroLaneThroughput[lane15ew].c[0],
+                        pathVertex->mlHeroLaneThroughput[lane15ew].c[1],
+                        pathVertex->mlHeroLaneThroughput[lane15ew].c[2]))
+                MLHeroAudit15ew(9u, "LANE_AFTER_BOUNCE", pathVertex->mlHeroLaneThroughput[lane15ew],
+                    eye15ew, light15ew, mlHeroRrProb15et, bsdfPdfW, cosSampledDir);
+        MLHeroAudit15ew(10u, "MIS_AFTER_BOUNCE", Spectrum(pathVertex->dVCM, pathVertex->dVC, pathVertex->dVM),
+            eye15ew, light15ew, mlHeroRrProb15et, bsdfPdfW, cosSampledDir);
+    }
+    // 15ge: only diagnostics; snapshot the accepted bounce after ALL spectral updates.
+    if (MLHeroCurrentHeavyDiagnosticsEnabled15cq() && pathVertex->mlHeroLaneCount) {
+        const unsigned cap15ge = 12u;
+        unsigned index15ge = pathVertex->mlHeroTraceCount15ge;
+        if (index15ge >= cap15ge) {
+            for (unsigned i=1; i<cap15ge; ++i)
+                pathVertex->mlHeroTrace15ge[i-1] = pathVertex->mlHeroTrace15ge[i];
+            index15ge = cap15ge-1u;
+        } else ++pathVertex->mlHeroTraceCount15ge;
+        auto &b15ge = pathVertex->mlHeroTrace15ge[index15ge];
+        b15ge.depth = pathVertex->depth;
+        b15ge.materialType = (u_int)pathVertex->bsdf.GetMaterialType();
+        b15ge.event = (u_int)event;
+        b15ge.active = pathVertex->mlHeroActiveWavelengthCount;
+        b15ge.collapsed = pathVertex->mlHeroSecondaryWavelengthsTerminated ? 1u : 0u;
+        b15ge.pdf = bsdfPdfW;
+        b15ge.rr = mlHeroRrProb15et;
+        b15ge.cosine = cosSampledDir;
+        // 15gg: these four measures are taken from the actual accepted bounce.
+        // Absolute cosines quantify grazing incidence, while signed values
+        // would depend on LuxCore normal and path-direction conventions.
+        b15ge.incidentShadeCos = AbsDot(pathVertex->bsdf.hitPoint.fixedDir, pathVertex->bsdf.hitPoint.shadeN);
+        b15ge.exitShadeCos = AbsDot(sampledDir, pathVertex->bsdf.hitPoint.shadeN);
+        b15ge.incidentGeomCos = AbsDot(pathVertex->bsdf.hitPoint.fixedDir, pathVertex->bsdf.hitPoint.geometryN);
+        b15ge.exitGeomCos = AbsDot(sampledDir, pathVertex->bsdf.hitPoint.geometryN);
+        for (unsigned lane=0; lane<8; ++lane) {
+            const float before = (lane < pathVertex->mlHeroLaneCount) ? mlHeroBeforeTP[lane].c[0] : 0.f;
+            const float after = (lane < pathVertex->mlHeroLaneCount) ? pathVertex->mlHeroLaneThroughput[lane].c[0] : 0.f;
+            b15ge.pre[lane] = before;
+            b15ge.post[lane] = after;
+            b15ge.ratio[lane] = (before != 0.f) ? after/before : 0.f;
+        }
+    }
     ++pathVertex->depth;
 
     return true;
@@ -7124,6 +8167,11 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 	SetThreadGroupAffinity(threadIndex);
 
 	BiDirCPURenderEngine *engine = (BiDirCPURenderEngine *)renderEngine;
+// 15fh BEGIN diagnostic-only
+    MLHeroReset15fh(engine->mlHeroEnabled && engine->mlHeroWavelengthCount>1 &&
+        engine->mlHeroDiagnostics && engine->mlHeroCurrentDiagnostics);
+// 15fh END
+
 	mlHeroDiagnostics15cq.store(engine->mlHeroDiagnostics, std::memory_order_relaxed);
 	mlHeroCurrentDiagnostics15cq.store(engine->mlHeroCurrentDiagnostics, std::memory_order_relaxed);
 	mlHeroLegacyDiagnostics15cq.store(engine->mlHeroLegacyDiagnostics, std::memory_order_relaxed);
@@ -7239,6 +8287,24 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 			mlHero15dbAppliedMultiplierAbsMax.store(0.0, std::memory_order_relaxed);
 			mlHero15dbAppliedOverRawSum.store(0.0, std::memory_order_relaxed);
 			mlHero15dbAppliedOverRawMax.store(0.0, std::memory_order_relaxed);
+            for (u_int m15dr = 0u; m15dr < MLHERO_15DR_MODEL_COUNT; ++m15dr) {
+                for (u_int s15dr = 0u; s15dr < MLHERO_15DP_SIDE_COUNT; ++s15dr) {
+                    for (u_int d15dr = 0u; d15dr < MLHERO_15DP_DEPTH_BUCKETS; ++d15dr) {
+                        mlHero15drValidCount[m15dr][s15dr][d15dr].store(0ull, std::memory_order_relaxed);
+                        mlHero15drSignedSum[m15dr][s15dr][d15dr].store(0.0, std::memory_order_relaxed);
+                        mlHero15drAbsSum[m15dr][s15dr][d15dr].store(0.0, std::memory_order_relaxed);
+                        mlHero15drSquareSum[m15dr][s15dr][d15dr].store(0.0, std::memory_order_relaxed);
+                        mlHero15drAbsMax[m15dr][s15dr][d15dr].store(0.0, std::memory_order_relaxed);
+                    }
+                    for (u_int b15dr = 0u; b15dr < MLHERO_15DR_BAND_COUNT; ++b15dr) {
+                        mlHero15drBandCount[m15dr][s15dr][b15dr].store(0ull, std::memory_order_relaxed);
+                        mlHero15drBandPreWeightedSum[m15dr][s15dr][b15dr].store(0.0, std::memory_order_relaxed);
+                    }
+                }
+            }
+            for (u_int s15dr = 0u; s15dr < MLHERO_15DP_SIDE_COUNT; ++s15dr)
+                for (u_int d15dr = 0u; d15dr < MLHERO_15DP_DEPTH_BUCKETS; ++d15dr)
+                    mlHero15drSkippedHeroInvalid[s15dr][d15dr].store(0ull, std::memory_order_relaxed);
 			mlHero15ddSampleResultCount.store(0ull, std::memory_order_relaxed);
 			mlHero15ddRadianceRSum.store(0.0, std::memory_order_relaxed);
 			mlHero15ddRadianceGSum.store(0.0, std::memory_order_relaxed);
@@ -7285,10 +8351,89 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 		// unambiguous build/test header. This also makes it immediately obvious
 		// whether Blender loaded the newly built pyluxcore wheel.
 		std::lock_guard<std::recursive_mutex> mlHeroDebugLogLock11(mlHeroDebugLogMutex);
-		FILE *f = engine->mlHeroDiagnostics ? fopen(ML_HERO_LOG_FILE, "w") : nullptr;
+        for (u_int stage = 0; stage < 5u; ++stage) {
+            mlHero15etCalls[stage].store(0ull, std::memory_order_relaxed);
+            mlHero15etRejected[stage].store(0ull, std::memory_order_relaxed);
+            mlHero15etLogTickets[stage].store(0ull, std::memory_order_relaxed);
+            mlHero15etApplied[stage].store(0ull, std::memory_order_relaxed);
+        }
+        for (u_int side = 0u; side < 2u; ++side) {
+            mlHero15evEvents[side].store(0ull, std::memory_order_relaxed);
+            mlHero15evCalls[side].store(0ull, std::memory_order_relaxed);
+            mlHero15evRejected[side].store(0ull, std::memory_order_relaxed);
+            mlHero15evCollapses[side].store(0ull, std::memory_order_relaxed);
+        }
+        mlHero15evConnections.store(0ull, std::memory_order_relaxed);
+// 15fb BEGIN
+        MLHeroReset15fb();
+// 15fb END
+// 15fc BEGIN
+        MLHeroReset15fc();
+// 15fc END
+// 15fd BEGIN diagnostic-only
+        MLHeroReset15fd();
+// 15fd END diagnostic-only
+// 15fe BEGIN
+        MLHeroReset15fe();
+// 15fe END
+// 15fa BEGIN diagnostic-only
+        MLHeroReset15fa();
+// 15fa END diagnostic-only
+        MLHeroReset15ew();
+        MLHeroReset15ex();
+        MLHeroReset15ey();
+        mlHero15euDetailTicket.store(0ull, std::memory_order_relaxed);
+        for (u_int category = 0u; category < 4u; ++category) {
+            mlHero15euConnections[category].store(0ull, std::memory_order_relaxed);
+            mlHero15euEligible[category].store(0ull, std::memory_order_relaxed);
+            mlHero15euApplied[category].store(0ull, std::memory_order_relaxed);
+            mlHero15euBeforeY[category].store(0.0, std::memory_order_relaxed);
+            mlHero15euAfterY[category].store(0.0, std::memory_order_relaxed);
+            mlHero15euBeforeAbsY[category].store(0.0, std::memory_order_relaxed);
+            mlHero15euAfterAbsY[category].store(0.0, std::memory_order_relaxed);
+            mlHero15euCandidateY[category].store(0.0, std::memory_order_relaxed);
+        }
+        // 15gb: always create a compact baseline for BIDIR, even with HERO OFF.
+        const bool logReady15gb = slg::mlhero15gb::Begin("BIDIR", engine->mlHeroEnabled, ML_HERO_BUILD, ML_HERO_TEST_PHASE);
+        FILE *f = logReady15gb ? fopen(ML_HERO_LOG_FILE, "w") : nullptr;
+        if (f) {
+            fprintf(f, "ML HERO 15gb RUN: engine=BIDIR heroEnabled=%u diagnostics=%u current=%u legacy=%u heavy=%u wavelengths=%u seed=%u\n",
+                engine->mlHeroEnabled ? 1u : 0u, engine->mlHeroDiagnostics ? 1u : 0u,
+                engine->mlHeroCurrentDiagnostics ? 1u : 0u, engine->mlHeroLegacyDiagnostics ? 1u : 0u,
+                engine->mlHeroHeavyDiagnostics ? 1u : 0u, (unsigned)engine->mlHeroWavelengthCount,
+                (unsigned)engine->seedBase);
+        }
+
 		if (f) {
 			fprintf(f, "ML HERO v2.11.2 | Test phase: %s | Feature: %s\n", ML_HERO_TEST_PHASE, ML_HERO_FEATURE);
-			fprintf(f, "ML HERO phase 15cs CONFIG: path.mlhero.glassmode=%d (0=packet weighting -> HERO-only at dispersive delta transmit, 1=HERO-only reference, 2=lane-PDF -> HERO-only at dispersive delta transmit)\n", engine->mlHeroGlassMode);
+            fprintf(f,"phase15fx REFLECTANCE_FIX scope=CPU_BIDIR_MatteValidatedKdFit_Glossy2SplitKd unitReflectanceBound=0to1 sampledTransportUnbounded=1 genericWholeBSDFUnchanged=1 glassEtaWeightsUnchanged=1 physicsIndependentOfDiagnostics=1\n");
+            fprintf(f,"phase15fw FINITE_CONFIG diagnosticsOnly=1 transportChanged=0 absoluteThreshold=64 colorThreshold=16 colorRatio=8 detailBudgetPerStageAndKind=32 connectionBudget=64 rawContributionNotFilmPixel=1 bounceFactorIsRRq=1 connectionFactorIsMIS=1 coordsOrigin=rendererFilmNotEXRRow\n");
+            fprintf(f, "phase15ew NONFINITE_CONFIG build=%s diagnosticsOnly=1 rendererPhysicsChanged=1 detailBudgetPerStage=16 fingerprintFiniteOnly=1 rrSurvivalLimit=%.9g rrDepth=%u pathLogUnchanged=15ev\n",
+                ML_HERO_BUILD, engine->rrImportanceCap, engine->rrDepth);
+            fprintf(f, "phase15ex DLS_MIS_CONFIG diagnosticsOnly=1 candidateApplied=0 logOnlyNonfiniteMISOrNaNCompetitor=1 detailBudgetPerReason=16 rrSurvivalLimit=%.9g rrDepth=%u\n",
+                engine->rrImportanceCap, engine->rrDepth);
+            fprintf(f, "phase15ey DLS_MIS_FIX_CONFIG policy=EXACT_ZERO_HISTORY_ONLY applied=1 nonzeroHistory=ORIGINAL_ARITHMETIC diagnosticsIndependentPhysics=1 emissionPdfUnchanged=1 glassTransportUnchanged=1\n");
+// 15fb BEGIN
+            fprintf(f, "phase15fb MATTE_CONFIG enabled=1 rendererPhysicsChanged=1 scope=strict_neutral_MATTE_MATTE_no_legacy_activation guard=exact_scalar_finite_nonnegative_matching_packet lanes=2,4,8 transport=existing_CIE_packet PDF_MIS_RR_UNCHANGED=1 otherEndpointsUnchanged=1 diagnosticsIndependentPhysics=1\n");
+// 15fb END
+// 15fc BEGIN
+            fprintf(f, "phase15fc TRANSLUCENT_CONFIG enabled=1 rendererPhysicsChanged=1 scope=strict_neutral_MATTE_MATTETRANSLUCENT_pairs_no_legacy_activation guard=exact_scalar_finite_nonnegative_matching_packet lanes=2,4,8 transport=existing_CIE_packet PDF_MIS_RR_UNCHANGED=1 coloredEndpointsUnchanged=1 diagnosticsIndependentPhysics=1\n");
+// 15fc END
+// 15fd BEGIN diagnostic-only
+            fprintf(f, "phase15fd BOUNCE_CONFIG diagnosticsOnly=1 rendererPhysicsChanged=0 transportBaseline=15fc cases=eyeReflect,eyeTransmit,lightReflect,lightTransmit,eyeMirror,lightMirror detailBudgetPerCase=12 spectralCandidate=separate_Kr_Kt_times_1minusKr candidateNeverApplied=1 extraTextureReads=bounded_only rrIncludedInLaneClosure=1\n");
+// 15fd END diagnostic-only
+// 15fe BEGIN
+            fprintf(f, "phase15fe TRANSLUCENT_CONFIG enabled=1 rendererPhysicsChanged=1 stages=eyeBounce,lightBounce,DLS,ConnectVertices,ConnectToEye reflection=R_lambda transmission=T_lambda_times_1minusR_lambda inputs=separate_RGB_textures_to_380_780_SPD unitCoefficients=clamp_0_1 proposalPDF_MIS_RR=UNCHANGED nativeSampleWrapper=explicit noFitInTransport=1 PATH_GPU_UI=UNCHANGED diagnosticsIndependentPhysics=1 old15fdClosure=baseline_difference_after_live_change\n");
+// 15fe END
+// 15ff BEGIN
+            fprintf(f, "phase15ff BASIS_CONFIG scope=BIDIR_MATTETRANSLUCENT_only compensation=%u reference=existing_HERO_white_relative_RGB calibration=fixed_offline_unit_primary_inverse coefficientClamp=0_1 grayBypass=1 diagnosticsIndependentPhysics=1 PATH_GPU_otherMaterials_UNCHANGED=1\n", engine->mlHeroGenericReflectanceCompensation ? 1u : 0u);
+            fprintf(f, "phase15ff TRANSPORT_MODE configuredWavelengths=%u heroEnabled=%u packetSpectralMaterialPath=%u singleLaneUsesLegacyRGB=1 singleLaneIsNotCompensationAB=1 referenceDetailsMax=4 perCoefficientNotFilm=1\n", engine->mlHeroWavelengthCount, engine->mlHeroEnabled ? 1u : 0u, engine->mlHeroEnabled && engine->mlHeroWavelengthCount > 1u ? 1u : 0u);
+// 15ff END
+// 15fa BEGIN diagnostic-only
+            fprintf(f, "phase15fa CONNECTION_CONFIG diagnosticsOnly=1 rendererPhysicsChanged=1 scope=visible_ConnectVertices primary=first_observed_failure observedMask=overlapping detailLimitPerReason=%u oneExamplePerReasonMaterialPair=1 noExtraBSDFEvaluations=1 summaryAtThreadCompletion=1 PATH=UNCHANGED_15EV\n", MLHERO_15FA_DETAIL_LIMIT);
+// 15fa END diagnostic-only
+            fprintf(f, "ML HERO phase 15ez CLEANUP: spectralGlass=15ev spectralRoughGlass=15et legacyGlassWeighting=REMOVED legacyMode2Blend25=REMOVED legacyRgbOwnership=REMOVED spectralPhysicsChanged=0 rgbConnectionFallback=RETAINED mode1RgbDualCompensation=RETAINED historicalAuditCountersMayBeInactive=1\n");
+			fprintf(f, "ML HERO phase 15cs CONFIG: path.mlhero.glassmode=%d (legacy IDs; shared spectral Glass/RoughGlass transport in all modes; Mode1 retains RGB-connection compensation)\n", engine->mlHeroGlassMode);
 			fprintf(f, "ML HERO phase 15bz CONFIG: path.mlhero.glassperlaneweight=%u\n", engine->mlHeroGlassPerLaneWeight ? 1u : 0u);
 			fprintf(f, "ML HERO phase 15bz CONFIG: path.mlhero.quartercycling=%u\n", engine->mlHeroQuarterCycling ? 1u : 0u);
 			fprintf(f, "ML HERO phase 15bz CONFIG: path.mlhero.dualterminationcompensation=%u\n", engine->mlHeroDualTerminationCompensation ? 1u : 0u);
@@ -7300,6 +8445,7 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 				engine->mlHeroLegacyDiagnostics ? 1u : 0u, engine->mlHeroHeavyDiagnostics ? 1u : 0u);
 			fprintf(f, "ML HERO phase 15bz CONFIG: mode1TerminationIndependentOfPerLaneWeight=1\n");
 			fprintf(f, "ML HERO phase 15bz CONFIG: compensationRule=bothTerminated_ConnectVertices_divideByWavelengthCount\n");
+            fprintf(f, "ML HERO phase 15eu CONFIG: dualTerminationSpectralModes=0,1,2 enabled=%u scope=matched_spectral_ConnectVertices rule=both_HERO_only_same_N_scale_divN_once legacyRGB=unchanged_Mode1 diagnostics=current_without_heavy PATH=UNCHANGED_15ES\n", engine->mlHeroDualTerminationCompensation ? 1u : 0u);
 			fprintf(f, "ML HERO phase 15ca CONFIG: mode2LanePdfIndependentOfPerLaneWeight=1\n");
 			fprintf(f, "Build date/time: %s %s\n", __DATE__, __TIME__);
 			fprintf(f, "Wavelength count: %u\n", (u_int)engine->mlHeroWavelengthCount);
@@ -7308,9 +8454,15 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 			ML_HERO_MODE2_SHARED_HERO_PDF_15DI, ML_HERO_MODE2_SHARED_HERO_PDF_15DI ? 0 : 1);
 			fprintf(f, "ML HERO phase 15dj CONFIG: diagnosticOnly=1 decompose=colorSample,transport,fresnel,heroPdf,lanePdf,adjoint,materialLane,wrappedLane,sharedLane,modeApplied heroOffUntouched=1\n");
 			fprintf(f, "ML HERO phase 15dk CONFIG: diagnosticOnly=1 audit=mode2_color_ownership_correlation models=spectralized_lane_vs_rgb_owned_vs_shared_scalar heroOffUntouched=1 rendererPhysicsChanged=0\n");
-			fprintf(f, "ML HERO phase 15dm CONFIG: mode2RgbOwnership=%d scope=Mode2_IdealGlass_SPECULAR_TRANSMIT_PLWoff_multilane dispersionIndependent=1 dispersiveCollapseUnchanged=1 rendererPhysicsChanged=1 heroOffUntouched=1 modes0and1Untouched=1 reflectionUntouched=1 roughGlassUntouched=1\n",
-				ML_HERO_MODE2_RGB_OWNERSHIP_15DM ? 1 : 0);
-			fprintf(f, "------------------------------------------------------------\n");
+			fprintf(f, "ML HERO phase 15dm CONFIG: mode2RgbOwnership=%d scope=REMOVED_UNREACHABLE_BRANCH dispersionIndependent=1 dispersiveCollapseUnchanged=1 rendererPhysicsChanged=0 heroOffUntouched=1 modes0and1Untouched=1 reflectionUntouched=1 roughGlassUntouched=1\n",
+				0);
+            fprintf(f, "ML HERO phase 15dr CONFIG: diagnosticOnly=1 roughGlassRenderer=15et_SPECTRAL legacyBlend25Removed=1 models=f_over_lanePdf,f_over_heroPdf,f_over_mixturePdf mixturePdf=mean_valid_lane_pdfs sharedDirectionOwner=HERO 15dqRendererReverted=1\n");
+            fprintf(f, "ML HERO phase 15ds CONFIG: diagnosticOnly=1 roughGlassRenderer=15et_SPECTRAL legacyBlend25Removed=1 pathPdf=cumulative_same_path_roughglass_directional_pdfs candidate=laneRaw_times_N_Pi_over_sumP wavelengthIndependentFactorsCancel=1 rendererPhysicsChanged=0\n");
+            fprintf(f, "ML HERO phase 15dt CONFIG: diagnosticOnly=1 roughGlassRenderer=15et_SPECTRAL legacyBlend25Removed=1 fullEstimator=commonPath_times_product_fOverP pathMIS=N_Pi_over_sumP removesPriorActiveBlend25=1 rendererPhysicsChanged=0\n");
+            fprintf(f, "ML HERO phase 15du CONFIG: diagnosticOnly=1 roughGlassRenderer=15et_SPECTRAL legacyBlend25Removed=1 audit=microfacet_ownership heroOwnsSampledMicrofacet=1 compare=sameMicrofacetNaturalDirection_vs_sharedHeroDirection split=NDF_vs_refractionJacobian rendererPhysicsChanged=0\n");
+            fprintf(f, "ML HERO phase 15er CONFIG: roughGlassAllModesDispersiveTransmit=HERO_ONLY_ONE_SHOT nonDispersiveRoughGlass=PACKET heroLane=unblended_f_over_p packetToSingleScale=N_once postCollapse=ordinary_single_hero modes=0,1,2 sampleFallback=unblended_f_over_p rendererPhysicsChanged=1 heroOffUntouched=1 reflectionUntouched=1 idealGlassUntouched=1\n");
+			fprintf(f, "ML HERO phase 15et CONFIG: RoughGlass=ALL_MODES_CONTINUOUS_SPECTRAL stages=0_eyeBounce,1_lightBounce,2_DLS,3_ConnectVertices,4_ConnectToEye color=MATCH_PATH_15ES sharedSamplePdf=HERO rr=ONCE collapse=TX_ONLY_xN_ONCE nonDispersive=PACKET mode2Blend25=BYPASSED_FOR_CONTINUOUS_ROUGHGLASS PATH=UNCHANGED_15ES\n");
+            fprintf(f, "------------------------------------------------------------\n");
 			fclose(f);
 		}
 	}
@@ -7369,12 +8521,17 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 		}
 
 		sampleResults.clear();
+// 15fh BEGIN diagnostic-only
+        MLHeroCycle15fh();
+// 15fh END
+
 		lightPathVertices.clear();
 
 		const float timeSample = sampler->GetSample(12);
 		const float time = scene.GetCamera().GenerateRayTime(timeSample);
 
 		SetMLHeroEnabled(engine->mlHeroEnabled);
+		mlHeroRoughGlassFresnelImportance = engine->mlHeroRoughGlassFresnelImportanceConfig;
 		// ML HERO phase 15u:
 		// When HERO is disabled, force the shared packet state back to one lane.
 		// All multi-wave contribution branches are gated by laneCount > 1, so
@@ -7512,6 +8669,10 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 		// Trace light path
 		//----------------------------------------------------------------------
 
+        if (MLHeroCurrentDiagnosticsEnabled15cq()) {
+            mlHeroThread15fw=threadIndex; mlHeroStep15fw=steps;
+            mlHeroFilmX15fw=sampler->GetSample(0); mlHeroFilmY15fw=sampler->GetSample(1);
+        }
 		const bool validLightPath = TraceLightPath(time, sampler, camera, lightPathVertices, sampleResults);
 		assert (SampleResult::IsAllValid(sampleResults));
 
@@ -7530,6 +8691,10 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 					eyeSampleResult.filmX, eyeSampleResult.filmY, &eyeRay,
 					&eyeVertex.volInfo, sampler->GetSample(10), sampler->GetSample(11));
 
+// 15fh BEGIN diagnostic-only
+            MLHeroBegin15fh(eyeSampleResult.filmX,eyeSampleResult.filmY,
+                engine->GetFilm().GetWidth(),engine->GetFilm().GetHeight());
+// 15fh END
 			// Required by MIS weights update
 			eyeVertex.bsdf.hitPoint.fixedDir = -eyeRay.d;
 			eyeVertex.throughput = Spectrum(1.f);
@@ -7659,8 +8824,13 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 						if (photonGICache->IsCausticEnabled() && (eyeVertex.depth > 1)) {
 							const SpectrumGroup causticRadiance = photonGICache->ConnectWithCausticPaths(eyeVertex.bsdf);
 
-							if (!causticRadiance.Black())
+							if (!causticRadiance.Black()) {
 								eyeSampleResult.radiance.AddWeighted(eyeVertex.throughput, causticRadiance);
+                            if (MLHeroCurrentDiagnosticsEnabled15cq())
+                                for (u_int group15ew = 0u; group15ew < engine->GetFilm().GetRadianceGroupCount(); ++group15ew)
+                                    MLHeroAudit15ew(6u, "ACCUMULATOR_AFTER_CAUSTIC", eyeSampleResult.radiance[group15ew],
+                                        &eyeVertex, nullptr, 0.f, 0.f, 0.f, eyeSampleResult.filmX, eyeSampleResult.filmY, group15ew);
+                            }
 							
 							photonGICausticCacheUsed = true;
 						}
@@ -7732,10 +8902,21 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 		if (MLHeroCurrentDiagnosticsEnabled15cq()) {
 			for (u_int i15dd = 0u; i15dd < sampleResults.size(); ++i15dd) {
 				Spectrum total15dd(0.f);
-				for (u_int g15dd = 0u; g15dd < engine->GetFilm().GetRadianceGroupCount(); ++g15dd)
-					total15dd += sampleResults[i15dd].radiance[g15dd];
-				const double y15dd = (double)total15dd.Y();
-				mlHero15ddSampleResultCount.fetch_add(1ull, std::memory_order_relaxed);
+                for (u_int g15dd = 0u; g15dd < engine->GetFilm().GetRadianceGroupCount(); ++g15dd) {
+                    const Spectrum &group15ew = sampleResults[i15dd].radiance[g15dd];
+                    MLHeroAudit15ew(7u, "GROUP", group15ew, nullptr, nullptr, 0.f, 0.f, 0.f,
+                        sampleResults[i15dd].filmX, sampleResults[i15dd].filmY, g15dd);
+                    total15dd += group15ew;
+                }
+                const double y15dd = (double)total15dd.Y();
+                mlHero15ddSampleResultCount.fetch_add(1ull, std::memory_order_relaxed);
+                MLHeroAudit15ew(8u, "TOTAL", total15dd, nullptr, nullptr, 0.f, 0.f, 0.f,
+                    sampleResults[i15dd].filmX, sampleResults[i15dd].filmY);
+                if (!MLHeroFinite15ew(total15dd) || !std::isfinite(y15dd)) {
+                    mlHero15ewBadTotals.fetch_add(1ull, std::memory_order_relaxed);
+                    continue; // Exclude only from diagnostic sums, never from rendering.
+                }
+                mlHero15ewFiniteTotals.fetch_add(1ull, std::memory_order_relaxed);
 				mlHero15ddRadianceRSum.fetch_add((double)total15dd.c[0], std::memory_order_relaxed);
 				mlHero15ddRadianceGSum.fetch_add((double)total15dd.c[1], std::memory_order_relaxed);
 				mlHero15ddRadianceBSum.fetch_add((double)total15dd.c[2], std::memory_order_relaxed);
@@ -7746,6 +8927,14 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 			}
 		}
 
+// 15fh BEGIN diagnostic-only
+        for(const auto& result15fh:sampleResults) {
+            if(result15fh.HasChannel(Film::RADIANCE_PER_PIXEL_NORMALIZED))
+                MLHeroFinish15fh(result15fh);
+            else if(result15fh.HasChannel(Film::RADIANCE_PER_SCREEN_NORMALIZED))
+                MLHeroScreen15fh(result15fh,engine->GetFilm().GetWidth(),engine->GetFilm().GetHeight());
+        }
+// 15fh END
 		// Variance clamping
 		if (varianceClamping.hasClamping()) {
 			for(u_int i = 0; i < sampleResults.size(); ++i)
@@ -7776,6 +8965,21 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 		if (f15cq) {
 			fprintf(f15cq, "------------------------------------------------------------\n");
 			fprintf(f15cq, "ML HERO phase 15ct CURRENT DIAGNOSTICS SUMMARY heavy=%u\n", mlHeroHeavyDiagnostics15cq.load(std::memory_order_relaxed) ? 1u : 0u);
+// 15fb BEGIN
+            MLHeroSummary15fb(f15cq);
+// 15fb END
+// 15fc BEGIN
+            MLHeroSummary15fc(f15cq);
+// 15fc END
+// 15fd BEGIN diagnostic-only
+            MLHeroSummary15fd(f15cq);
+// 15fd END diagnostic-only
+// 15fe BEGIN
+            MLHeroSummary15fe(f15cq);
+// 15fe END
+// 15fa BEGIN diagnostic-only
+            MLHeroSummary15fa(f15cq);
+// 15fa END diagnostic-only
 			fprintf(f15cq, "phase15cr columns: materialType candidate genericRGBReflSPD matteCompensated glossy2Split genericCompensated\n");
 			for (u_int t15cq = 0u; t15cq < MLHERO_MATERIAL_TYPE_COUNT_15CL; ++t15cq) {
 				const unsigned long long c = mlHero15clReflectCandidate[t15cq].load(std::memory_order_relaxed);
@@ -8113,12 +9317,246 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
                 }
             }
             fprintf(f15cq, "phase15dk interpretation=if_spectralizedOverRgbOwnedY_or_RGB_balance_differs_systematically_while_Mode0_Mode1_match_render_then_Mode2_is_reconstructing_an_already_chromatic_Glass_sample_per_wavelength; correlation_reports_whether_lane_energy_and_that_multiplier_are_coupled; diagnostic_only_no_throughput_change\n");
+
+            fprintf(f15cq, "ML HERO phase 15dp ROUGHGLASS MODE2 FIRST-DIVERGENCE AUDIT diagnosticOnly=1 sampledDirectionOwner=HERO blend25RendererUnchanged=1\n");
+            const char *sideName15dp[MLHERO_15DP_SIDE_COUNT] = { "EYE", "LIGHT" };
+            for (u_int side15dp = 0u; side15dp < MLHERO_15DP_SIDE_COUNT; ++side15dp) {
+                for (u_int depth15dp = 0u; depth15dp < MLHERO_15DP_DEPTH_BUCKETS; ++depth15dp) {
+                    const unsigned long long events15dp = mlHero15dpEventCount[side15dp][depth15dp].load(std::memory_order_relaxed);
+                    const unsigned long long lanes15dp = mlHero15dpLaneCount[side15dp][depth15dp].load(std::memory_order_relaxed);
+                    const unsigned long long invalid15dp = mlHero15dpInvalidLaneCount[side15dp][depth15dp].load(std::memory_order_relaxed);
+                    if (!events15dp && !lanes15dp)
+                        continue;
+                    const unsigned long long valid15dp = (lanes15dp >= invalid15dp) ? lanes15dp - invalid15dp : 0ull;
+                    const double invValid15dp = valid15dp ? (1.0 / (double)valid15dp) : 0.0;
+                    fprintf(f15cq,
+                        "phase15dp side=%s depth=%s events=%llu lanes=%llu valid=%llu invalid=%llu meanAbsPdfRatioDelta=%.9g maxAbsPdfRatio=%.9g meanAbsRawRatioDelta=%.9g maxAbsRawRatio=%.9g meanAbsBlendDelta=%.9g maxAbsApplied=%.9g\n",
+                        sideName15dp[side15dp], (depth15dp == MLHERO_15DP_DEPTH_BUCKETS - 1u) ? "7+" : std::to_string(depth15dp).c_str(),
+                        events15dp, lanes15dp, valid15dp, invalid15dp,
+                        mlHero15dpAbsPdfRatioDeltaSum[side15dp][depth15dp].load(std::memory_order_relaxed) * invValid15dp,
+                        mlHero15dpMaxPdfRatio[side15dp][depth15dp].load(std::memory_order_relaxed),
+                        mlHero15dpAbsRawRatioDeltaSum[side15dp][depth15dp].load(std::memory_order_relaxed) * invValid15dp,
+                        mlHero15dpMaxRawRatio[side15dp][depth15dp].load(std::memory_order_relaxed),
+                        mlHero15dpAbsBlendDeltaSum[side15dp][depth15dp].load(std::memory_order_relaxed) * invValid15dp,
+                        mlHero15dpMaxAppliedAbs[side15dp][depth15dp].load(std::memory_order_relaxed));
+                }
+            }
+            fprintf(f15cq, "phase15dp interpretation=pdf_delta_localizes_sampling_pdf_difference; raw_delta_includes_BSDF_and_pdf_same_direction; blend_delta_is_only_current_Blend25_change; invalid_is_support_or_zero_pdf; compare_first_nonzero_depth_between_EYE_and_LIGHT\n");
+
+            fprintf(f15cq, "ML HERO phase 15dr ROUGHGLASS MIXTURE-PDF OWNERSHIP AUDIT diagnosticOnly=1 renderer=15dp_Blend25 directionOwner=HERO q=mean_valid_lane_pdfs\n");
+            const char *modelName15dr[MLHERO_15DR_MODEL_COUNT] = { "LANE_PDF", "HERO_PDF", "MIXTURE_PDF" };
+            const char *sideName15dr[MLHERO_15DP_SIDE_COUNT] = { "EYE", "LIGHT" };
+            const char *bandName15dr[MLHERO_15DR_BAND_COUNT] = { "BLUE_380_500", "GREEN_500_600", "RED_600_780" };
+            for (u_int m15dr = 0u; m15dr < MLHERO_15DR_MODEL_COUNT; ++m15dr) {
+                for (u_int s15dr = 0u; s15dr < MLHERO_15DP_SIDE_COUNT; ++s15dr) {
+                    for (u_int d15dr = 0u; d15dr < MLHERO_15DP_DEPTH_BUCKETS; ++d15dr) {
+                        const unsigned long long n15dr = mlHero15drValidCount[m15dr][s15dr][d15dr].load(std::memory_order_relaxed);
+                        if (!n15dr) continue;
+                        const double dn15dr = (double)n15dr;
+                        const double signed15dr = mlHero15drSignedSum[m15dr][s15dr][d15dr].load(std::memory_order_relaxed) / dn15dr;
+                        const double abs15dr = mlHero15drAbsSum[m15dr][s15dr][d15dr].load(std::memory_order_relaxed) / dn15dr;
+                        const double rms15dr = sqrt(Max(0.0, mlHero15drSquareSum[m15dr][s15dr][d15dr].load(std::memory_order_relaxed) / dn15dr));
+                        fprintf(f15cq, "phase15dr model=%s side=%s depth=%s lanes=%llu mean=%.12g meanAbs=%.12g rms=%.12g maxAbs=%.12g skippedHeroInvalid=%llu\n",
+                            modelName15dr[m15dr], sideName15dr[s15dr],
+                            (d15dr == MLHERO_15DP_DEPTH_BUCKETS - 1u) ? "7+" : std::to_string(d15dr).c_str(),
+                            n15dr, signed15dr, abs15dr, rms15dr,
+                            mlHero15drAbsMax[m15dr][s15dr][d15dr].load(std::memory_order_relaxed),
+                            mlHero15drSkippedHeroInvalid[s15dr][d15dr].load(std::memory_order_relaxed));
+                    }
+                    for (u_int b15dr = 0u; b15dr < MLHERO_15DR_BAND_COUNT; ++b15dr) {
+                        const unsigned long long nBand15dr = mlHero15drBandCount[m15dr][s15dr][b15dr].load(std::memory_order_relaxed);
+                        fprintf(f15cq, "phase15dr_band model=%s side=%s band=%s lanes=%llu preWeightedSum=%.12g meanPreWeighted=%.12g\n",
+                            modelName15dr[m15dr], sideName15dr[s15dr], bandName15dr[b15dr], nBand15dr,
+                            mlHero15drBandPreWeightedSum[m15dr][s15dr][b15dr].load(std::memory_order_relaxed),
+                            nBand15dr ? mlHero15drBandPreWeightedSum[m15dr][s15dr][b15dr].load(std::memory_order_relaxed) / (double)nBand15dr : 0.0);
+                    }
+                }
+            }
+            fprintf(f15cq, "phase15dr interpretation=compare_rms_and_maxAbs_first_then_band_preWeighted_balance; HERO_PDF_is_the_rejected_15dq_counterfactual; MIXTURE_PDF_is_candidate_only_not_renderer; if_q_reduces_tails_without_large_band_shift_it_earns_a_separate_render_AB_test\n");
+
+            fprintf(f15cq, "ML HERO phase 15ds ROUGHGLASS CUMULATIVE PATH-PDF SPECTRAL-MIS AUDIT diagnosticOnly=1 renderer=15dp_Blend25 pathTechnique=P_k_product_of_wavelength_dependent_RoughGlass_directional_pdfs candidateFactor=N*P_i/sumP\n");
+            const char *sideName15ds[MLHERO_15DP_SIDE_COUNT] = { "EYE", "LIGHT" };
+            const char *bandName15ds[MLHERO_15DR_BAND_COUNT] = { "BLUE_380_500", "GREEN_500_600", "RED_600_780" };
+            for (u_int s15ds = 0u; s15ds < MLHERO_15DP_SIDE_COUNT; ++s15ds) {
+                for (u_int d15ds = 0u; d15ds < MLHERO_15DP_DEPTH_BUCKETS; ++d15ds) {
+                    const unsigned long long n15ds = mlHero15dsValidCount[s15ds][d15ds].load(std::memory_order_relaxed);
+                    const unsigned long long ev15ds = mlHero15dsEventCount[s15ds][d15ds].load(std::memory_order_relaxed);
+                    if (!n15ds && !ev15ds) continue;
+                    const double dn15ds = n15ds ? (double)n15ds : 1.0;
+                    const double meanCandidate15ds = mlHero15dsCandidateSum[s15ds][d15ds].load(std::memory_order_relaxed) / dn15ds;
+                    const double rmsCandidate15ds = sqrt(Max(0.0, mlHero15dsCandidateSquareSum[s15ds][d15ds].load(std::memory_order_relaxed) / dn15ds));
+                    fprintf(f15cq, "phase15ds side=%s depth=%s events=%llu lanes=%llu supportless=%llu meanBalanceFactor=%.12g meanAbsBalanceDelta=%.12g maxBalanceFactor=%.12g meanCandidate=%.12g rmsCandidate=%.12g maxCandidate=%.12g meanHeroTechniqueWeight=%.12g meanEffectiveTechniqueCount=%.12g\n",
+                        sideName15ds[s15ds], (d15ds == MLHERO_15DP_DEPTH_BUCKETS - 1u) ? "7+" : std::to_string(d15ds).c_str(),
+                        ev15ds, n15ds, mlHero15dsSupportlessLaneCount[s15ds][d15ds].load(std::memory_order_relaxed),
+                        mlHero15dsBalanceFactorSum[s15ds][d15ds].load(std::memory_order_relaxed) / dn15ds,
+                        mlHero15dsBalanceFactorAbsDeltaSum[s15ds][d15ds].load(std::memory_order_relaxed) / dn15ds,
+                        mlHero15dsBalanceFactorMax[s15ds][d15ds].load(std::memory_order_relaxed),
+                        meanCandidate15ds, rmsCandidate15ds, mlHero15dsCandidateMax[s15ds][d15ds].load(std::memory_order_relaxed),
+                        mlHero15dsHeroTechniqueWeightSum[s15ds][d15ds].load(std::memory_order_relaxed) / dn15ds,
+                        mlHero15dsEffectiveTechniqueCountSum[s15ds][d15ds].load(std::memory_order_relaxed) / dn15ds);
+                }
+                for (u_int b15ds = 0u; b15ds < MLHERO_15DR_BAND_COUNT; ++b15ds) {
+                    const unsigned long long nb15ds = mlHero15dsBandCount[s15ds][b15ds].load(std::memory_order_relaxed);
+                    if (!nb15ds) continue;
+                    const double base15ds = mlHero15dsBandBaselinePreWeighted[s15ds][b15ds].load(std::memory_order_relaxed);
+                    const double cand15ds = mlHero15dsBandCandidatePreWeighted[s15ds][b15ds].load(std::memory_order_relaxed);
+                    fprintf(f15cq, "phase15ds_band side=%s band=%s lanes=%llu baselinePreWeighted=%.12g candidatePreWeighted=%.12g candidateOverBaseline=%.12g\n",
+                        sideName15ds[s15ds], bandName15ds[b15ds], nb15ds, base15ds, cand15ds,
+                        (fabs(base15ds) > 1e-30) ? cand15ds / base15ds : 0.0);
+                }
+            }
+            fprintf(f15cq, "phase15ds interpretation=full_path_balance_uses_cumulative_same_path_probability_not_local_pdf_only; compare_rmsCandidate_to_phase15dr_LANE_PDF_and_MIXTURE_PDF; band_candidateOverBaseline_near1_without_tail_growth_is_required_before_any_render_AB; diagnostic_only_no_renderer_values_modified\n");
+
+            fprintf(f15cq, "ML HERO phase 15dt ROUGHGLASS FULL-PATH ESTIMATOR RECONSTRUCTION AUDIT diagnosticOnly=1 renderer=15dp_Blend25 numeratorAndPdfSamePathDepth=1 baseline=commonPath_times_product_fOverP candidate=baseline_times_N_Pi_over_sumP\n");
+            const char *sideName15dt[MLHERO_15DP_SIDE_COUNT] = { "EYE", "LIGHT" };
+            const char *bandName15dt[MLHERO_15DR_BAND_COUNT] = { "BLUE_380_500", "GREEN_500_600", "RED_600_780" };
+            for (u_int s15dt = 0u; s15dt < MLHERO_15DP_SIDE_COUNT; ++s15dt) {
+                for (u_int d15dt = 0u; d15dt < MLHERO_15DP_DEPTH_BUCKETS; ++d15dt) {
+                    const unsigned long long n15dt = mlHero15dtValidCount[s15dt][d15dt].load(std::memory_order_relaxed);
+                    const unsigned long long skip15dt = mlHero15dtSkippedCount[s15dt][d15dt].load(std::memory_order_relaxed);
+                    if (!n15dt && !skip15dt) continue;
+                    const double dn15dt = n15dt ? (double)n15dt : 1.0;
+                    const double meanBase15dt = mlHero15dtFullBaselineSum[s15dt][d15dt].load(std::memory_order_relaxed) / dn15dt;
+                    const double rmsBase15dt = sqrt(Max(0.0, mlHero15dtFullBaselineSquareSum[s15dt][d15dt].load(std::memory_order_relaxed) / dn15dt));
+                    const double meanCand15dt = mlHero15dtFullCandidateSum[s15dt][d15dt].load(std::memory_order_relaxed) / dn15dt;
+                    const double rmsCand15dt = sqrt(Max(0.0, mlHero15dtFullCandidateSquareSum[s15dt][d15dt].load(std::memory_order_relaxed) / dn15dt));
+                    fprintf(f15cq, "phase15dt side=%s depth=%s lanes=%llu skipped=%llu meanFullBaseline=%.12g rmsFullBaseline=%.12g maxFullBaseline=%.12g meanFullCandidate=%.12g rmsFullCandidate=%.12g maxFullCandidate=%.12g rmsCandidateOverBaseline=%.12g meanFullOverLocal=%.12g meanAbsFullOverLocalDelta=%.12g meanBalanceFactor=%.12g\n",
+                        sideName15dt[s15dt], (d15dt == MLHERO_15DP_DEPTH_BUCKETS - 1u) ? "7+" : std::to_string(d15dt).c_str(),
+                        n15dt, skip15dt, meanBase15dt, rmsBase15dt,
+                        mlHero15dtFullBaselineMax[s15dt][d15dt].load(std::memory_order_relaxed),
+                        meanCand15dt, rmsCand15dt,
+                        mlHero15dtFullCandidateMax[s15dt][d15dt].load(std::memory_order_relaxed),
+                        (rmsBase15dt > 1e-300) ? (rmsCand15dt / rmsBase15dt) : 0.0,
+                        mlHero15dtFullOverLocalSum[s15dt][d15dt].load(std::memory_order_relaxed) / dn15dt,
+                        mlHero15dtFullOverLocalAbsDeltaSum[s15dt][d15dt].load(std::memory_order_relaxed) / dn15dt,
+                        mlHero15dtBalanceFactorSum[s15dt][d15dt].load(std::memory_order_relaxed) / dn15dt);
+                }
+                for (u_int b15dt = 0u; b15dt < MLHERO_15DR_BAND_COUNT; ++b15dt) {
+                    const unsigned long long nb15dt = mlHero15dtBandCount[s15dt][b15dt].load(std::memory_order_relaxed);
+                    if (!nb15dt) continue;
+                    const double base15dt = mlHero15dtBandBaseline[s15dt][b15dt].load(std::memory_order_relaxed);
+                    const double cand15dt = mlHero15dtBandCandidate[s15dt][b15dt].load(std::memory_order_relaxed);
+                    fprintf(f15cq, "phase15dt_band side=%s band=%s lanes=%llu fullBaseline=%.12g fullCandidate=%.12g candidateOverBaseline=%.12g\n",
+                        sideName15dt[s15dt], bandName15dt[b15dt], nb15dt, base15dt, cand15dt,
+                        (fabs(base15dt) > 1e-300) ? (cand15dt / base15dt) : 0.0);
+                }
+            }
+            fprintf(f15cq, "phase15dt interpretation=depth1_should_reduce_to_local_mixture; deeper_depths_test_matched_full_numerator_and_path_pdf; candidate_requires_stable_rms_and_band_ratio_near1_before_render_AB; diagnostic_only_no_renderer_values_modified\n");
+
+            fprintf(f15cq, "ML HERO phase 15du ROUGHGLASS MICROFACET OWNERSHIP AUDIT diagnosticOnly=1 renderer=15dp_Blend25 heroOwnsSampledMicrofacet=1 naturalLaneDirection=same_microfacet_plus_lane_eta sharedLaneDirection=hero_direction_requires_lane_specific_microfacet\n");
+            const char *sideName15du[MLHERO_15DP_SIDE_COUNT] = { "EYE", "LIGHT" };
+            const char *bandName15du[MLHERO_15DR_BAND_COUNT] = { "BLUE_380_500", "GREEN_500_600", "RED_600_780" };
+            for (u_int s15du = 0u; s15du < MLHERO_15DP_SIDE_COUNT; ++s15du) {
+                for (u_int d15du = 0u; d15du < MLHERO_15DP_DEPTH_BUCKETS; ++d15du) {
+                    const unsigned long long n15du = mlHero15duCount[s15du][d15du].load(std::memory_order_relaxed);
+                    if (!n15du) continue;
+                    const unsigned long long tir15du = mlHero15duNaturalTirCount[s15du][d15du].load(std::memory_order_relaxed);
+                    const unsigned long long nonTir15du = (n15du >= tir15du) ? (n15du - tir15du) : 0ull;
+                    const double dn15du = (double)n15du;
+                    const double dNonTir15du = nonTir15du ? (double)nonTir15du : 1.0;
+                    fprintf(f15cq, "phase15du side=%s depth=%s lanes=%llu naturalTIR=%llu naturalTIRppm=%.9g meanNaturalDirDelta=%.12g maxNaturalDirDelta=%.12g meanSharedWhDelta=%.12g maxSharedWhDelta=%.12g meanLaneSharedMicroPdfOverHeroMicroPdf=%.12g meanSharedJacobianOverNaturalJacobian=%.12g meanSharedDirPdfOverNaturalDirPdf=%.12g meanReconstructedSharedPdfRelErr=%.12g maxReconstructedSharedPdfRelErr=%.12g\n",
+                        sideName15du[s15du], (d15du == MLHERO_15DP_DEPTH_BUCKETS - 1u) ? "7+" : std::to_string(d15du).c_str(),
+                        n15du, tir15du, 1e6 * (double)tir15du / dn15du,
+                        mlHero15duNaturalDirDeltaSum[s15du][d15du].load(std::memory_order_relaxed) / dn15du,
+                        mlHero15duNaturalDirDeltaMax[s15du][d15du].load(std::memory_order_relaxed),
+                        mlHero15duSharedWhDeltaSum[s15du][d15du].load(std::memory_order_relaxed) / dn15du,
+                        mlHero15duSharedWhDeltaMax[s15du][d15du].load(std::memory_order_relaxed),
+                        mlHero15duMicroPdfRatioSum[s15du][d15du].load(std::memory_order_relaxed) / dn15du,
+                        mlHero15duJacobianRatioSum[s15du][d15du].load(std::memory_order_relaxed) / dNonTir15du,
+                        mlHero15duSharedOverNaturalPdfSum[s15du][d15du].load(std::memory_order_relaxed) / dNonTir15du,
+                        mlHero15duReconstructedPdfRelErrSum[s15du][d15du].load(std::memory_order_relaxed) / dn15du,
+                        mlHero15duReconstructedPdfRelErrMax[s15du][d15du].load(std::memory_order_relaxed));
+                }
+                for (u_int b15du = 0u; b15du < MLHERO_15DR_BAND_COUNT; ++b15du) {
+                    const unsigned long long nb15du = mlHero15duBandCount[s15du][b15du].load(std::memory_order_relaxed);
+                    if (!nb15du) continue;
+                    fprintf(f15cq, "phase15du_band side=%s band=%s lanes=%llu meanNaturalDirDelta=%.12g meanSharedDirPdfOverNaturalDirPdf=%.12g\n",
+                        sideName15du[s15du], bandName15du[b15du], nb15du,
+                        mlHero15duBandNaturalDirDeltaSum[s15du][b15du].load(std::memory_order_relaxed) / (double)nb15du,
+                        mlHero15duBandSharedOverNaturalPdfSum[s15du][b15du].load(std::memory_order_relaxed) / (double)nb15du);
+                }
+            }
+            fprintf(f15cq, "phase15du interpretation=lane0_is_control_and_should_have_near_zero_direction_and_halfvector_delta; companion_nonzero_natural_direction_delta_proves_same_microfacet_event_maps_to_different_direction_under_eta_lambda; sharedWhDelta_and_microPdfRatio_measure_NDF_cost_of_forcing_companion_to_HERO_direction; jacobianRatio_is_refraction_mapping_cost; reconstructedSharedPdfRelErr_near0_validates_debug_factorization_against_live_lane_pdf; diagnostic_only_no_renderer_values_modified\n");
+            const unsigned long long term15dv = mlHero15dvTerminationCount.load(std::memory_order_relaxed);
+            const unsigned long long eye15dv = mlHero15dvEyeTerminationCount.load(std::memory_order_relaxed);
+            const unsigned long long light15dv = mlHero15dvLightTerminationCount.load(std::memory_order_relaxed);
+            const unsigned long long lanes15dv = mlHero15dvCompanionLanesTerminated.load(std::memory_order_relaxed);
+            const unsigned long long nonDisp15dv = mlHero15dvNonDispersivePacketEvents.load(std::memory_order_relaxed);
+            const double rawSum15dv = mlHero15dvHeroRawMultiplierSum.load(std::memory_order_relaxed);
+            const double blendSum15dv = mlHero15dvHeroBlendMultiplierSum.load(std::memory_order_relaxed);
+            const double ratioSum15dv = mlHero15dvHeroRawOverBlendSum.load(std::memory_order_relaxed);
+            const unsigned long long suppressedHero15dw = mlHero15dwSuppressedAlreadyHeroOnly.load(std::memory_order_relaxed);
+            const unsigned long long suppressedDead15dw = mlHero15dwSuppressedNoLiveSecondary.load(std::memory_order_relaxed);
+            fprintf(f15cq, "ML HERO phase 15er ROUGHGLASS HERO-ONLY ONE-SHOT activeRendererChange=1 scope=AllModes_GLOSSY_TRANSMIT_dispersionOnly terminations=%llu eye=%llu light=%llu companionLanesTerminated=%llu nonDispersivePacketEvents=%llu suppressedAlreadyHeroOnly=%llu suppressedNoLiveSecondary=%llu meanHeroRaw=%.12g meanPriorMultiplier=%.12g meanRawOverPriorMultiplier=%.12g\n",
+                term15dv, eye15dv, light15dv, lanes15dv, nonDisp15dv, suppressedHero15dw, suppressedDead15dw,
+                term15dv ? rawSum15dv / (double)term15dv : 0.0,
+                term15dv ? blendSum15dv / (double)term15dv : 0.0,
+                term15dv ? ratioSum15dv / (double)term15dv : 0.0);
+            fprintf(f15cq, "phase15er sampleFallback=%llu\n", mlHero15erSampleFallback.load(std::memory_order_relaxed));
+            fprintf(f15cq, "phase15er interpretation=packet_to_HERO_transition_must_happen_once_per_path; after_first_collapse later_RoughGlass_events_use_ordinary_single_HERO_without_Blend25_or_xN; dispersion_off_must_report_terminations=0_and_continue_packet\n");
+
 			const unsigned long long samples15dd = mlHero15ddSampleResultCount.load(std::memory_order_relaxed);
-			const double den15dd = samples15dd ? (double)samples15dd : 1.0;
+			const unsigned long long finite15ew = mlHero15ewFiniteTotals.load(std::memory_order_relaxed);
+            const double den15dd = finite15ew ? (double)finite15ew : 1.0;
 			const double meanY15dd = mlHero15ddRadianceYSum.load(std::memory_order_relaxed) / den15dd;
 			const double meanAbsY15dd = mlHero15ddRadianceYAbsSum.load(std::memory_order_relaxed) / den15dd;
 			const double rmsY15dd = sqrt(Max(0.0, mlHero15ddRadianceY2Sum.load(std::memory_order_relaxed) / den15dd));
-			fprintf(f15cq, "ML HERO phase 15dd ROUGHGLASS MODE A/B RADIANCE FINGERPRINT glassMode=%u samples=%llu preVarianceClamp=1 physicsChangedSince15db=1 glassLaneColorPreservationFix15df=1\n", engine->mlHeroGlassMode, samples15dd);
+            for (u_int stage = 0; stage < 5u; ++stage)
+            fprintf(f15cq, "phase15et SUMMARY stage=%u helperCalls=%llu helperRejected=%llu appliedEvents=%llu\n",
+                    stage, mlHero15etCalls[stage].load(std::memory_order_relaxed),
+                    mlHero15etRejected[stage].load(std::memory_order_relaxed),
+                    mlHero15etApplied[stage].load(std::memory_order_relaxed));
+            for (u_int side = 0u; side < 2u; ++side)
+                fprintf(f15cq, "phase15ev GLASS_SUMMARY side=%u events=%llu helperCalls=%llu helperRejected=%llu firstCollapses=%llu\n",
+                    side, mlHero15evEvents[side].load(std::memory_order_relaxed),
+                    mlHero15evCalls[side].load(std::memory_order_relaxed),
+                    mlHero15evRejected[side].load(std::memory_order_relaxed),
+                    mlHero15evCollapses[side].load(std::memory_order_relaxed));
+            fprintf(f15cq, "phase15ev GLASS_CONNECTIONS applied=%llu scope=matched_scalar_supported_endpoints_with_glass_history dualCompensation=15eu_retained\n",
+                mlHero15evConnections.load(std::memory_order_relaxed));
+            for (u_int stage15ew = 0u; stage15ew < MLHERO_15EW_STAGES; ++stage15ew)
+                fprintf(f15cq, "phase15ew NONFINITE_SUMMARY stage=%s checks=%llu nonfinite=%llu hasNaN=%llu hasInf=%llu\n",
+                    MLHeroStage15ew(stage15ew), mlHero15ewChecks[stage15ew].load(std::memory_order_relaxed),
+                    mlHero15ewNonfinite[stage15ew].load(std::memory_order_relaxed),
+                    mlHero15ewNaN[stage15ew].load(std::memory_order_relaxed),
+                    mlHero15ewInf[stage15ew].load(std::memory_order_relaxed));
+            for (u_int stage=0u;stage<MLHERO_15EW_STAGES;++stage)
+                for (u_int kind=0u;kind<2u;++kind)
+                    fprintf(f15cq,"phase15fw FINITE_SUMMARY stage=%s kind=%s events=%llu maxAbsChannel=%.12g detailsWrittenAtMost=32\n",
+                        MLHeroStage15ew(stage),kind==0u?"ABS64":"COLOR16_RATIO8",
+                        mlHero15fwEvents[stage][kind].load(std::memory_order_relaxed),
+                        mlHero15fwPeak[stage][kind].load(std::memory_order_relaxed));
+            fprintf(f15cq, "phase15ew FINGERPRINT_FILTER sampleResults=%llu finiteTotals=%llu excludedNonfiniteTotals=%llu finiteOnly=1 rendererPhysicsChanged=0 contributionChecksIncludeAccumulatorStates=1 detailBudgetPerStage=16\n",
+                samples15dd, finite15ew, mlHero15ewBadTotals.load(std::memory_order_relaxed));
+            for (u_int reason15ex = 0u; reason15ex < 5u; ++reason15ex)
+                fprintf(f15cq, "phase15ex DLS_MIS_SUMMARY reason=%s events=%llu\n",
+                    MLHeroMISReason15ex(reason15ex), mlHero15exCases[reason15ex].load(std::memory_order_relaxed));
+            fprintf(f15cq, "phase15ex DLS_MIS_CANDIDATE invalidActualMis=%llu candidateApplicableAndFinite=%llu candidateApplied=0 auditDiagnosticOnly=1 liveZeroHistoryFix=15ey\n",
+                mlHero15exInvalidMis.load(std::memory_order_relaxed), mlHero15exCandidateFinite.load(std::memory_order_relaxed));
+            fprintf(f15cq, "phase15ey DLS_MIS_FIX_SUMMARY zeroHistoryEvents=%llu recoveredLegacyNonfiniteMis=%llu unresolvedLegacyNonfiniteMis=%llu applied=1 detailBudget=16\n",
+                mlHero15eyZeroHistory.load(std::memory_order_relaxed), mlHero15eyRecovered.load(std::memory_order_relaxed),
+                mlHero15eyUnresolved.load(std::memory_order_relaxed));
+            const char *dualCategory15eu[] = {"neither", "eyeOnly", "lightOnly", "both"};
+            double allConnectionAbsY15eu = 0.0;
+            for (u_int category = 0u; category < 4u; ++category)
+                allConnectionAbsY15eu += mlHero15euBeforeAbsY[category].load(std::memory_order_relaxed);
+            for (u_int category = 0u; category < 4u; ++category) {
+                const double beforeY = mlHero15euBeforeY[category].load(std::memory_order_relaxed);
+                const double afterY = mlHero15euAfterY[category].load(std::memory_order_relaxed);
+                const double beforeAbsY = mlHero15euBeforeAbsY[category].load(std::memory_order_relaxed);
+                const double afterAbsY = mlHero15euAfterAbsY[category].load(std::memory_order_relaxed);
+                fprintf(f15cq, "phase15eu DUAL_SUMMARY glassMode=%u enabled=%u category=%s connections=%llu eligible=%llu applied=%llu beforeY=%.12g afterY=%.12g beforeAbsY=%.12g afterAbsY=%.12g candidateDivN_Y=%.12g ratioAbsY=%.9g shareBeforeAbsY_pct=%.9g\n",
+                    engine->mlHeroGlassMode, engine->mlHeroDualTerminationCompensation ? 1u : 0u,
+                    dualCategory15eu[category], mlHero15euConnections[category].load(std::memory_order_relaxed),
+                    mlHero15euEligible[category].load(std::memory_order_relaxed),
+                    mlHero15euApplied[category].load(std::memory_order_relaxed),
+                    beforeY, afterY, beforeAbsY, afterAbsY,
+                    mlHero15euCandidateY[category].load(std::memory_order_relaxed),
+                    beforeAbsY > 1e-30 ? afterAbsY / beforeAbsY : 0.0,
+                    allConnectionAbsY15eu > 1e-30 ? 100.0 * beforeAbsY / allConnectionAbsY15eu : 0.0);
+            }
+            fprintf(f15cq, "phase15eu interpretation=only_matched_spectral_ConnectVertices; shareBeforeAbsY_pct_is_connection_contribution_share_not_whole_film; enabled0_is_15et_baseline; enabled1_divides_eligible_dual_contributions_once; legacy_RGB_Mode1_behavior_retained\n");
+            fprintf(f15cq, "ML HERO phase 15dd ROUGHGLASS MODE A/B RADIANCE FINGERPRINT glassMode=%u samples=%llu preVarianceClamp=1 physicsChangedSince15db=1 glassLaneColorPreservationFix15df=1\n", engine->mlHeroGlassMode, samples15dd);
 			fprintf(f15cq, "phase15dd glassMode=%u meanRGB=(%.12g, %.12g, %.12g) meanY=%.12g meanAbsY=%.12g rmsY=%.12g maxAbsY=%.12g\n",
 				engine->mlHeroGlassMode,
 				mlHero15ddRadianceRSum.load(std::memory_order_relaxed) / den15dd,
@@ -8126,8 +9564,8 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 				mlHero15ddRadianceBSum.load(std::memory_order_relaxed) / den15dd,
 				meanY15dd, meanAbsY15dd, rmsY15dd, mlHero15ddRadianceYMax.load(std::memory_order_relaxed));
 			fprintf(f15cq, "phase15dd comparisonProtocol=render_same_scene_twice_same_settings_first_glassMode0_then_glassMode2_save_each_log; compare_meanRGB_meanY_meanAbsY_rmsY_maxAbsY_and_phase15dc_tails\n");
-			fprintf(f15cq, "phase15cw note=RoughGlass_8lane_shared_direction_support_diagnostic; phase15cx_extreme_multiplier_trace_enabled; phase15cy_spectral_mixture_diagnostic_enabled; phase15cz_power2_diagnostic_enabled; phase15da_partial_balance_blend_diagnostic_enabled; phase15db_roughglass_mode2_blend25_render_enabled; phase15dc_real_render_tail_diagnostic_enabled; phase15dd_mode_ab_radiance_fingerprint_enabled; phase15de_packet_color_weight_audit_enabled; phase15dg_mode2_spectral_energy_balance_audit_enabled; phase15dh_delta_glass_path_accounting_audit_enabled; phase15dj_glass_multiplier_decomposition_enabled; phase15dk_mode2_color_ownership_correlation_enabled; phase15dl_mode2_rgb_ownership_candidate_validated; phase15dm_mode2_glass_rgb_ownership_regular_path_enabled; 15cv_radiance_fix_retained\n");
-			fprintf(f15cq, "ML HERO phase 15dh DIAGNOSTIC STATUS: mode=current master=1 current=1 legacy=%u heavy=%u glassMode=%u physicsChanges=ROUGHGLASS_MODE2_TRANSMIT_BLEND25+GLASS_LANE_COLOR_15DF physicsChangedSince15db=1\n", mlHeroLegacyDiagnostics15cq.load(std::memory_order_relaxed) ? 1u : 0u, mlHeroHeavyDiagnostics15cq.load(std::memory_order_relaxed) ? 1u : 0u, engine->mlHeroGlassMode);
+			fprintf(f15cq, "phase15cw note=RoughGlass_8lane_shared_direction_support_diagnostic; phase15cx_extreme_multiplier_trace_enabled; phase15cy_spectral_mixture_diagnostic_enabled; phase15cz_power2_diagnostic_enabled; phase15da_partial_balance_blend_diagnostic_enabled; phase15dq_shared_hero_pdf_rejected_reverted; phase15dr_mixture_pdf_ownership_audit_retained; phase15ds_cumulative_path_pdf_spectral_mis_audit_retained; phase15dt_full_path_estimator_reconstruction_audit_retained; phase15du_microfacet_ownership_audit_retained; phase15dw_roughglass_dispersive_tx_hero_only_one_shot_enabled; phase15dc_real_render_tail_diagnostic_enabled; phase15dd_mode_ab_radiance_fingerprint_enabled; phase15de_packet_color_weight_audit_enabled; phase15dg_mode2_spectral_energy_balance_audit_enabled; phase15dh_delta_glass_path_accounting_audit_enabled; phase15dj_glass_multiplier_decomposition_enabled; phase15dk_mode2_color_ownership_correlation_enabled; phase15dl_mode2_rgb_ownership_candidate_validated; phase15dm_mode2_glass_rgb_ownership_regular_path_enabled; phase15dp_roughglass_first_divergence_audit_retained; 15cv_radiance_fix_retained\n");
+			fprintf(f15cq, "ML HERO phase 15dh DIAGNOSTIC STATUS: mode=current master=1 current=1 legacy=%u heavy=%u glassMode=%u physicsChanges=DUAL_TERMINATION_ALL_MODES_SPECTRAL_15EU+ROUGHGLASS_ALL_MODES_SPECTRAL_BOUNCES_AND_CONNECTIONS_15ET+GLASS_LANE_COLOR_15DF diagnostic15du=microfacet_ownership active15dw=roughglass_dispersive_tx_hero_only_one_shot physicsChangedSince15db=1\n", mlHeroLegacyDiagnostics15cq.load(std::memory_order_relaxed) ? 1u : 0u, mlHeroHeavyDiagnostics15cq.load(std::memory_order_relaxed) ? 1u : 0u, engine->mlHeroGlassMode);
 			fclose(f15cq);
 		}
 	}
@@ -9053,6 +10491,19 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 		}
 	}
 
+// 15fh BEGIN diagnostic-only
+    if(MLHeroCurrentDiagnosticsEnabled15cq()) {
+        std::lock_guard<std::recursive_mutex> lock15fh(mlHeroDebugLogMutex);
+        FILE*f15fh=fopen(ML_HERO_LOG_FILE,"a");
+        if(f15fh){
+            fprintf(f15fh,"phase15fi DEPTH_CONFIG engine=BIDIRCPU thread=%u eyeMax=%u lightMax=%u rrStart=%u rrLimit=%.9g rrCounter=subpathVertexDepth rrBeforeDepthIncrement=1 rrSkipSpecular=0 independentSubpathLimits=1 rendererPhysicsChanged=0\n",threadIndex,engine->maxEyePathDepth,engine->maxLightPathDepth,engine->rrDepth,engine->rrImportanceCap);
+            fprintf(f15fh,"phase15fo BIDIR_MIS_CONFIG engine=BIDIRCPU thread=%u rendererPhysicsChanged=1 liveEndpointPDF=RAW_DIRECTIONAL rawBounceHistoryRetained=1 rrCompensation=THROUGHPUT_ONLY localRRPDFRemoved=ConnectVerticesBothSides,ConnectToEye,DLS independentOfHeroAndDiagnostics=1 BIDIRVMCPU_BaselineRetained=1 fullRuntimePathClosure=0\n",threadIndex);
+            fprintf(f15fh,"phase15ft RR_EXPERIMENT_CONFIG engine=BIDIRCPU thread=%u enabled=%u heroEnabled=%u wavelengths=%u rendererPhysicsChangedWhenEligible=%u scope=EyeIdealGlassOnly candidate=AccumulatedScalarLaneMaxTimesEtaScale capIsMinimumSurvival=1 selectedQCompensation=ClassicAndAllLanes diagnosticsIndependent=1 randomDimensionsUnchanged=1 local15fkIsBaselineReference=1 native15fsIsLiveDecision=1 MIS=Retained15foRawDirectional fullBidirRuntimeClosure=0\n",threadIndex,engine->mlHeroRRGlassEtaExperiment?1u:0u,engine->mlHeroEnabled?1u:0u,static_cast<unsigned>(engine->mlHeroWavelengthCount),engine->mlHeroRRGlassEtaExperiment?1u:0u);
+            fprintf(f15fh,"phase15fv MATERIAL_RR_EXPERIMENT_CONFIG engine=BIDIRCPU thread=%u enabled=%u scope=EyeMatteMetal2Glossy2 candidate=PostMaterialAccumulatedScalarMaxTimesEtaScale fallback=BaselineOnInvalid candidateAppliedWhenEligible=1 rrCompensation=ClassicAndAllLanes sameRandomDimension=1 MIS=Retained15foRawDirectional fullBidirRuntimeClosure=0\n",threadIndex,engine->mlHeroRRMaterialExperiment?1u:0u);
+            MLHeroWrite15fh(f15fh,"BIDIRCPU",threadIndex);fclose(f15fh);
+        }
+    }
+// 15fh END
 	threadDone = true;
 
 	// This is done to stop threads pending on barrier wait

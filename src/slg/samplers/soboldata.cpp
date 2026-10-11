@@ -1,3 +1,4 @@
+#include <stdexcept>
 /***************************************************************************
  * Copyright 1998-2020 by authors (see AUTHORS.txt)                        *
  *                                                                         *
@@ -21280,7 +21281,9 @@ static const SobolDirectionNumbers SOBOL_NUMBERS[SOBOL_MAX_DIMENSIONS - 1] = {
 };
 
 void slg::SobolSequence::GenerateDirectionVectors(u_int *vectors, const u_int dimensions) {
-	assert(dimensions <= SOBOL_MAX_DIMENSIONS);
+	if (dimensions == 0u || dimensions > SOBOL_MAX_DIMENSIONS)
+        throw std::runtime_error("SOBOL direction-vector dimension limit exceeded");
+    assert(dimensions <= SOBOL_MAX_DIMENSIONS);
 
 	const u_int L = SOBOL_BITS;
 

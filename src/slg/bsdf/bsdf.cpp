@@ -19,10 +19,23 @@
 #include "slg/bsdf/bsdf.h"
 #include "slg/scene/scene.h"
 #include "slg/materials/glass.h"
+#include "slg/materials/roughglass.h"
 #include <memory>
+#include <cmath>
 
+// 15fe BEGIN
+#include <cmath>
+// 15fe END
 #include "slg/materials/metal2.h"
+// 15fd BEGIN diagnostic-only
+#include "slg/materials/mattetranslucent.h"
+// 15fd END diagnostic-only
 #include "slg/materials/glossy2.h"
+
+// Explicit wavelength evaluation must preserve the renderer's sampled state.
+extern thread_local float mlDispersionWaveLength;
+extern thread_local bool mlDispersionUsed;
+extern thread_local bool mlHeroPacketFallbackUsed;
 
 using namespace luxrays;
 using namespace slg;
@@ -399,6 +412,72 @@ Spectrum BSDF::Sample(Vector *sampledDir,
 	return result;
 }
 
+// 15fe BEGIN
+bool BSDF::GetMLHeroMatteTranslucentFactors15fe(const Vector &dir,
+        const BSDFEvent event, const bool sampled, Spectrum *kr, Spectrum *kt,
+        float *wrapper) const {
+    if (!wrapper || !GetMLHeroMatteTranslucentInputs15fd(kr, kt) ||
+            !(event & DIFFUSE) || (event & (GLOSSY | SPECULAR)) ||
+            bool(event & REFLECT) == bool(event & TRANSMIT)) return false;
+    for (u_int c = 0u; c < 3u; ++c)
+        if (!std::isfinite(kr->c[c]) || !std::isfinite(kt->c[c])) return false;
+    const bool reflect = (event & REFLECT) != 0;
+    const Vector &eyeDir = hitPoint.fromLight ? dir : hitPoint.fixedDir;
+    const Vector &lightDir = hitPoint.fromLight ? hitPoint.fixedDir : dir;
+    const Vector localLight = frame.ToLocal(lightDir), localEye = frame.ToLocal(eyeDir);
+    if (reflect != (localLight.z * localEye.z > 0.f)) return false;
+    float factor;
+    if (sampled) {
+        const Vector fixed = frame.ToLocal(hitPoint.fixedDir), generated = frame.ToLocal(dir);
+        if (fabsf(fixed.z) < DEFAULT_COS_EPSILON_STATIC ||
+                fabsf(generated.z) < DEFAULT_COS_EPSILON_STATIC) return false;
+        const Spectrum transmission = *kt * (Spectrum(1.f) - *kr);
+        const bool rBlack = kr->Black(), tBlack = transmission.Black();
+        if (rBlack && tBlack) return false;
+        const float threshold = !rBlack ? (!tBlack ? .5f : 1.f) : 0.f;
+        // The native proposal remains authoritative, including black-lobe cases.
+        if (reflect != (hitPoint.passThroughEvent < threshold)) return false;
+        const float probability = reflect ? threshold : 1.f - threshold;
+        if (!(probability > 0.f)) return false;
+        factor = 1.f / probability;
+        if (hitPoint.fromLight) factor *= fabsf(fixed.z / generated.z);
+        if (reflect && hitPoint.shadeN != hitPoint.interpolatedN)
+            factor *= ShadowTerminatorAvoidanceFactor(hitPoint.GetLandingInterpolatedN(),
+                hitPoint.GetLandingShadeN(), lightDir);
+        if (hitPoint.fromLight) {
+            const float fixedNG = AbsDot(hitPoint.fixedDir, hitPoint.geometryN);
+            if (!(fixedNG > 0.f)) return false;
+            factor *= AbsDot(dir, hitPoint.geometryN) / fixedNG;
+        }
+    } else {
+        const float eyeNG = AbsDot(eyeDir, hitPoint.geometryN);
+        const float lightNG = AbsDot(lightDir, hitPoint.geometryN);
+        if (eyeNG < DEFAULT_COS_EPSILON_STATIC || lightNG < DEFAULT_COS_EPSILON_STATIC)
+            return false;
+        // Both sides are supported by this material, as in BSDF::Evaluate().
+        factor = INV_PI * fabsf(localLight.z);
+        if (reflect && hitPoint.shadeN != hitPoint.interpolatedN)
+            factor *= ShadowTerminatorAvoidanceFactor(hitPoint.GetLandingInterpolatedN(),
+                hitPoint.GetLandingShadeN(), lightDir);
+        if (hitPoint.fromLight) factor *= eyeNG / lightNG;
+    }
+    if (!std::isfinite(factor) || factor < 0.f) return false;
+    *wrapper = factor;
+    return true;
+}
+// 15fe END
+
+// 15fd BEGIN diagnostic-only
+bool BSDF::GetMLHeroMatteTranslucentInputs15fd(Spectrum *kr, Spectrum *kt) const {
+    if (!kr || !kt || !material || material->GetType() != MATTETRANSLUCENT)
+        return false;
+    const MatteTranslucentMaterial &m = static_cast<const MatteTranslucentMaterial &>(*material);
+    *kr = m.GetKr()->GetSpectrumValue(hitPoint).Clamp(0.f, 1.f);
+    *kt = m.GetKt()->GetSpectrumValue(hitPoint).Clamp(0.f, 1.f);
+    return true;
+}
+// 15fd END diagnostic-only
+
 bool BSDF::EvaluateMLHeroMetal2SampleAtWaveLength(const Vector &sampledDir,
 		const float waveLength, Spectrum *sampleMultiplier) const {
 	if (!sampleMultiplier || !material || (material->GetType() != METAL2))
@@ -547,6 +626,84 @@ bool BSDF::EvaluateMLHeroGlassDebugAtWaveLength(const Vector &sampledDir,
 			exteriorIOR, interiorIORBase, interiorIORLambda,
 			fresnelR, eta, eta2, transportFactor, directionDelta, sampleMultiplier,
 			cosFixedOut, sinI2Out, sinT2Out, tirOut, laneEventPdfWOut);
+}
+
+
+bool BSDF::HasMLHeroGlassDispersion() const {
+    return material && material->GetType() == GLASS &&
+        static_cast<const GlassMaterial &>(*material).HasMLHeroDispersion(hitPoint);
+}
+
+bool BSDF::EvaluateMLHeroGlassSampleAtWaveLength(const Vector &dir,
+        const BSDFEvent event, const float pdfW, const float wavelength,
+        Spectrum *value, float *directionDelta) const {
+    if (!value || !material || material->GetType() != GLASS || !(event & SPECULAR) ||
+        !(event & (REFLECT | TRANSMIT)) || !std::isfinite(pdfW) || pdfW <= 0.f ||
+        !std::isfinite(wavelength) || wavelength < 380.f || wavelength > 780.f) return false;
+    float nc = 0.f, base = 0.f, nt = 0.f, fresnel = 0.f, eta = 0.f, eta2 = 0.f;
+    float transport = 0.f, delta = 0.f;
+    const bool valid = EvaluateMLHeroGlassDebugAtWaveLength(dir, event, pdfW, wavelength,
+        &nc, &base, &nt, &fresnel, &eta, &eta2, &transport, &delta, value);
+    if (directionDelta) *directionDelta = delta;
+    // A delta transmission may only carry the wavelength owning this direction.
+    // Reflection is common to all packet wavelengths. Callers evaluate only
+    // HERO on dispersive transmission; no companion-direction approximation.
+    if (!valid || !std::isfinite(delta) || delta > 2e-4f) return false;
+    if (hitPoint.fromLight) {
+        const float fixedNg = AbsDot(hitPoint.fixedDir, hitPoint.geometryN);
+        if (fixedNg <= 1e-20f) return false;
+        *value *= AbsDot(dir, hitPoint.geometryN) / fixedNg;
+    }
+    return !value->IsNaN() && !value->IsInf() && !value->IsNeg();
+}
+
+bool BSDF::HasMLHeroRoughGlassDispersion() const {
+    return material && material->GetType() == ROUGHGLASS &&
+        static_cast<const RoughGlassMaterial &>(*material).HasMLHeroDispersion(hitPoint);
+}
+
+bool BSDF::EvaluateMLHeroRoughGlassAtWaveLength(const Vector &dir,
+        const BSDFEvent expectedEvent, const float wavelength, Spectrum *value) const {
+    if (!value || !material || material->GetType() != ROUGHGLASS ||
+        wavelength < 380.f || wavelength > 780.f || !std::isfinite(wavelength)) return false;
+    struct Restore {
+        float wavelength; bool used, fallback;
+        Restore() : wavelength(mlDispersionWaveLength), used(mlDispersionUsed),
+            fallback(mlHeroPacketFallbackUsed) {}
+        ~Restore() { mlDispersionWaveLength = wavelength; mlDispersionUsed = used;
+            mlHeroPacketFallbackUsed = fallback; }
+    } restore;
+    mlDispersionWaveLength = wavelength;
+    BSDFEvent laneEvent = NONE;
+    float pdf = 0.f, reversePdf = 0.f;
+    *value = Evaluate(dir, &laneEvent, &pdf, &reversePdf);
+    // Zero is a valid spectral contribution at a companion wavelength.
+    return !value->IsNaN() && !value->IsInf() && !value->IsNeg() &&
+        (value->Black() || ((laneEvent & (REFLECT | TRANSMIT)) ==
+            (expectedEvent & (REFLECT | TRANSMIT))));
+}
+
+bool BSDF::EvaluateMLHeroRoughGlassMicrofacetOwnershipDebug(
+		const Vector &sampledDir, const BSDFEvent sampledEvent,
+		const float heroWaveLength, const float laneWaveLength,
+		float *heroEta, float *laneEta,
+		float *heroMicrofacetPdf, float *laneSharedMicrofacetPdf,
+		float *naturalJacobian, float *sharedJacobian,
+		float *naturalDirPdf, float *sharedDirPdf,
+		float *naturalDirDelta, float *sharedWhDelta, bool *naturalTir) const {
+	if (!material || (material->GetType() != ROUGHGLASS))
+		return false;
+
+	const RoughGlassMaterial &roughGlass = static_cast<const RoughGlassMaterial &>(*material);
+	const Vector localFixedDir = frame.ToLocal(hitPoint.fixedDir);
+	const Vector localSharedDir = frame.ToLocal(sampledDir);
+	return roughGlass.EvaluateMLHeroMicrofacetOwnershipDebug(hitPoint,
+			localFixedDir, localSharedDir, sampledEvent,
+			heroWaveLength, laneWaveLength, heroEta, laneEta,
+			heroMicrofacetPdf, laneSharedMicrofacetPdf,
+			naturalJacobian, sharedJacobian,
+			naturalDirPdf, sharedDirPdf,
+			naturalDirDelta, sharedWhDelta, naturalTir);
 }
 
 bool BSDF::EvaluateMLHeroGlossy2DebugSampleComponents(

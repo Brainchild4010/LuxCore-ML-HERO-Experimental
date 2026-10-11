@@ -17,6 +17,8 @@
  ***************************************************************************/
 
 #include "slg/engines/pathcpu/pathcpu.h"
+#include "../mlherolog.h"
+
 #include "slg/engines/pathcpu/pathcpurenderstate.h"
 #include "slg/film/filters/filter.h"
 #include "slg/samplers/sobol.h"
@@ -148,6 +150,7 @@ void PathCPURenderEngine::StartLockLess() {
 
 void PathCPURenderEngine::StopLockLess() {
 	CPUNoTileRenderEngine::StopLockLess();
+	slg::mlhero15gb::Finish("PATH");
 
 	pathTracer.DeletePixelFilterDistribution();
 
