@@ -1,3 +1,6 @@
+#include "slg/engines/mlhero_metal_pdf15lb.h"
+#include "slg/engines/mlhero_schlick_audit15la.h"
+#include "slg/engines/mlhero_metal_direction15ky.h"
 /***************************************************************************
  * Copyright 1998-2020 by authors (see AUTHORS.txt)                        *
  *                                                                         *
@@ -33,6 +36,37 @@ namespace {
 using namespace std;
 using namespace luxrays;
 using namespace slg;
+
+// 15ky BEGIN: one numerical Schlick geometry convention for CPU HERO Metal2.
+static Vector MLHeroMetalHalf15ky(const Vector&a,const Vector&b){
+    if(!GetMLHeroEnabled())return Normalize(a+b);
+    using namespace slg::mlhero15kk;
+    auto h=Unit(Unit(V(a))+Unit(V(b)));
+    if(h.z<0.)h=h*(-1.);
+    return Vector(float(h.x),float(h.y),float(h.z));
+}
+static float MLHeroMetalCos15ky(const Vector&a,const Vector&b){
+    if(!GetMLHeroEnabled())return Dot(a,Normalize(a+b));
+    using namespace slg::mlhero15kk;
+    // For unit reflected directions |cos(theta_h)|=|a+b|/2.
+    // Symmetric and stable even when a and b nearly cancel at grazing.
+    const auto sum=Unit(V(a))+Unit(V(b));
+    const float c=float(.5*std::sqrt(sum.Norm2()));
+    return a.z<0.f?-c:c;
+}
+static float MLHeroMetalD15ky(float roughness,const Vector&h,float anisotropy){
+    if(!GetMLHeroEnabled())return SchlickDistribution_D(roughness,h,anisotropy);
+    const double x=h.x,y=h.y,z=h.z,r=roughness,n2=x*x+y*y+z*z;
+    if(!(n2>0.)||!(r>0.)||!std::isfinite(n2))return 0.f;
+    const double denominator=(x*x+y*y+r*z*z)/n2;
+    return float((r/denominator)/denominator*SchlickDistribution_SchlickA(h,anisotropy)*INV_PI);
+}
+// 15lb: native/HERO-off probabilities are preserved exactly.
+static float MLHeroMetalHalfPdf15lb(float roughness,const Vector&h,float anisotropy){
+    if(!GetMLHeroEnabled())return MLHeroMetalD15ky(roughness,h,anisotropy);
+    return float(slg::mlhero15lb::HalfPdf(roughness,anisotropy,h.x,h.y,h.z));
+}
+// 15ky END
 
 //------------------------------------------------------------------------------
 // Metal2 material
@@ -79,6 +113,65 @@ Metal2Material::Metal2Material(
 	glossiness = ComputeGlossiness(nu, nv);
 }
 
+// 15ky BEGIN: cache material inputs once, evaluate the emitted direction pair.
+// No second material sample, no extra texture/Fresnel query, no PDF clamp.
+static Spectrum MLHeroMetalSample15ky(const Metal2Material&m,const HitPoint&hp,
+        const Frame*frame,const Vector&input,Vector*out,float u0,float u1,
+        float*pdf,BSDFEvent*event,float*cosine){
+    const Vector fixed=frame?slg::mlhero15ky::Local(*frame,input):slg::mlhero15kp::Normalize(input);
+    slg::mlhero15la::Attempt audit15la(hp.fromLight,m.GetID());
+    if(fabsf(fixed.z)<DEFAULT_COS_EPSILON_STATIC)return Spectrum();
+    const float u=Clamp(m.GetNu()->GetFloatValue(hp),1e-9f,1.f);
+    const float v=Clamp(m.GetNv()->GetFloatValue(hp),1e-9f,1.f);
+    const float u2=u*u,v2=v*v;
+    const float anis=(u2<v2)?1.f-u2/v2:(u2>0.f?v2/u2-1.f:0.f);
+    const float roughness=u*v;
+    using namespace slg::mlhero15kk;
+    const auto h=slg::mlhero15ky::SampleHalf(roughness,anis,u0,u1);
+    const auto f=Unit(V(fixed));
+    const auto generated=Unit(h*(2.*slg::mlhero15kk::Dot(f,h))-f);
+    if(audit15la.Active())audit15la.Draw(u,v,roughness,anis,u0,u1,f,h,
+        MLHeroMetalD15ky(roughness,Vector(float(h.x),float(h.y),float(h.z)),anis));
+    Vector emitted;
+    if(frame){
+        const slg::mlhero15kl::Frame precise(*frame);const auto world=precise.ToWorld(generated);
+        emitted=slg::mlhero15kp::Normalize(Vector(float(world.x),float(world.y),float(world.z)));
+    }else emitted=slg::mlhero15kp::Normalize(Vector(float(generated.x),float(generated.y),float(generated.z)));
+    const Vector local=frame?slg::mlhero15ky::Local(*frame,emitted):emitted;
+    if(fabsf(local.z)<DEFAULT_COS_EPSILON_STATIC||fixed.z*local.z<0.f)return Spectrum();
+    Vector pairHalf=MLHeroMetalHalf15ky(fixed,local);
+    // Keep the native sampled Fresnel orientation: sampled h is on the upper side.
+    if(pairHalf.z<0.f)pairHalf=-pairHalf;
+    const float cosWH=MLHeroMetalCos15ky(fixed,local);
+    const float d=MLHeroMetalD15ky(roughness,pairHalf,anis);
+    const float halfPdf=MLHeroMetalHalfPdf15lb(roughness,pairHalf,anis);
+    const float probability=halfPdf/(4.f*fabsf(cosWH));
+    if(!(probability>0.f)||!std::isfinite(probability)){audit15la.PdfRejected();return Spectrum();}
+    audit15la.Accept(V(pairHalf),probability);
+    const float G=SchlickDistribution_G(roughness,fixed,local);
+    Spectrum F;
+    if(m.GetFresnel())F=m.GetFresnel()->Evaluate(hp,cosWH);
+    else {
+        const Spectrum eta=m.GetN()->GetSpectrumValue(hp).Clamp(.001f);
+        const Spectrum kk=m.GetK()->GetSpectrumValue(hp).Clamp(.001f);
+        F=FresnelTexture::GeneralEvaluate(eta,kk,cosWH);
+    }
+    F.Clamp(0.f,1.f);
+    // BRDF D and generated half-density differ. Use f*cos/pdf, without
+    // conditioning on hemisphere acceptance or silently changing the BRDF.
+    const float factor=float((double(d)/halfPdf)*G*fabsf(cosWH)/
+        (hp.fromLight?fabsf(local.z):fabsf(fixed.z)));
+    *out=emitted;*pdf=probability;*event=GLOSSY|REFLECT;
+    if(cosine)*cosine=fabsf(local.z);
+    return factor*F;
+}
+Spectrum Metal2Material::SampleMLHeroWorld15ky(const HitPoint&hp,const Frame&frame,
+        Vector*out,float u0,float u1,float passThroughEvent,float*pdf,
+        float*cosine,BSDFEvent*event)const{
+    return MLHeroMetalSample15ky(*this,hp,&frame,hp.fixedDir,out,u0,u1,pdf,event,cosine);
+}
+// 15ky END
+
 bool Metal2Material::EvaluateFresnelAtWaveLength(const HitPoint &hitPoint, const float cosi,
 		const float waveLength, Spectrum *fresnel) const {
 	if (!fresnelTex || !fresnel)
@@ -106,8 +199,8 @@ bool Metal2Material::EvaluateAtWaveLength(const HitPoint &hitPoint,
 	const float anisotropy = (u2 < v2) ? (1.f - u2 / v2) : u2 > 0.f ? (v2 / u2 - 1.f) : 0.f;
 	const float roughness = u * v;
 
-	const Vector wh(Normalize(localLightDir + localEyeDir));
-	const float cosWH = Dot(localLightDir, wh);
+	const Vector wh(MLHeroMetalHalf15ky(localLightDir,localEyeDir));
+	const float cosWH = MLHeroMetalCos15ky(localLightDir,localEyeDir);
 	if (fabsf(cosWH) < DEFAULT_COS_EPSILON_STATIC)
 		return false;
 
@@ -116,7 +209,7 @@ bool Metal2Material::EvaluateAtWaveLength(const HitPoint &hitPoint,
 		return false;
 
 	const float G = SchlickDistribution_G(roughness, localLightDir, localEyeDir);
-	*value = (SchlickDistribution_D(roughness, wh, anisotropy) * G /
+	*value = (MLHeroMetalD15ky(roughness, wh, anisotropy) * G /
 			(4.f * fabsf(localEyeDir.z))) * F;
 	return true;
 }
@@ -138,8 +231,8 @@ bool Metal2Material::EvaluateAtWaveLengthDebug(const HitPoint &hitPoint,
 		u2 > 0.f ? (v2 / u2 - 1.f) : 0.f;
 	const float roughness = u * v;
 
-	const Vector wh(Normalize(localLightDir + localEyeDir));
-	const float cosWH = Dot(localLightDir, wh);
+	const Vector wh(MLHeroMetalHalf15ky(localLightDir,localEyeDir));
+	const float cosWH = MLHeroMetalCos15ky(localLightDir,localEyeDir);
 	if (fabsf(cosWH) < DEFAULT_COS_EPSILON_STATIC)
 		return false;
 
@@ -150,7 +243,7 @@ bool Metal2Material::EvaluateAtWaveLengthDebug(const HitPoint &hitPoint,
 	fresnel->Clamp(0.f, 1.f);
 
 	const float G = SchlickDistribution_G(roughness, localLightDir, localEyeDir);
-	const float factor = SchlickDistribution_D(roughness, wh, anisotropy) * G /
+	const float factor = MLHeroMetalD15ky(roughness, wh, anisotropy) * G /
 		(4.f * fabsf(localEyeDir.z));
 
 	*microfacetFactor = factor;
@@ -175,16 +268,16 @@ bool Metal2Material::EvaluateSampleAtWaveLength(const HitPoint &hitPoint,
 	const float anisotropy = (u2 < v2) ? (1.f - u2 / v2) : u2 > 0.f ? (v2 / u2 - 1.f) : 0.f;
 	const float roughness = u * v;
 
-	const Vector wh(Normalize(localFixedDir + localSampledDir));
-	const float cosWH = Dot(localFixedDir, wh);
+	const Vector wh(MLHeroMetalHalf15ky(localFixedDir,localSampledDir));
+	const float cosWH = MLHeroMetalCos15ky(localFixedDir,localSampledDir);
 	if (fabsf(cosWH) < DEFAULT_COS_EPSILON_STATIC)
 		return false;
 
-	const float specPdf = SchlickDistribution_Pdf(roughness, wh, anisotropy);
+	const float specPdf = MLHeroMetalHalfPdf15lb(roughness, wh, anisotropy);
 	if (specPdf <= 0.f)
 		return false;
 
-	const float d = SchlickDistribution_D(roughness, wh, anisotropy);
+	const float d = MLHeroMetalD15ky(roughness, wh, anisotropy);
 	const float G = SchlickDistribution_G(roughness, localFixedDir, localSampledDir);
 	const float coso = fabsf(localFixedDir.z);
 	const float cosi = fabsf(localSampledDir.z);
@@ -230,14 +323,14 @@ Spectrum Metal2Material::Evaluate(const HitPoint &hitPoint,
 	const float anisotropy = (u2 < v2) ? (1.f - u2 / v2) : u2 > 0.f ? (v2 / u2 - 1.f) : 0.f;
 	const float roughness = u * v;
 
-	const Vector wh(Normalize(localLightDir + localEyeDir));
-	const float cosWH = Dot(localLightDir, wh);
+	const Vector wh(MLHeroMetalHalf15ky(localLightDir,localEyeDir));
+	const float cosWH = MLHeroMetalCos15ky(localLightDir,localEyeDir);
 
 	if (directPdfW)
-		*directPdfW = SchlickDistribution_Pdf(roughness, wh, anisotropy) / (4.f * cosWH);
+		*directPdfW = MLHeroMetalHalfPdf15lb(roughness, wh, anisotropy) / (4.f * (GetMLHeroEnabled()?fabsf(cosWH):cosWH));
 
 	if (reversePdfW)
-		*reversePdfW = SchlickDistribution_Pdf(roughness, wh, anisotropy) / (4.f * cosWH);
+		*reversePdfW = MLHeroMetalHalfPdf15lb(roughness, wh, anisotropy) / (4.f * (GetMLHeroEnabled()?fabsf(cosWH):cosWH));
 
 	Spectrum F;
 	if (fresnelTex)
@@ -253,13 +346,15 @@ Spectrum Metal2Material::Evaluate(const HitPoint &hitPoint,
 	const float G = SchlickDistribution_G(roughness, localLightDir, localEyeDir);
 
 	*event = GLOSSY | REFLECT;
-	return (SchlickDistribution_D(roughness, wh, anisotropy) * G / (4.f * fabsf(localEyeDir.z))) * F;
+	return (MLHeroMetalD15ky(roughness, wh, anisotropy) * G / (4.f * fabsf(localEyeDir.z))) * F;
 }
 
 Spectrum Metal2Material::Sample(const HitPoint &hitPoint,
 	const Vector &localFixedDir, Vector *localSampledDir,
 	const float u0, const float u1, const float passThroughEvent,
 	float *pdfW, BSDFEvent *event) const {
+    if(GetMLHeroEnabled())return MLHeroMetalSample15ky(*this,hitPoint,nullptr,localFixedDir,
+        localSampledDir,u0,u1,pdfW,event,nullptr);
 	if (fabsf(localFixedDir.z) < DEFAULT_COS_EPSILON_STATIC)
 		return Spectrum();
 
@@ -319,13 +414,13 @@ void Metal2Material::Pdf(const HitPoint &hitPoint,
 	const float anisotropy = (u2 < v2) ? (1.f - u2 / v2) : u2 > 0.f ? (v2 / u2 - 1.f) : 0.f;
 	const float roughness = u * v;
 
-	const Vector wh(Normalize(localLightDir + localEyeDir));
+	const Vector wh(MLHeroMetalHalf15ky(localLightDir,localEyeDir));
 
 	if (directPdfW)
-		*directPdfW = SchlickDistribution_Pdf(roughness, wh, anisotropy) / (4.f * AbsDot(localLightDir, wh));
+		*directPdfW = MLHeroMetalHalfPdf15lb(roughness, wh, anisotropy) / (4.f * fabsf(MLHeroMetalCos15ky(localLightDir,localEyeDir)));
 
 	if (reversePdfW)
-		*reversePdfW = SchlickDistribution_Pdf(roughness, wh, anisotropy) / (4.f * AbsDot(localLightDir, wh));
+		*reversePdfW = MLHeroMetalHalfPdf15lb(roughness, wh, anisotropy) / (4.f * fabsf(MLHeroMetalCos15ky(localLightDir,localEyeDir)));
 }
 
 void Metal2Material::AddReferencedTextures(std::unordered_set<const Texture *>  &referencedTexs) const {

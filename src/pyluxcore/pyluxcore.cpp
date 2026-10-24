@@ -45,6 +45,7 @@
 
 #include "luxrays/luxrays.h"
 #include "luxcore/luxcore.h"
+#include "slg/engines/mlhero_version.h"
 #include "luxcore/luxcoreimpl.h"
 #include "luxcore/pyluxcore/pyluxcoreforblender.h"
 #include "luxcore/pyluxcore/pyluxcoreutils.h"
@@ -2155,6 +2156,14 @@ PYBIND11_MODULE(pyluxcore, m) {
       "Provides access to the LuxCoreRender API in python\n\n";
 
   m.def("Version", LuxCoreVersion, "Returns the LuxCore version");
+  m.def("MLBuildInfo", []() {
+    py::dict d;
+    d["build"] = ML_HERO_BUILD;
+    d["phase"] = ML_HERO_TEST_PHASE;
+    d["feature"] = ML_HERO_FEATURE;
+    d["schema"] = ML_HERO_IDENTITY_SCHEMA;
+    return d;
+  }, "Returns the identity compiled into the active ML HERO binary");
 
   m.def("Init", &LuxCore_Init);
   m.def("Init", &LuxCore_InitDefaultHandler);

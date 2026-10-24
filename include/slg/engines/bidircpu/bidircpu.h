@@ -28,6 +28,8 @@
 #include "slg/film/filmsamplesplatter.h"
 #include "slg/film/sampleresult.h"
 #include "slg/bsdf/bsdf.h"
+#include "slg/engines/mlhero_parent_pdf_history15ke.h"
+#include "slg/engines/mlhero_path_factors15kq.h"
 #include "slg/volumes/volume.h"
 
 namespace slg {
@@ -40,6 +42,9 @@ typedef struct PathVertexVM {
 	BSDF bsdf;
 	BSDFEvent bsdfEvent;
 	luxrays::Spectrum throughput;
+    // 15ke: native parent bounce linkage only; never consumed by transport.
+    slg::mlhero15ke::State mlHeroParentHistory15ke;
+    slg::mlhero15kq::State mlHeroPathFactors15kq;
 
 	// ML-HERO phase 6: diagnostic per-wavelength path throughput. These lanes
 	// are propagated alongside the classic RGB throughput but are not yet used
@@ -232,6 +237,7 @@ public:
 	float rrImportanceCap;
     bool mlHeroRRMaterialExperiment = false; // 15fv: eye Matte/Metal2/Glossy2
     bool mlHeroRRGlassEtaExperiment = false; // 15ft: explicit eye-Glass A/B switch
+    bool mlHeroSplittingRequested15gl = false; // 15gl: configuration handshake only; no child rays
 
 	// ML HERO global spectral mode
 	bool mlHeroEnabled;
@@ -278,6 +284,9 @@ protected:
 	virtual void InitFilm();
 	virtual void StartLockLess();
 	virtual void StopLockLess();
+	virtual void EndSceneEditLockLess(const EditActionList &editActions);
+	// Shared diagnostics must be initialized before any render worker starts.
+	void PrepareMLHeroDiagnostics15kd();
 
 	PhotonGICache *photonGICache;
 

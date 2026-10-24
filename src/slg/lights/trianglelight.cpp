@@ -19,6 +19,8 @@
 #include "slg/bsdf/bsdf.h"
 #include "slg/core/sphericalfunction/sphericalfunction.h"
 #include "slg/lights/trianglelight.h"
+#include "slg/engines/mlhero_emission_source15kg.h"
+#include "slg/engines/mlhero_polar_pdf15kh.h"
 #include "slg/scene/sceneobject.h"
 
 using namespace std;
@@ -286,12 +288,29 @@ bool TriangleLight::IsAlwaysInShadow(SceneConstRef scene,
 Spectrum TriangleLight::GetRadiance(const HitPoint &hitPoint,
 		float *directPdfA,
 		float *emissionPdfW) const {
+
+    slg::mlhero15kg::Capture source15kg(static_cast<const LightSource *>(this));
+    if (source15kg.Enabled()) {
+        auto &a=slg::mlhero15kg::current;
+        a.meshIndex=meshIndex; a.triangleIndex=triangleIndex;
+        a.triangleArea=triangleArea; a.inverseTriangleArea=invTriangleArea;
+        a.meshArea=meshArea; a.inverseMeshArea=invMeshArea;
+        a.branch=slg::mlhero15kg::Branch::RejectedArea;
+    }
 	// A safety check to avoid NaN/Inf
 	if ((triangleArea == 0.f) || (meshArea == 0.f))
 		return Spectrum();
 
 	const float cosOutLight = Dot(hitPoint.shadeN, hitPoint.fixedDir);
 	const SampleableSphericalFunction *emissionFunc = lightMaterial->GetEmissionFunc();
+    if (source15kg.Enabled()) {
+        auto &a=slg::mlhero15kg::current;
+        a.emissionFunction=emissionFunc; a.cosOutLight=cosOutLight;
+        a.emittedTheta=lightMaterial->GetEmittedTheta();
+        a.cosThetaMax=lightMaterial->GetEmittedCosThetaMax();
+        a.branch=slg::mlhero15kg::Branch::RejectedHemisphere;
+    }
+
 	// emissionFunc can emit light even backward, this is for compatibility with classic Lux
 	if (!emissionFunc && (cosOutLight < lightMaterial->GetEmittedCosThetaMax() + DEFAULT_COS_EPSILON_STATIC))
 		return Spectrum();
@@ -301,26 +320,41 @@ Spectrum TriangleLight::GetRadiance(const HitPoint &hitPoint,
 
 	Spectrum emissionColor(1.f);
 	if (emissionFunc) {
+        if (source15kg.Enabled()) slg::mlhero15kg::current.branch=slg::mlhero15kg::Branch::Profile;
 		const Vector localFromLight = Normalize(hitPoint.GetFrame().ToLocal(hitPoint.fixedDir));
 		
 		if (emissionPdfW) {
 			const float emissionFuncPdf = emissionFunc->Pdf(localFromLight);
-			if (emissionFuncPdf == 0.f)
+			// 15kh: a zero density at the exact polar coordinate singularity
+            // does not mean that the light emits zero radiance in that direction.
+			if (emissionFuncPdf == 0.f && !slg::mlhero15kh::IsExactPole(
+                    localFromLight.x,localFromLight.y,localFromLight.z))
 				return Spectrum();
 			*emissionPdfW = emissionFuncPdf * invTriangleArea;
 		}
 		emissionColor = ((SphericalFunction *)emissionFunc)->Evaluate(localFromLight) / emissionFunc->Average();
 	} else {
 		if (emissionPdfW) {
-			if (lightMaterial->GetEmittedTheta() == 0.f)
+			if (lightMaterial->GetEmittedTheta() == 0.f) {
+                if (source15kg.Enabled()) slg::mlhero15kg::current.branch=slg::mlhero15kg::Branch::Delta;
 				*emissionPdfW = 1.f;
-			else if (lightMaterial->GetEmittedTheta() < 90.f)
+            } else if (lightMaterial->GetEmittedTheta() < 90.f) {
+                if (source15kg.Enabled()) slg::mlhero15kg::current.branch=slg::mlhero15kg::Branch::Cone;
 				*emissionPdfW = UniformConePdf(lightMaterial->GetEmittedCosThetaMax());
-			else
+            } else {
+                if (source15kg.Enabled()) slg::mlhero15kg::current.branch=slg::mlhero15kg::Branch::Lambert;
 				*emissionPdfW = invTriangleArea * fabsf(cosOutLight) * INV_PI;
+            }
 		}
 	}
 
+
+    if (source15kg.Enabled()) {
+        auto &a=slg::mlhero15kg::current;
+        a.directWritten=directPdfA != nullptr; a.emissionWritten=emissionPdfW != nullptr;
+        if (directPdfA) a.directPdfA=*directPdfA;
+        if (emissionPdfW) a.emissionPdfW=*emissionPdfW;
+    }
 	return lightMaterial->GetEmittedRadiance(hitPoint, invMeshArea) * emissionColor;
 }
 // vim: autoindent noexpandtab tabstop=4 shiftwidth=4

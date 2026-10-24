@@ -18,6 +18,8 @@
 
 #include "luxrays/utils/mcdistribution.h"
 #include "slg/core/sphericalfunction/sphericalfunction.h"
+#include "slg/engines/mlhero_emission_source15kg.h"
+#include "slg/engines/mlhero_polar_pdf15kh.h"
 
 using namespace std;
 using namespace luxrays;
@@ -92,31 +94,62 @@ Spectrum SampleableSphericalFunction::Evaluate(const float phi, const float thet
 
 Spectrum SampleableSphericalFunction::Sample(
 	const float u1, const float u2, Vector *w, float *pdf) const {
-	// Find floating-point $(u,v)$ sample coordinates
 	float uv[2];
 	uvDistrib->SampleContinuous(u1, u2, uv, pdf);
 	if (*pdf == 0.f)
 		return Spectrum();
 
-	// Convert sample point to direction on the unit sphere
 	const float theta = uv[1] * M_PI;
 	const float phi = uv[0] * 2.f * M_PI;
 	const float costheta = cosf(theta), sintheta = sinf(theta);
 	*w = SphericalDirection(sintheta, costheta, phi);
 
-	// Compute PDF for sampled direction
-	*pdf /= 2.f * M_PI * M_PI * sintheta;
-
-	// Return value for direction
-	return Evaluate(phi, theta) / *pdf;
+    // 15kh: use the density of the direction actually returned after float
+    // rounding, including the same UV-cell lookup as an independent Pdf call.
+    // No resampling and no changes to sampler dimensions.
+    *pdf = Pdf(*w);
+    if (!(*pdf > 0.f) || !std::isfinite(*pdf)) {
+        if (slg::mlhero15kg::enabled)
+            slg::mlhero15kh::rejectedSampleEndpoints.fetch_add(1ull,std::memory_order_relaxed);
+        *pdf=0.f;
+        return Spectrum();
+    }
+    // Evaluate the same returned direction used by direct light queries.
+    return func->Evaluate(*w) / *pdf;
 }
 
 float SampleableSphericalFunction::Pdf(const Vector &w) const {
-	const float theta = SphericalTheta(w);
-	const float phi = SphericalPhi(w);
-
-	return uvDistrib->Pdf(phi * INV_TWOPI, theta * INV_PI) /
-		(2.f * M_PI * M_PI * sinf(theta));
+    // 15kh: acos(z) loses a small polar angle when z rounds to +/-1 even
+    // though x/y are still nonzero. atan2 and transverse/length retain it.
+    const auto a=slg::mlhero15kh::FromDirection(w.x,w.y,w.z);
+    float numerator=0.f, result=0.f;
+    const double denominator=2.f * M_PI * M_PI * a.sine;
+    const float theta=static_cast<float>(a.theta);
+    const float phi=static_cast<float>(a.phi);
+    if (a.valid && !a.exactPole) {
+        numerator=uvDistrib->Pdf(phi * INV_TWOPI,theta * INV_PI);
+        result=numerator/denominator;
+        if (slg::mlhero15kg::enabled && a.roundedAxis && std::isfinite(result))
+            slg::mlhero15kh::roundedPolarRecovered.fetch_add(1ull,std::memory_order_relaxed);
+    } else if (slg::mlhero15kg::enabled) {
+        if (a.exactPole)
+            slg::mlhero15kh::exactPolePdfZero.fetch_add(1ull,std::memory_order_relaxed);
+        else
+            slg::mlhero15kh::invalidDirectionPdfZero.fetch_add(1ull,std::memory_order_relaxed);
+    }
+    // Exact axes are a measure-zero UV singularity. Choose density zero there;
+    // sampling rejects that endpoint, while direct emission retains radiance.
+    if (slg::mlhero15kg::enabled && slg::mlhero15kg::current.active &&
+            slg::mlhero15kg::current.emissionFunction == static_cast<const void *>(this)) {
+        auto &snapshot=slg::mlhero15kg::current;
+        snapshot.functionPdfObserved=true;
+        snapshot.localX=w.x; snapshot.localY=w.y; snapshot.localZ=w.z;
+        snapshot.theta=theta; snapshot.phi=phi; snapshot.sinTheta=static_cast<float>(a.sine);
+        snapshot.u=phi * INV_TWOPI; snapshot.v=theta * INV_PI;
+        snapshot.distributionPdf=numerator; snapshot.denominator=denominator;
+        snapshot.functionPdf=result;
+    }
+    return result;
 }
 
 float SampleableSphericalFunction::Average() const {

@@ -56,7 +56,7 @@ PropertiesUPtr Filter::ToProperties(const Properties &cfg) {
 	if (FilterRegistry::STATICTABLE_NAME(ToProperties).Get(type, func)) {
 		auto props = std::make_unique<Properties>();
 
-		const float defaultFilterWidth = cfg.Get(GetDefaultProps()->Get("film.filter.width")).Get<double>();
+		const float defaultFilterWidth = cfg.Get(Property("film.filter.width")((type == "LANCZOS") ? 3.f : 2.f)).Get<double>();
 		const Property filterXWidth = cfg.Get(Property("film.filter.xwidth")(defaultFilterWidth));
 		const Property filterYWidth = cfg.Get(Property("film.filter.ywidth")(defaultFilterWidth));
 
@@ -137,6 +137,7 @@ OBJECTSTATICREGISTRY_REGISTER(FilterRegistry, MitchellFilter);
 OBJECTSTATICREGISTRY_REGISTER(FilterRegistry, MitchellSSFilter);
 OBJECTSTATICREGISTRY_REGISTER(FilterRegistry, BlackmanHarrisFilter);
 OBJECTSTATICREGISTRY_REGISTER(FilterRegistry, SincFilter);
+OBJECTSTATICREGISTRY_REGISTER(FilterRegistry, LanczosFilter);
 OBJECTSTATICREGISTRY_REGISTER(FilterRegistry, CatmullRomFilter);
 // Just add here any new Filter (don't forget in the .h too)
 // vim: autoindent noexpandtab tabstop=4 shiftwidth=4

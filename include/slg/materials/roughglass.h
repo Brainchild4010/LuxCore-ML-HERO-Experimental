@@ -21,6 +21,7 @@
 
 #include "slg/materials/material.h"
 #include "slg/materials/glass.h"
+#include "slg/engines/mlhero_rough_optics15kk.h"
 
 namespace slg {
 
@@ -57,6 +58,26 @@ public:
 	virtual void Pdf(const HitPoint &hitPoint,
 		const luxrays::Vector &localLightDir, const luxrays::Vector &localEyeDir,
 		float *directPdfW, float *reversePdfW) const;
+
+
+    // 15kl: unrounded local geometry for the CPU HERO RoughGlass BSDF wrapper.
+    luxrays::Spectrum EvaluateMLHeroPrecise15kl(const HitPoint &hitPoint,
+        const mlhero15kk::V &localLightDir,const mlhero15kk::V &localEyeDir,
+        BSDFEvent *event,float *directPdfW,float *reversePdfW) const;
+    luxrays::Spectrum SampleMLHeroPrecise15kl(const HitPoint &hitPoint,
+        const mlhero15kk::V &localFixedPrecise15kl,mlhero15kk::V *localSampledPrecise15kl,
+        float u0,float u1,float passThroughEvent,float *pdfW,BSDFEvent *event) const;
+    void PdfMLHeroPrecise15kl(const HitPoint &hitPoint,
+        const mlhero15kk::V &localLightDir,const mlhero15kk::V &localEyeDir,
+        float *directPdfW,float *reversePdfW) const;
+bool EvaluateMLHeroMicrofacetOwnershipPrecise15kl(const HitPoint &hitPoint,
+		const mlhero15kk::V &localFixedPrecise15kl, const mlhero15kk::V &localSharedPrecise15kl,
+		const BSDFEvent sampledEvent, const float heroWaveLength,
+		const float laneWaveLength, float *heroEta, float *laneEta,
+		float *heroMicrofacetPdf, float *laneSharedMicrofacetPdf,
+		float *naturalJacobian, float *sharedJacobian,
+		float *naturalDirPdf, float *sharedDirPdf,
+		float *naturalDirDelta, float *sharedWhDelta, bool *naturalTir) const ;
 
 	bool HasMLHeroDispersion(const HitPoint &hitPoint) const;
 

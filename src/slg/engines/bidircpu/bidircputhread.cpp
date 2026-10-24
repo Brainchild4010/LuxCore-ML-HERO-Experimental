@@ -1,3 +1,6 @@
+#include "slg/engines/mlhero_schlick_audit15la.h"
+#include "slg/engines/mlhero_surface_recovery15kx.h"
+#include "slg/engines/mlhero_surface_trace15kv.h"
 /***************************************************************************
  * Copyright 1998-2020 by authors (see AUTHORS.txt)                        *
  *                                                                         *
@@ -20,13 +23,29 @@
 // (http://www.davidovic.cz and http://www.smallvcm.com)
 
 #include <thread>
+#include <array>
+#include <type_traits>
+#include <memory>
 #include <cassert>
 #include <cstdio>
 #include <atomic>
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <limits>
 #include "slg/engines/mlhero_finite_tail15fw.h"
+#include "slg/engines/mlhero_version.h"
+#include "slg/engines/mlhero_directhit_audit15kf.h"
+#include "slg/engines/mlhero_emission_source15kg.h"
+#include "slg/engines/mlhero_polar_pdf15kh.h"
+#include "slg/engines/mlhero_rough_precision15ki.h"
+#include "slg/bsdf/hitpoint.h"
+#include "slg/engines/mlhero_rough_frame15kl.h"
+#include "slg/engines/mlhero_mis_audit15km.h"
+#include "slg/engines/mlhero_mis_precision15kn.h"
+#include "slg/engines/mlhero_direction_trace15ko.h"
+extern slg::mlhero15ki::Comparison MLHeroCompareRoughGlass15ki(const slg::HitPoint &,const slg::mlhero15kk::V &);
 #include "slg/engines/mlhero_unit_reflectance15fx.h"
 // 15fh BEGIN diagnostic-only
 #include "slg/engines/mlhero_diagnostics15fh.h"
@@ -44,6 +63,8 @@
 #include "luxrays/core/color/spds/data/xyzbasis.h"
 
 #include "slg/engines/bidircpu/bidircpu.h"
+#include "slg/volumes/volume.h"
+#include "slg/materials/glass.h"
 #include "slg/cameras/camera.h"
 #include "slg/lights/light.h"
 
@@ -55,6 +76,36 @@ void SetMLDispersionWaveLength(const float waveLength, const float sampleWeight)
 void SetMLHeroWavelengthCount(const u_int count);
 void SetMLHeroWaveLengthAt(const u_int lane, const float waveLength, const float sampleWeight);
 luxrays::Spectrum GetMLDispersionSampleColor();
+// 15ii: native glass.cpp thread-local audit; values refer to just completed Sample.
+bool GetMLHeroGlassTIRSample15ii(unsigned int *, unsigned int *,
+    float *, float *, float *, float *, float *, float *, float *, float *,
+    unsigned int *, unsigned long long *, unsigned long long *, unsigned long long *);
+
+// 15ir: read-only native per-sample lobe-weight snapshot.
+bool GetMLHeroNativeLobe15ir(unsigned *, unsigned *, unsigned *, unsigned *,
+    float *, float *, float *, float *);
+
+// 15iw: native parent hit, read-only counterfactual wavelength TIR snapshot.
+bool GetMLHeroLaneTIR15iw(unsigned *, unsigned *, unsigned *, unsigned *, unsigned *,
+    float *, float *, float *, unsigned *, unsigned *);
+// 15iz: diagnostic native-policy lane masses from real parent material textures.
+// 15jd: implemented in glass.cpp; only the render-start coordinator calls it.
+void MLHeroSetNativeGlassChildArmed15je(bool enabled);
+// 15jd reset API retained for compatibility; no longer owns the child audit quota.
+void MLHeroResetNativeGlassChildBudget15jd();
+// 15kd: reset diagnostic-only TLS in the worker that owns it.
+void MLHeroResetGlassDiagnosticThreadState15kd();
+bool GetMLHeroNativeChild15jb(unsigned *,unsigned *,unsigned *,unsigned *,
+        unsigned *,unsigned *,unsigned *,float *,float *,float *,
+        float *,float *,unsigned *,unsigned *);
+bool GetMLHeroLaneMass15iz(unsigned *,unsigned *,unsigned *,float *,float *,
+        float *,float *,float *,float *,unsigned *,unsigned *,unsigned *,unsigned *);
+
+
+// 15is: read-only actual parent Sample() decision invariants.
+bool GetMLHeroNativeSpecial15is(unsigned *, unsigned *, unsigned *, unsigned *,
+    unsigned *, unsigned *, unsigned *, unsigned *, unsigned *,
+    float *, float *, float *);
 
 // ML HERO phase 15db: temporary wavelength override used only while evaluating
 // the shared RoughGlass direction at each vertex-owned wavelength lane.
@@ -64,6 +115,599 @@ extern thread_local bool mlDispersionUsed;
 using namespace std;
 using namespace luxrays;
 using namespace slg;
+
+// 15ik Phase A, step 2: typed candidate child state, read-only and NOT transport.
+// A PDF is only usable when its measure and validity are explicitly known.
+enum class MLHeroChildMeasure15ik : unsigned char {
+    UNAVAILABLE = 0, DISCRETE_EVENT_MASS = 1, SOLID_ANGLE_DENSITY = 2
+};
+struct MLHeroChildProbability15ik {
+    double value = 0.;
+    MLHeroChildMeasure15ik measure = MLHeroChildMeasure15ik::UNAVAILABLE;
+    bool available = false;
+};
+struct MLHeroSpectralChildState15ik {
+    // Ownership and wavelength: wavelengthPdf is a density in nm^-1.
+    u_int lane = 0u, depth = 0u;
+    bool fromLight = false;
+    double lambdaNm = 0., wavelengthPdfPerNm = 0., wavelengthSampleWeight = 0.;
+    // Candidate quantities are not automatically BSDF throughput or MIS factors.
+    double parentThroughputScalar = 0.;
+    double estimatorNormalization = 0.;
+    bool estimatorNormalizationValidated = false;
+    MLHeroChildProbability15ik eventForward, eventReverse;
+    // A3: the debug helper's proposal is NOT the native or full path PDF.
+    MLHeroChildProbability15ik eventProposalForward;
+    // 15in: complementary hypothetical discrete branches at the child wavelength.
+    MLHeroChildProbability15ik reflectProposalForward, transmitProposalForward;
+    bool proposalPhysicallyVerified = false;
+    bool spectralTIRCandidate = false;
+    MLHeroChildProbability15ik directionForward, directionReverse;
+    MLHeroChildProbability15ik rrForward, rrReverse;
+    MLHeroChildProbability15ik jointPathProbability;
+    // IMPORTANT: value-copy semantics; each eventual child needs its OWN stack.
+    // The two states are initialized from the parent only in read-only probes.
+    PathVolumeInfo mediumBefore, mediumAfter;
+    bool mediumAfterValidated = false;
+    bool directionValidated = false;
+    bool spawned = false;
+};
+static bool MLHeroChildProbabilityValid15ik(const MLHeroChildProbability15ik &p) {
+    if (!p.available)
+        return p.measure == MLHeroChildMeasure15ik::UNAVAILABLE;
+    return p.measure != MLHeroChildMeasure15ik::UNAVAILABLE &&
+        std::isfinite(p.value) && p.value >= 0. &&
+        (p.measure != MLHeroChildMeasure15ik::DISCRETE_EVENT_MASS || p.value <= 1.);
+}
+// This check proves only the candidate's *data contract*, not physical correctness.
+static bool MLHeroChildContractValid15ik(const MLHeroSpectralChildState15ik &s) {
+    return !s.spawned && s.lane < 64u && std::isfinite(s.lambdaNm) &&
+        s.lambdaNm >= 380. && s.lambdaNm <= 780. &&
+        std::isfinite(s.wavelengthPdfPerNm) && s.wavelengthPdfPerNm > 0. &&
+        std::isfinite(s.wavelengthSampleWeight) && s.wavelengthSampleWeight >= 0. &&
+        std::isfinite(s.parentThroughputScalar) &&
+        MLHeroChildProbabilityValid15ik(s.eventProposalForward) &&
+        MLHeroChildProbabilityValid15ik(s.reflectProposalForward) &&
+        MLHeroChildProbabilityValid15ik(s.transmitProposalForward) &&
+        !s.proposalPhysicallyVerified &&
+        MLHeroChildProbabilityValid15ik(s.eventForward) &&
+        MLHeroChildProbabilityValid15ik(s.eventReverse) &&
+        MLHeroChildProbabilityValid15ik(s.directionForward) &&
+        MLHeroChildProbabilityValid15ik(s.directionReverse) &&
+        MLHeroChildProbabilityValid15ik(s.rrForward) &&
+        MLHeroChildProbabilityValid15ik(s.rrReverse) &&
+        MLHeroChildProbabilityValid15ik(s.jointPathProbability) &&
+        !s.estimatorNormalizationValidated && !s.mediumAfterValidated &&
+        !s.directionValidated;
+}
+
+// 15hn Stage 29: optional, read-only IOR texture access via the Volume API.
+// Missing methods and absent volumes are UNKNOWN, never implicitly IOR=1.
+// Accept both API variants returning a Texture reference or a Texture pointer.
+static const slg::Texture *MLHeroTextureAsPointer15hn(const slg::Texture &texture) {
+    return &texture;
+}
+static const slg::Texture *MLHeroTextureAsPointer15hn(const slg::Texture *texture) {
+    return texture;
+}
+template <typename T>
+static auto MLHeroVolumeIORTexture15hn(const T *v, int)
+    -> decltype(v->GetIORTexture(), (const slg::Texture *)nullptr) {
+    return v ? MLHeroTextureAsPointer15hn(v->GetIORTexture()) : nullptr;
+}
+template <typename T>
+static auto MLHeroVolumeIORTexture15hn(const T *v, long)
+    -> decltype(v->GetIorTexture(), (const slg::Texture *)nullptr) {
+    return v ? MLHeroTextureAsPointer15hn(v->GetIorTexture()) : nullptr;
+}
+template <typename T>
+static const slg::Texture *MLHeroVolumeIORTexture15hn(const T *, ...) {
+    return nullptr;
+}
+
+// 15gx Stage 13: read-only active-medium identity probes.
+// SFINAE fallback keeps diagnostics buildable on PathVolumeInfo variants
+// without a public GetCurrentVolume() accessor. A missing accessor is UNKNOWN.
+template <typename T>
+static auto MLHeroCurrentMedium15gx(const T &v, int)
+    -> decltype(v.GetCurrentVolume(), (const void *)nullptr) {
+    // 15gy FIX: GetCurrentVolume() is a reference in LuxCore and MUST NOT
+    // be evaluated when the active volume is null.
+    if (!v.HasCurrentVolume()) return nullptr;
+    using ReturnType = decltype(v.GetCurrentVolume());
+    if constexpr (std::is_pointer_v<std::remove_reference_t<ReturnType>>) {
+        return static_cast<const void *>(v.GetCurrentVolume());
+    } else if constexpr (std::is_lvalue_reference_v<ReturnType>) {
+        return static_cast<const void *>(std::addressof(v.GetCurrentVolume()));
+    } else {
+        // A by-value return has no stable identity; mark medium UNKNOWN.
+        return nullptr;
+    }
+}
+template <typename T>
+static const void *MLHeroCurrentMedium15gx(const T &, long) { return nullptr; }
+template <typename T>
+static auto MLHeroHasMediumAccessor15gx(const T &v, int)
+    -> decltype(v.GetCurrentVolume(), bool()) {
+    using ReturnType = decltype(v.GetCurrentVolume());
+    return std::is_pointer_v<std::remove_reference_t<ReturnType>> ||
+        std::is_lvalue_reference_v<ReturnType>;
+}
+template <typename T>
+static bool MLHeroHasMediumAccessor15gx(const T &, long) { return false; }
+
+// 15gy Stage 14: independent read-only snapshot of the PUBLIC PathVolumeInfo
+// stack API (GetListSize/GetVolume/HasCurrentVolume). These checks do not
+// drive path tracing and never mutate the parent or the film.
+struct MLHeroStackSnapshot15gy {
+    const slg::Volume *active = nullptr;
+    std::array<const slg::Volume *, PATHVOLUMEINFO_SIZE> entries{};
+    u_int count = 0u;
+    bool sizeValid = true;
+    bool scattered = false;
+};
+
+static MLHeroStackSnapshot15gy MLHeroCaptureStack15gy(const PathVolumeInfo &v) {
+    MLHeroStackSnapshot15gy s;
+    const u_int count = v.GetListSize();
+    s.sizeValid = count <= PATHVOLUMEINFO_SIZE;
+    s.count = std::min(count, (u_int)PATHVOLUMEINFO_SIZE);
+    s.scattered = v.IsScatteredStart();
+    s.active = v.HasCurrentVolume() ? std::addressof(v.GetCurrentVolume()) : nullptr;
+    for (u_int i = 0u; i < s.count; ++i)
+        s.entries[i] = std::addressof(v.GetVolume(i));
+    return s;
+}
+
+static bool MLHeroStacksEqual15gy(const MLHeroStackSnapshot15gy &a,
+        const MLHeroStackSnapshot15gy &b) {
+    if (!a.sizeValid || !b.sizeValid || a.count != b.count ||
+            a.active != b.active || a.scattered != b.scattered) return false;
+    for (u_int i = 0u; i < a.count; ++i)
+        if (a.entries[i] != b.entries[i]) return false;
+    return true;
+}
+
+// A distinct implementation of active-volume arbitration: the last volume
+// of maximum priority wins, matching LuxCore's priority and tie semantics.
+static const slg::Volume *MLHeroExpectedActive15gy(
+        const MLHeroStackSnapshot15gy &s) {
+    const slg::Volume *active = nullptr;
+    for (u_int i = 0u; i < s.count; ++i) {
+        const slg::Volume *candidate = s.entries[i];
+        if (!candidate) return nullptr;
+        if (!active || candidate->GetPriority() >= active->GetPriority())
+            active = candidate;
+    }
+    return active;
+}
+
+static bool MLHeroStackConsistent15gy(const MLHeroStackSnapshot15gy &s) {
+    if (!s.sizeValid) return false;
+    for (u_int i = 0u; i < s.count; ++i)
+        if (!s.entries[i]) return false;
+    return MLHeroExpectedActive15gy(s) == s.active;
+}
+
+// Expected stack transition, reconstructed from (event, intoObject,
+// material interior), independently from PathVolumeInfo::Update().
+// An unmatched exit is explicitly reported as uncheckable instead of
+// treating its resulting list as correct.
+static bool MLHeroExpectedTransition15gy(
+        const MLHeroStackSnapshot15gy &before, const BSDFEvent event,
+        const BSDF &bsdf, MLHeroStackSnapshot15gy *expected) {
+    *expected = before;
+    if (!before.sizeValid) return false;
+    // In Stages 12/13 Update() is called only for TRANSMIT.
+    // Reflection must preserve the snapshot exactly, including scatteredStart.
+    if (!(event & TRANSMIT)) return true;
+    if (bsdf.IsVolume()) {
+        expected->scattered = true;
+    } else {
+        expected->scattered = false;
+        if (event & TRANSMIT) {
+            const slg::Volume *interior = bsdf.GetMaterialInteriorVolume();
+            if (bsdf.hitPoint.intoObject) {
+                if (interior && expected->count < PATHVOLUMEINFO_SIZE)
+                    expected->entries[expected->count++] = interior;
+            } else if (interior && expected->count > 0u) {
+                u_int removeIndex = expected->count;
+                for (u_int i = 0u; i < expected->count; ++i) {
+                    if (expected->entries[i] == interior) {
+                        removeIndex = i;
+                        break;
+                    }
+                }
+                if (removeIndex == expected->count) return false;
+                for (u_int i = removeIndex + 1u; i < expected->count; ++i)
+                    expected->entries[i - 1u] = expected->entries[i];
+                --expected->count;
+                expected->entries[expected->count] = nullptr;
+            }
+        }
+    }
+    expected->active = MLHeroExpectedActive15gy(*expected);
+    return true;
+}
+
+static void MLHeroPrintStack15gy(FILE *f, const char *side,
+        const unsigned long long ticket, const u_int child,
+        const char *stage, const MLHeroStackSnapshot15gy &s) {
+    fprintf(f, "phase15gy CHILD_STACK_STATE side=%s ticket=%llu child=%u "
+        "stage=%s count=%u sizeValid=%u scattered=%u active=%p entries=",
+        side, ticket, child, stage, s.count, s.sizeValid ? 1u : 0u,
+        s.scattered ? 1u : 0u, (const void *)s.active);
+    for (u_int i = 0u; i < s.count; ++i)
+        fprintf(f, "%s%p", i ? "," : "[", (const void *)s.entries[i]);
+    fprintf(f, "%s\n", s.count ? "]" : "[]");
+}
+
+// 15id Stage 45: report actual stack priorities and per-volume IOR values.
+// Observational only: no modification of stack, ray, BSDF or sampler.
+static void MLHeroPriorityIOR15id(FILE *f, const char *side,
+        const unsigned long long ticket, const u_int child, const u_int lane,
+        const char *stage, const MLHeroStackSnapshot15gy &s,
+        const slg::HitPoint &hp) {
+    bool valuesFinite = s.sizeValid;
+    bool conflict = false;
+    bool equalPriority = false;
+    bool differentIOR = false;
+    bool activeMatched = MLHeroExpectedActive15gy(s) == s.active;
+    double minIOR = std::numeric_limits<double>::infinity();
+    double maxIOR = -std::numeric_limits<double>::infinity();
+    for (u_int i = 0; i < s.count; ++i) {
+        const slg::Volume *v = s.entries[i];
+        if (!v) { valuesFinite = false; continue; }
+        const double ior = v->GetIOR(hp);
+        valuesFinite = valuesFinite && std::isfinite(ior) && ior > 0.;
+        if (std::isfinite(ior)) { minIOR = std::min(minIOR, ior); maxIOR = std::max(maxIOR, ior); }
+        for (u_int j = 0; j < i; ++j) {
+            if (!s.entries[j] || s.entries[j] == v) continue;
+            conflict = true;
+            equalPriority |= s.entries[j]->GetPriority() == v->GetPriority();
+        }
+    }
+    differentIOR = s.count > 1 && valuesFinite &&
+        maxIOR - minIOR > 1.e-5 * std::max(1., maxIOR);
+    fprintf(f, "phase15id STACK_PRIORITY_IOR side=%s ticket=%llu child=%u lane=%u "
+        "stage=%s count=%u active=%p activePriority=%d "
+        "activeIOR=%.12g priorityArbitrationMatch=%u distinctVolumePointers=%u "
+        "equalPriorityCompetition=%u differentIOR=%u finitePositiveIOR=%u "
+        "depth3plus=%u nestedIORPriorityCandidate=%u entries=",
+        side, ticket, child, lane, stage, s.count, (const void *)s.active,
+        s.active ? (int)s.active->GetPriority() : -1,
+        s.active ? (double)s.active->GetIOR(hp) : -1.,
+        activeMatched ? 1u : 0u, conflict ? 1u : 0u,
+        equalPriority ? 1u : 0u, differentIOR ? 1u : 0u,
+        valuesFinite ? 1u : 0u, s.count >= 3 ? 1u : 0u,
+        (s.count >= 3 && differentIOR && activeMatched) ? 1u : 0u);
+    for (u_int i = 0; i < s.count; ++i) {
+        const slg::Volume *v = s.entries[i];
+        fprintf(f, "%s%p:priority=%d:ior=%.12g%s", i ? "," : "[",
+            (const void *)v, v ? (int)v->GetPriority() : -1,
+            v ? (double)v->GetIOR(hp) : -1., v == s.active ? ":ACTIVE" : "");
+    }
+    fprintf(f, "%s diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0 "
+        "misChanged=0 rrChanged=0\n", s.count ? "]" : "[]");
+}
+
+// The budget is per render session; RenderFunc(threadIndex==0) resets both.
+static std::atomic<unsigned long long> mlHeroSplitTickets15gy[2];
+
+// 15gz Stage 15: isolated glass-event PDF/adjoint bookkeeping.
+// GlassMaterial::EvaluateMLHeroDebugAtWaveLength() supplies
+// sampleMultiplier = Kt(lambda)*FresnelTransmission(lambda)/samplePdfW.
+// That is NOT the bare transportFactor and is not yet a two-child estimator.
+// For LIGHT only, BSDF::Sample() and the spectral BSDF wrapper also apply
+// the adjoint geometric-normal ratio. Reconstruct it at the lane's OWN
+// Snell direction, not at the parent HERO direction.
+struct MLHeroGlassWeight15gz {
+    double parentPdf = 0., lanePdf = 0., adjoint = 1.;
+    double rawR = 0., parentProposalR = 0., laneProposalR = 0.;
+    double laneProposalG = 0., laneProposalB = 0.;
+    bool valid = false, adjointValid = false;
+};
+
+static MLHeroGlassWeight15gz MLHeroAuditGlassWeight15gz(
+        const BSDF &bsdf, const bool helperOK, const bool tir,
+        const Spectrum &sampleMultiplier, const float parentPdf,
+        const float lanePdf, const float eta, const float sinT2,
+        const float cosFixed) {
+    MLHeroGlassWeight15gz a;
+    a.parentPdf = (double)parentPdf;
+    a.lanePdf = (double)lanePdf;
+    if (!helperOK || tir || !std::isfinite(parentPdf) || parentPdf <= 0.f ||
+            !std::isfinite(lanePdf) || lanePdf <= 0.f ||
+            !std::isfinite(eta) || eta <= 0.f ||
+            !std::isfinite(sinT2) || sinT2 < 0.f || sinT2 >= 1.f ||
+            !std::isfinite(cosFixed) || sampleMultiplier.IsNaN() ||
+            sampleMultiplier.IsInf() || sampleMultiplier.IsNeg())
+        return a;
+    a.adjointValid = true;
+    if (bsdf.hitPoint.fromLight) {
+        const luxrays::Frame &frame = bsdf.GetFrame();
+        const luxrays::Vector fixedLocal = frame.ToLocal(bsdf.hitPoint.fixedDir);
+        const float cosT = sqrtf(Max(0.f, 1.f - sinT2)) *
+            ((cosFixed > 0.f) ? -1.f : 1.f);
+        const luxrays::Vector transmittedLocal(-eta * fixedLocal.x,
+            -eta * fixedLocal.y, cosT);
+        const luxrays::Vector transmittedWorld = frame.ToWorld(transmittedLocal);
+        const double fixedNg = fabs((double)Dot(bsdf.hitPoint.fixedDir,
+            bsdf.hitPoint.geometryN));
+        const double generatedNg = fabs((double)Dot(transmittedWorld,
+            bsdf.hitPoint.geometryN));
+        a.adjointValid = fixedNg > 1e-20 && std::isfinite(fixedNg) &&
+            std::isfinite(generatedNg);
+        if (!a.adjointValid) return a;
+        a.adjoint = generatedNg / fixedNg;
+    }
+    // Undo only the PDF used by the diagnostic helper, then divide ONCE by
+    // the wavelength-specific event probability. Never divide Sample()
+    // weights by a BSDF PDF again and never repeat the wavelength weighting.
+    a.rawR = (double)sampleMultiplier.c[0];
+    a.parentProposalR = a.rawR * a.adjoint;
+    const double changeOfEventProposal = a.parentPdf / a.lanePdf;
+    a.laneProposalR = a.parentProposalR * changeOfEventProposal;
+    a.laneProposalG = (double)sampleMultiplier.c[1] * a.adjoint * changeOfEventProposal;
+    a.laneProposalB = (double)sampleMultiplier.c[2] * a.adjoint * changeOfEventProposal;
+    a.valid = std::isfinite(a.adjoint) && a.adjoint >= 0. &&
+        std::isfinite(a.rawR) && std::isfinite(a.parentProposalR) &&
+        std::isfinite(a.laneProposalR) && std::isfinite(a.laneProposalG) &&
+        std::isfinite(a.laneProposalB) &&
+        a.laneProposalR >= 0. && a.laneProposalG >= 0. && a.laneProposalB >= 0.;
+    return a;
+}
+
+struct MLHeroPairLedger15gz {
+    bool glassValid = false, nextValid = false;
+    u_int lane = 0u;
+    double lambda = 0., afterGlass = 0., afterNext = 0.;
+    double wavelengthIdentity = 0., parentPdf = 0., lanePdf = 0.;
+};
+
+// 15hc Stage 18: diagnostic-only reconstruction of the EXISTING BIDIRCPU
+// specular-vertex MIS recurrence. This is NOT a new MIS heuristic and is NOT
+// a valid end-to-end spectral-child MIS estimator. The incoming dVCM/dVC/dVM
+// must be carried independently for a physical child path in a later phase.
+// The specular branch of SampleBSDF() sets dVCM=0 and multiplies dVC/dVM
+// by MIS(absCos) = absCos^2. The discrete event probability (e.g. Fresnel)
+// belongs to the BSDF sampling distribution/weight, NOT to a solid-angle PDF.
+// We record it separately rather than feeding it to a non-delta MIS formula.
+struct MLHeroMISRecurrence15hc {
+    double dVCM = 0., dVC = 0., dVM = 0.;
+    double absCos = 0., eventProbability = 0.;
+    bool valid = false;
+};
+
+static MLHeroMISRecurrence15hc MLHeroAuditSpecularMIS15hc(
+        const double parentVCM, const double parentVC, const double parentVM,
+        const double absCos, const double eventProbability) {
+    MLHeroMISRecurrence15hc r;
+    r.absCos = absCos;
+    r.eventProbability = eventProbability;
+    if (!std::isfinite(parentVCM) || !std::isfinite(parentVC) ||
+            !std::isfinite(parentVM) || !std::isfinite(absCos) ||
+            !std::isfinite(eventProbability) ||
+            absCos < 0. || absCos > 1.0001 ||
+            eventProbability <= 0. || eventProbability > 1.0001)
+        return r;
+    const double factor = absCos * absCos;
+    r.dVCM = 0.;
+    r.dVC = parentVC * factor;
+    r.dVM = parentVM * factor;
+    r.valid = std::isfinite(r.dVC) && std::isfinite(r.dVM);
+    return r;
+}
+
+// 15hd Stage 19: reconstruct the native BIDIRCPU NON-DELTA MIS recurrence
+// from diagnostic child BSDF forward and reverse solid-angle densities.
+// IMPORTANT: This is an isolated numerical audit, NOT physical child MIS.
+// At a real child path the incoming state, RR-modified PDFs, spectral
+// selection density, connection strategy and path-length probabilities all
+// need separately correct ownership. This helper takes no decisions and
+// cannot modify a production path or its MIS ledger.
+struct MLHeroNonDeltaMIS15hd {
+    double dVCM = 0., dVC = 0., dVM = 0.;
+    double absCos = 0., pdfForward = 0., pdfReverse = 0.;
+    double sampledPdfRatio = 0., importance = 0.;
+    bool valid = false;
+};
+
+static MLHeroNonDeltaMIS15hd MLHeroAuditNonDeltaMIS15hd(
+        const double inVCM, const double inVC, const double inVM,
+        const double absCos, const double pdfForward, const double pdfReverse,
+        const double misVmFactor, const double misVcFactor) {
+    MLHeroNonDeltaMIS15hd r;
+    r.absCos = absCos;
+    r.pdfForward = pdfForward;
+    r.pdfReverse = pdfReverse;
+    if (!std::isfinite(inVCM) || !std::isfinite(inVC) ||
+            !std::isfinite(inVM) || !std::isfinite(absCos) ||
+            !std::isfinite(pdfForward) || !std::isfinite(pdfReverse) ||
+            !std::isfinite(misVmFactor) || !std::isfinite(misVcFactor) ||
+            absCos < 0. || absCos > 1.0001 || pdfForward <= 0. ||
+            pdfReverse < 0. || misVmFactor < 0. || misVcFactor < 0.)
+        return r;
+    const double ratio = absCos / pdfForward;
+    const double factor = ratio * ratio;
+    const double rev2 = pdfReverse * pdfReverse;
+    r.sampledPdfRatio = ratio;
+    r.importance = factor;
+    r.dVCM = 1. / (pdfForward * pdfForward);
+    r.dVC = factor * (inVC * rev2 + inVCM + misVmFactor);
+    r.dVM = factor * (inVM * rev2 + inVCM * misVcFactor + 1.);
+    r.valid = std::isfinite(r.dVCM) && std::isfinite(r.dVC) &&
+        std::isfinite(r.dVM) && std::isfinite(r.sampledPdfRatio) &&
+        std::isfinite(r.importance);
+    return r;
+}
+
+// 15ha Stage 16: read-only audit of the ACTUAL wavelength packet.
+// The renderer creates all lanes from ONE shared sampler dimension:
+//     u_i = fract(u_0 + i / N).
+// It does NOT randomly pick two of N lanes. The split probe always examines
+// 0 and N/2; therefore Horvitz-Thompson/random-subset probabilities do not
+// exist for this fixed-index diagnostic. The pair average is a candidate for
+// a pure wavelength integral (under a uniform u_0 marginal), NOT a proof of
+// an unbiased BIDIR path estimator or a valid spectral MIS measure.
+struct MLHeroPacketAudit15ha {
+    u_int count = 0u;
+    u_int selectedA = 0u, selectedB = 0u;
+    double maxPdfIdentityError = 0.;
+    double maxLinearGridError = 0.;
+    double selectedSlotFraction = 0.;
+    double pairSpanNm = 0.;
+    double minPdf = INFINITY, maxPdf = 0.;
+    bool boundsOK = false, uniqueOK = false, pdfIdentityOK = false;
+    bool linearGridCheckable = false, linearGridOK = false;
+    bool halfPacketPairOK = false, packetFinite = false;
+};
+
+static MLHeroPacketAudit15ha MLHeroAuditPacket15ha(
+        const PathVertexVM &vertex, const u_int selectedA,
+        const u_int selectedB, const bool linearMode) {
+    MLHeroPacketAudit15ha a;
+    a.count = vertex.mlHeroLaneCount;
+    a.selectedA = selectedA;
+    a.selectedB = selectedB;
+    a.linearGridCheckable = linearMode;
+    if (a.count < 2u || a.count > 8u || selectedA >= a.count ||
+            selectedB >= a.count || selectedA == selectedB) return a;
+    a.selectedSlotFraction = 2. / (double)a.count;
+    a.boundsOK = true;
+    a.uniqueOK = true;
+    a.pdfIdentityOK = true;
+    a.linearGridOK = linearMode;
+    const double u0 = ((double)vertex.mlHeroLaneWaveLength[0] - 380.) / 400.;
+    for (u_int i = 0u; i < a.count; ++i) {
+        const double lambda = (double)vertex.mlHeroLaneWaveLength[i];
+        const double w = (double)vertex.mlHeroLaneSampleWeight[i];
+        const double pdf = (double)vertex.mlHeroLaneWaveLengthPdf[i];
+        const bool valid = std::isfinite(lambda) && lambda >= 380. &&
+            lambda <= 780. && std::isfinite(w) && w > 0. &&
+            std::isfinite(pdf) && pdf > 0.;
+        if (!valid) {
+            a.boundsOK = false;
+            a.pdfIdentityOK = false;
+            a.linearGridOK = false;
+            continue;
+        }
+        a.minPdf = std::min(a.minPdf, pdf);
+        a.maxPdf = std::max(a.maxPdf, pdf);
+        const double identityErr = fabs(400. * pdf * w - 1.);
+        a.maxPdfIdentityError = std::max(a.maxPdfIdentityError, identityErr);
+        if (identityErr > 1e-5) a.pdfIdentityOK = false;
+        for (u_int j = 0u; j < i; ++j) {
+            if (fabs(lambda - (double)vertex.mlHeroLaneWaveLength[j]) < 1e-4)
+                a.uniqueOK = false;
+        }
+        if (linearMode) {
+            const double rawU = u0 + (double)i / (double)a.count;
+            const double expectedU = rawU - floor(rawU);
+            const double actualU = (lambda - 380.) / 400.;
+            const double direct = fabs(actualU - expectedU);
+            const double wrapped = std::min(direct,
+                std::min(fabs(direct - 1.), fabs(direct + 1.)));
+            a.maxLinearGridError = std::max(a.maxLinearGridError, wrapped);
+            if (wrapped > 2e-5) a.linearGridOK = false;
+        }
+    }
+    const double lambdaA = (double)vertex.mlHeroLaneWaveLength[selectedA];
+    const double lambdaB = (double)vertex.mlHeroLaneWaveLength[selectedB];
+    a.pairSpanNm = fabs(lambdaB - lambdaA);
+    a.halfPacketPairOK = (selectedA < a.count / 2u) &&
+        (selectedB == selectedA + a.count / 2u) && (a.count % 2u == 0u) &&
+        (!linearMode || fabs(a.pairSpanNm - 200.) < 0.02);
+    a.packetFinite = a.boundsOK && a.uniqueOK && a.pdfIdentityOK &&
+        a.halfPacketPairOK && (!linearMode || a.linearGridOK);
+    return a;
+}
+
+// Both forms agree algebraically, but they are NOT a statistical proof:
+// partialPacket = (A+B)/N, pairMean=(A+B)/2.
+// Reweighting by N/2 gives the pair mean, NOT automatically a valid
+// Horvitz-Thompson estimator because the two indices are fixed, not drawn.
+struct MLHeroPairNorm15ha {
+    double partialPacket = 0., pairMean = 0., hypotheticalFactor = 0.;
+    double scaledPartialPacket = 0., residual = 0.;
+    bool valid = false;
+};
+
+static MLHeroPairNorm15ha MLHeroPairNormAudit15ha(
+        const double a, const double b, const u_int packetCount) {
+    MLHeroPairNorm15ha v;
+    if (packetCount < 2u || packetCount > 8u ||
+            !std::isfinite(a) || !std::isfinite(b)) return v;
+    v.partialPacket = (a + b) / (double)packetCount;
+    v.pairMean = .5 * (a + b);
+    v.hypotheticalFactor = (double)packetCount / 2.;
+    v.scaledPartialPacket = v.hypotheticalFactor * v.partialPacket;
+    v.residual = v.pairMean - v.scaledPartialPacket;
+    v.valid = std::isfinite(v.partialPacket) && std::isfinite(v.pairMean) &&
+        std::isfinite(v.scaledPartialPacket) && std::isfinite(v.residual) &&
+        fabs(v.residual) <= 1e-9 * std::max(1., fabs(v.pairMean));
+    return v;
+}
+
+// 15hb Stage 17: LOCAL, deterministic, counter-based child debug streams.
+// Each candidate lane has its OWN key and counter. All draws below are made
+// exclusively from these local objects. The production Sampler (including
+// its Sobol dimensions, parent BSDF draws, RR, and MIS) is NEVER accessed.
+// This is NOT a production child Sampler, nor a statistical independence
+// proof, nor a substitute for a child-specific BIDIR MIS density.
+struct MLHeroChildDebugStream15hb {
+    std::uint64_t key = 0ull;
+    std::uint64_t counter = 0ull;
+};
+
+struct MLHeroChildDebugDraws15hb {
+    float u0 = 0.f, u1 = 0.f, rrPreview = 0.f;
+    bool finiteAndOpen = false;
+};
+
+static std::uint64_t MLHeroMix64_15hb(std::uint64_t x) {
+    // SplitMix64 finalizer: deterministic, well-mixed bits for probe ONLY.
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ull;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebull;
+    return x ^ (x >> 31);
+}
+
+static MLHeroChildDebugStream15hb MLHeroMakeStream15hb(
+        const std::uint64_t renderSeed, const u_int side,
+        const std::uint64_t ticket, const u_int lane) {
+    MLHeroChildDebugStream15hb result;
+    const std::uint64_t eventKey = MLHeroMix64_15hb(
+        renderSeed ^ 0x15b00b5eedcc07abull ^
+        MLHeroMix64_15hb(ticket + 0x9e3779b97f4a7c15ull) ^
+        (side ? 0xaf68e17b7d31f913ull : 0x4738ed3910be5a62ull));
+    result.key = MLHeroMix64_15hb(eventKey ^
+        ((std::uint64_t)lane + 1ull) * 0xd1b54a32d192ed03ull);
+    return result;
+}
+
+static float MLHeroNextFloat15hb(MLHeroChildDebugStream15hb &stream) {
+    const std::uint64_t bits = MLHeroMix64_15hb(stream.key +
+        (++stream.counter) * 0x9e3779b97f4a7c15ull);
+    // Exactly representable open interval (0,1), using 23 bits
+    // centered on the odd 24-bit grid. Cannot round to 0 or 1.
+    const std::uint32_t bucket = (std::uint32_t)(bits >> 41);
+    return (float)(2u * bucket + 1u) * (1.f / 16777216.f);
+}
+
+static MLHeroChildDebugDraws15hb MLHeroDrawChild15hb(
+        MLHeroChildDebugStream15hb &stream) {
+    MLHeroChildDebugDraws15hb r;
+    r.u0 = MLHeroNextFloat15hb(stream);
+    r.u1 = MLHeroNextFloat15hb(stream);
+    r.rrPreview = MLHeroNextFloat15hb(stream);
+    r.finiteAndOpen = std::isfinite(r.u0) && std::isfinite(r.u1) &&
+        std::isfinite(r.rrPreview) &&
+        r.u0 > 0.f && r.u0 < 1.f && r.u1 > 0.f && r.u1 < 1.f &&
+        r.rrPreview > 0.f && r.rrPreview < 1.f;
+    return r;
+}
 
 // 15fl: restrict paired endpoint reconstruction to ordinary flat area emitters.
 static unsigned MLHeroTerminalLightGuard15fl(LightSourceConstRef light,const float time) {
@@ -124,6 +768,600 @@ static inline bool MLHeroLegacyHeavyDiagnosticsEnabled15cq() {
     return MLHeroLegacyDiagnosticsEnabled15cq() && mlHeroHeavyDiagnostics15cq.load(std::memory_order_relaxed);
 }
 
+// 15ih / Diagnose 49: observe REAL glass-sampling outcomes (not a second sample).
+// A black sample cannot be attributed to TIR without an internal glass.cpp hook.
+// REFLECT does not prove a rejected transmission attempt. No renderer mutations.
+static std::atomic<unsigned long long> mlHero15ihTotal[2];
+static std::atomic<unsigned long long> mlHero15ihReflected[2];
+static std::atomic<unsigned long long> mlHero15ihTransmitted[2];
+static std::atomic<unsigned long long> mlHero15ihBlack[2];
+static std::atomic<unsigned long long> mlHero15ihOther[2];
+// 15jc-r1: separate native Glass parent audit budget; reset at each render start.
+static std::atomic<unsigned long long> mlHeroNativeGlassParentTickets15im[2];
+// 15je: reserve the 64 true native Glass parent calls before BSDF::Sample.
+static std::atomic<unsigned long long> mlHeroNativeGlassChildReservations15je[2];
+// 15kc: typed, value-owned reference for ONE production parent bounce only.
+// Not a path history, not a child sample, not a joint spectral density.
+enum MLHeroPdfMeasure15kc { MLHERO_15KC_UNAVAILABLE = 0, MLHERO_15KC_SOLID_ANGLE = 1 };
+struct MLHeroParentPdfSnapshot15kc {
+    double sampleForward, queryForward, queryReverse;
+    MLHeroPdfMeasure15kc sampleMeasure, queryForwardMeasure, queryReverseMeasure;
+    bool sampleAvailable, queryForwardAvailable, queryReverseAvailable;
+    MLHeroParentPdfSnapshot15kc() : sampleForward(0.), queryForward(0.), queryReverse(0.),
+        sampleMeasure(MLHERO_15KC_UNAVAILABLE), queryForwardMeasure(MLHERO_15KC_UNAVAILABLE),
+        queryReverseMeasure(MLHERO_15KC_UNAVAILABLE), sampleAvailable(false),
+        queryForwardAvailable(false), queryReverseAvailable(false) { }
+    void Capture(const float sampled, const float forward, const float reverse) {
+        sampleAvailable = std::isfinite((double)sampled) && sampled > 0.f;
+        queryForwardAvailable = std::isfinite((double)forward) && forward >= 0.f;
+        queryReverseAvailable = std::isfinite((double)reverse) && reverse >= 0.f;
+        if (sampleAvailable) { sampleForward = sampled; sampleMeasure = MLHERO_15KC_SOLID_ANGLE; }
+        if (queryForwardAvailable) { queryForward = forward; queryForwardMeasure = MLHERO_15KC_SOLID_ANGLE; }
+        if (queryReverseAvailable) { queryReverse = reverse; queryReverseMeasure = MLHERO_15KC_SOLID_ANGLE; }
+    }
+    bool IsInternallyConsistent() const {
+        return (sampleAvailable == (sampleMeasure == MLHERO_15KC_SOLID_ANGLE)) &&
+            (queryForwardAvailable == (queryForwardMeasure == MLHERO_15KC_SOLID_ANGLE)) &&
+            (queryReverseAvailable == (queryReverseMeasure == MLHERO_15KC_SOLID_ANGLE)) &&
+            (!sampleAvailable || (std::isfinite(sampleForward) && sampleForward > 0.)) &&
+            (!queryForwardAvailable || (std::isfinite(queryForward) && queryForward >= 0.)) &&
+            (!queryReverseAvailable || (std::isfinite(queryReverse) && queryReverse >= 0.));
+    }
+};
+// 15kb: per-render, bounded native RoughGlass parent PDF reference tickets.
+static std::atomic<unsigned long long> mlHero15kbNativeRoughPdfTickets[2];
+static void MLHeroGlassSampleAudit15ih(const BSDF &bsdf, const Spectrum &sample,
+        const BSDFEvent event, const float pdf, const float cosSampled) {
+    // Phase A 3b: bounded read-only audit of the ACTUAL native parent sample.
+    // The native GlassMaterial::Sample threshold is P(transmit); P(reflect)=1-threshold.
+    // This says NOTHING about unsampled spectral children or reverse-path MIS.
+    if (MLHeroCurrentDiagnosticsEnabled15cq() && bsdf.GetMaterialType() == GLASS) {
+        const unsigned nativeSide15im = bsdf.hitPoint.fromLight ? 1u : 0u;
+        const unsigned long long parentTicket15im =
+            mlHeroNativeGlassParentTickets15im[nativeSide15im].fetch_add(1ull, std::memory_order_relaxed) + 1ull;
+        if (parentTicket15im <= 64ull) {
+            unsigned int reason15im=0u, selected15im=0u, light15im=0u;
+            float wl15im=-1.f, nc15im=0.f, nt15im=0.f, ntWl15im=0.f;
+            float cos15im=0.f, eta15im=0.f, sin15im=0.f, threshold15im=0.f;
+            unsigned long long total15im=0ull, tir15im=0ull, black15im=0ull;
+            const bool native15im=GetMLHeroGlassTIRSample15ii(
+                &reason15im, &selected15im, &wl15im, &nc15im, &nt15im,
+                &ntWl15im, &cos15im, &eta15im, &sin15im, &threshold15im,
+                &light15im, &total15im, &tir15im, &black15im);
+            const bool blackSample15im=sample.Black();
+            const bool selectedConsistent15im=native15im &&
+                ((selected15im == 0u && blackSample15im) ||
+                 (selected15im == 1u && !blackSample15im && (event & REFLECT)) ||
+                 (selected15im == 2u && !blackSample15im && (event & TRANSMIT)));
+            const double nativeMass15im=(selected15im == 2u) ? threshold15im :
+                ((selected15im == 1u) ? (1.0-(double)threshold15im) : -1.0);
+            const bool massConsistent15im=native15im && selectedConsistent15im &&
+                !blackSample15im && std::isfinite(nativeMass15im) && nativeMass15im > 0. &&
+                std::isfinite((double)pdf) &&
+                fabs(nativeMass15im-(double)pdf) <= 2e-6;
+            std::lock_guard<std::recursive_mutex> lock15im(mlHeroDebugLogMutex);
+            FILE *f15im=MLHeroOpenAnyLog15gj("a");
+            if (f15im) {
+                if (MLHeroLegacyDiagnosticsEnabled15cq()) fprintf(f15im,"phase15im NATIVE_PARENT_EVENT side=%s ticket=%llu "
+                    "native=%u reason=%u selected=%u black=%u threshold=%.9g "
+                    "observedEventMass=%.9g observedPdf=%.9g selectionConsistent=%u "
+                    "massConsistent=%u wavelength=%.9g parentOnly=1 childForwardKnown=0 "
+                    "childReverseKnown=0 childJointPdfKnown=0 noExtraSampling=1 "
+                    "noTransportChange=1\n",
+                    nativeSide15im ? "LIGHT" : "EYE", parentTicket15im,
+                    native15im ? 1u : 0u, reason15im, selected15im,
+                    blackSample15im ? 1u : 0u, (double)threshold15im,
+                    nativeMass15im, (double)pdf,
+                    selectedConsistent15im ? 1u : 0u,
+                    massConsistent15im ? 1u : 0u, (double)wl15im);
+                // 15ir: native lobe support and selection checked against the
+                // ACTUAL GlassMaterial::Sample event and returned discrete PDF.
+                unsigned valid15ir=0u, r15ir=0u, t15ir=0u, black15ir=0u;
+                float rf15ir=0.f, tf15ir=0.f, threshold15ir=0.f, u15ir=0.f;
+                const bool got15ir=GetMLHeroNativeLobe15ir(&valid15ir,
+                    &r15ir, &t15ir, &black15ir, &rf15ir, &tf15ir,
+                    &threshold15ir, &u15ir);
+                const bool two15ir=r15ir && t15ir;
+                const double reference15ir=two15ir && rf15ir+tf15ir>0.f ?
+                    std::min(.75, std::max(.25,
+                        (double)tf15ir / ((double)rf15ir+(double)tf15ir))) :
+                    (t15ir ? 1. : 0.);
+                const bool finite15ir=got15ir && valid15ir &&
+                    std::isfinite((double)rf15ir) && std::isfinite((double)tf15ir) &&
+                    std::isfinite((double)u15ir) && std::isfinite((double)threshold15ir);
+                const bool thresholdMatch15ir=finite15ir &&
+                    (black15ir || fabs(reference15ir-threshold15ir)<2.e-6);
+                const unsigned selectedByU15ir=black15ir ? 0u :
+                    (u15ir<threshold15ir ? 2u : 1u);
+                const bool eventMatch15ir=finite15ir &&
+                    selectedByU15ir==selected15im &&
+                    ((black15ir && blackSample15im) ||
+                     (!black15ir && massConsistent15im));
+                if (MLHeroLegacyDiagnosticsEnabled15cq()) fprintf(f15im,"phase15ir NATIVE_LOBE_CONTRACT side=%s ticket=%llu "
+                    "valid=%u reflectPresent=%u transmitPresent=%u bothBlack=%u "
+                    "reflectFilter=%.12g transmitFilter=%.12g u=%.12g "
+                    "nativeThreshold=%.12g reconstructedThreshold=%.12g "
+                    "thresholdMatch=%u selectedByU=%u nativeSelected=%u "
+                    "eventMatch=%u nativeTIR=%u nativeBlack=%u "
+                    "actualParentOnly=1 syntheticChild=0 nativeChildVerified=0 "
+                    "noExtraSampling=1 childRays=0 physicsChanged=0\n",
+                    nativeSide15im ? "LIGHT" : "EYE", parentTicket15im,
+                    finite15ir ? 1u : 0u, r15ir, t15ir, black15ir,
+                    (double)rf15ir, (double)tf15ir, (double)u15ir,
+                    (double)threshold15ir, reference15ir,
+                    thresholdMatch15ir ? 1u : 0u, selectedByU15ir,
+                    selected15im, eventMatch15ir ? 1u : 0u,
+                    reason15im == 1u ? 1u : 0u, blackSample15im ? 1u : 0u);
+                // 15is: native special-case invariants from the same actual parent sample.
+                unsigned valid15is=0u,tir15is=0u,r15is=0u,t15is=0u,black15is=0u;
+                unsigned support15is=0u,threshold15isOk=0u,selected15isOk=0u,pdf15isOk=0u;
+                float expectedThreshold15is=-1.f,expectedPdf15is=-1.f,actualPdf15is=-1.f;
+                const bool got15is=GetMLHeroNativeSpecial15is(&valid15is,&tir15is,
+                    &r15is,&t15is,&black15is,&support15is,&threshold15isOk,
+                    &selected15isOk,&pdf15isOk,&expectedThreshold15is,
+                    &expectedPdf15is,&actualPdf15is);
+                const bool sampleBlack15is=sample.Black();
+                const bool eventOk15is=got15is && valid15is &&
+                    (black15is ? sampleBlack15is : !sampleBlack15is) &&
+                    support15is && threshold15isOk && selected15isOk &&
+                    (black15is || pdf15isOk);
+                if (MLHeroLegacyDiagnosticsEnabled15cq()) fprintf(f15im,"phase15is NATIVE_SPECIAL_INVARIANTS side=%s ticket=%llu "
+                    "valid=%u tir=%u reflectPresent=%u transmitPresent=%u bothBlack=%u "
+                    "supportConsistent=%u thresholdConsistent=%u selectedConsistent=%u "
+                    "pdfConsistent=%u expectedThreshold=%.9g expectedPdf=%.9g "
+                    "observedPdf=%.9g eventOk=%u actualParentOnly=1 "
+                    "noExtraSamplerDraws=1 noExtraSampleCalls=1 "
+                    "nativeChildVerified=0 childRays=0 physicsChanged=0\n",
+                    nativeSide15im ? "LIGHT" : "EYE",parentTicket15im,
+                    valid15is,tir15is,r15is,t15is,black15is,support15is,
+                    threshold15isOk,selected15isOk,pdf15isOk,
+                    (double)expectedThreshold15is,(double)expectedPdf15is,
+                    (double)actualPdf15is,eventOk15is ? 1u : 0u);
+                // 15iu: fixed-u boundary sweep over the lobes produced by the *real*
+                // parent GlassMaterial::Sample. Shadow decisions only: neither a
+                // second native call nor synthetic HitPoint/child-wavelength test.
+                // In particular the native TIR condition is only covered if observed.
+                const double probeU15iu[] = {0., .249999, .25, .499999, .5, .75, .999999};
+                unsigned pass15iu=0u,fail15iu=0u;
+                for (unsigned k15iu=0u; k15iu<7u; ++k15iu) {
+                    const double probe15iu=probeU15iu[k15iu];
+                    const unsigned predicted15iu=black15ir ? 0u :
+                        (probe15iu<reference15ir ? 2u : 1u);
+                    const unsigned nativeRule15iu=black15ir ? 0u :
+                        (probe15iu<(double)threshold15ir ? 2u : 1u);
+                    const double predictedPdf15iu=predicted15iu==0u ? 0. :
+                        (predicted15iu==2u ? reference15ir : 1.-reference15ir);
+                    const double nativeRulePdf15iu=nativeRule15iu==0u ? 0. :
+                        (nativeRule15iu==2u ? (double)threshold15ir : 1.-(double)threshold15ir);
+                    const bool ok15iu=finite15ir && thresholdMatch15ir &&
+                        predicted15iu==nativeRule15iu &&
+                        fabs(predictedPdf15iu-nativeRulePdf15iu)<2.e-6 &&
+                        !(tir15is && predicted15iu==2u);
+                    if (ok15iu) ++pass15iu; else ++fail15iu;
+                }
+                if (MLHeroLegacyDiagnosticsEnabled15cq()) fprintf(f15im,"phase15iu NATIVE_LOBES_FIXED_U_SWEEP side=%s ticket=%llu "
+                    "cases=7 pass=%u fail=%u realNativeLobes=%u "
+                    "nativeTIRObserved=%u bothBlackObserved=%u reflectionPresent=%u "
+                    "transmissionPresent=%u threshold=%.12g sampledParentEvent=%u "
+                    "extraNativeSampleCalls=0 shadowPolicyOnly=1 controlledHitPoint=0 "
+                    "nativeChildVerified=0 childRays=0 physicsChanged=0\n",
+                    nativeSide15im ? "LIGHT" : "EYE", parentTicket15im,
+                    pass15iu,fail15iu,finite15ir?1u:0u,tir15is,black15ir,
+                    r15ir,t15ir,(double)threshold15ir,selected15im);
+                // 15iv: compare the native Snell TIR decision with an independent
+                // double-precision critical-angle calculation. Read only the
+                // ACTUAL parent Sample snapshot; do not invoke the BSDF again.
+                // The normal here is the native shading-space local +Z normal.
+                const double pi15iv=3.14159265358979323846;
+                const double c15iv=std::min(1.,std::max(-1.,(double)cos15im));
+                const bool entering15iv=c15iv>0.;
+                const double ni15iv=entering15iv?(double)nc15im:(double)ntWl15im;
+                const double no15iv=entering15iv?(double)ntWl15im:(double)nc15im;
+                const bool iorsValid15iv=native15im && reason15im!=0u &&
+                    std::isfinite(ni15iv) && std::isfinite(no15iv) &&
+                    std::isfinite(c15iv) && ni15iv>0. && no15iv>0.;
+                const double incidentAngle15iv=acos(fabs(c15iv))*180./pi15iv;
+                const bool canTir15iv=iorsValid15iv && ni15iv>no15iv;
+                const double criticalAngle15iv=canTir15iv ?
+                    asin(std::min(1.,no15iv/ni15iv))*180./pi15iv : -1.;
+                const double independentSinT215iv=iorsValid15iv ?
+                    (ni15iv/no15iv)*(ni15iv/no15iv)*
+                    std::max(0.,1.-c15iv*c15iv) : -1.;
+                const bool independentTir15iv=iorsValid15iv &&
+                    independentSinT215iv>=1.;
+                const bool nativeTir15iv=(reason15im==1u);
+                const bool tirAgreement15iv=iorsValid15iv &&
+                    (independentTir15iv==nativeTir15iv);
+                const double sinResidual15iv=iorsValid15iv ?
+                    fabs(independentSinT215iv-(double)sin15im) : -1.;
+                const double margin15iv=canTir15iv ?
+                    incidentAngle15iv-criticalAngle15iv : -999.;
+                if (MLHeroLegacyDiagnosticsEnabled15cq()) fprintf(f15im,"phase15iv NATIVE_TIR_BOUNDARY side=%s ticket=%llu "
+                    "valid=%u entering=%u ni=%.12g no=%.12g nc=%.12g "
+                    "ntBase=%.12g ntLambda=%.12g wavelength=%.12g "
+                    "incidentDeg=%.12g criticalDeg=%.12g marginDeg=%.12g "
+                    "canTIR=%u nativeSinT2=%.12g independentSinT2=%.12g "
+                    "sinT2AbsError=%.12g nativeTIR=%u independentTIR=%u "
+                    "tirAgreement=%u nativeEvent=%u sampledPdf=%.12g "
+                    "actualParentOnly=1 shadingNormal=1 mediumStackIndependent=0 "
+                    "nativeChildVerified=0 extraSampleCalls=0 childRays=0 physicsChanged=0\n",
+                    nativeSide15im?"LIGHT":"EYE",parentTicket15im,
+                    iorsValid15iv?1u:0u,entering15iv?1u:0u,
+                    ni15iv,no15iv,(double)nc15im,(double)nt15im,
+                    (double)ntWl15im,(double)wl15im,incidentAngle15iv,
+                    criticalAngle15iv,margin15iv,canTir15iv?1u:0u,
+                    (double)sin15im,independentSinT215iv,sinResidual15iv,
+                    nativeTir15iv?1u:0u,independentTir15iv?1u:0u,
+                    tirAgreement15iv?1u:0u,selected15im,(double)pdf);
+                // 15iw: native material dispersion model at the actual parent hit.
+                // TIR per wavelength is a Snell-only counterfactual, not a child sample.
+                unsigned valid15iw=0u,count15iw=0u,parentTir15iw=0u,diff15iw=0u,invalid15iw=0u;
+                float wavelengths15iw[8]={}, ni15iw[8]={}, sin15iw[8]={};
+                unsigned tir15iw[8]={}, laneValid15iw[8]={};
+                const bool got15iw=GetMLHeroLaneTIR15iw(&valid15iw,&count15iw,
+                    &parentTir15iw,&diff15iw,&invalid15iw,
+                    wavelengths15iw,ni15iw,sin15iw,tir15iw,laneValid15iw);
+                if (MLHeroLegacyDiagnosticsEnabled15cq()) fprintf(f15im,"phase15iw NATIVE_SPECTRAL_TIR_SUMMARY side=%s ticket=%llu "
+                    "snapshot=%u valid=%u lanes=%u parentTIR=%u differing=%u invalid=%u "
+                    "parentWavelength=%.9g nativeParentIOR=%.9g "
+                    "sameHitPoint=1 nativeMaterialDispersion=1 childSampleCalled=0 "
+                    "childDirectionVerified=0 nativeChildVerified=0 reversePdfAvailable=0 "
+                    "childRays=0 physicsChanged=0\n",
+                    nativeSide15im?"LIGHT":"EYE",parentTicket15im,
+                    got15iw?1u:0u,valid15iw,count15iw,parentTir15iw,diff15iw,
+                    invalid15iw,(double)wl15im,(double)ntWl15im);
+                for (unsigned lane15iw=0u; lane15iw<count15iw && lane15iw<8u; ++lane15iw)
+                    if (MLHeroLegacyDiagnosticsEnabled15cq()) fprintf(f15im,"phase15iw NATIVE_SPECTRAL_TIR_LANE side=%s ticket=%llu "
+                        "lane=%u valid=%u wavelength=%.9g interiorIOR=%.12g "
+                        "sinT2=%.12g tir=%u parentTIR=%u differs=%u "
+                        "sameHitPoint=1 childSampleCalled=0 childRays=0 physicsChanged=0\n",
+                        nativeSide15im?"LIGHT":"EYE",parentTicket15im,
+                        lane15iw,laneValid15iw[lane15iw],(double)wavelengths15iw[lane15iw],
+                        (double)ni15iw[lane15iw],(double)sin15iw[lane15iw],tir15iw[lane15iw],
+                        parentTir15iw,(laneValid15iw[lane15iw] && tir15iw[lane15iw]!=parentTir15iw)?1u:0u);
+                // 15ix: angular coverage of all valid, REAL material-wavelength
+                // IOR probes at this same native parent hit. This is an audit
+                // only; the extrema do not alter sampling or path throughput.
+                unsigned eligible15ix=0u, blocked15ix=0u;
+                double minCritical15ix=1.e30,maxCritical15ix=-1.e30;
+                unsigned minLane15ix=8u,maxLane15ix=8u;
+                double minNi15ix=0.,minNo15ix=0.,maxNi15ix=0.,maxNo15ix=0.;
+                for (unsigned lane15ix=0u; lane15ix<count15iw && lane15ix<8u; ++lane15ix) {
+                    if (!laneValid15iw[lane15ix]) continue;
+                    const double in15ix=entering15iv?(double)nc15im:(double)ni15iw[lane15ix];
+                    const double out15ix=entering15iv?(double)ni15iw[lane15ix]:(double)nc15im;
+                    if (!std::isfinite(in15ix) || !std::isfinite(out15ix) ||
+                        in15ix<=0. || out15ix<=0.) continue;
+                    if (in15ix<=out15ix) { ++blocked15ix; continue; }
+                    const double crit15ix=asin(std::min(1.,out15ix/in15ix))*180./pi15iv;
+                    ++eligible15ix;
+                    if (crit15ix<minCritical15ix) {
+                        minCritical15ix=crit15ix;minLane15ix=lane15ix;
+                        minNi15ix=in15ix;minNo15ix=out15ix;
+                    }
+                    if (crit15ix>maxCritical15ix) {
+                        maxCritical15ix=crit15ix;maxLane15ix=lane15ix;
+                        maxNi15ix=in15ix;maxNo15ix=out15ix;
+                    }
+                }
+                const bool intervalValid15ix=iorsValid15iv && eligible15ix>0u &&
+                    std::isfinite(incidentAngle15iv);
+                const bool within15ix=intervalValid15ix &&
+                    incidentAngle15iv>=minCritical15ix && incidentAngle15iv<=maxCritical15ix;
+                const double signedDistance15ix=!intervalValid15ix ? -999. :
+                    (incidentAngle15iv<minCritical15ix ? incidentAngle15iv-minCritical15ix :
+                     (incidentAngle15iv>maxCritical15ix ? incidentAngle15iv-maxCritical15ix : 0.));
+                // Different lane TIR flags are the actual mixed-classification
+                // check; interval membership alone is only a candidate.
+                unsigned laneTir15ix=0u,laneNoTir15ix=0u;
+                for (unsigned lane15ix=0u; lane15ix<count15iw && lane15ix<8u; ++lane15ix)
+                    if (laneValid15iw[lane15ix]) {
+                        if (tir15iw[lane15ix]) ++laneTir15ix;
+                        else ++laneNoTir15ix;
+                    }
+                if (MLHeroLegacyDiagnosticsEnabled15cq()) fprintf(f15im,"phase15ix NATIVE_TIR_INTERVAL side=%s ticket=%llu "
+                    "valid=%u eligible=%u nonTIRCapable=%u minCriticalDeg=%.12g "
+                    "maxCriticalDeg=%.12g widthDeg=%.12g incidentDeg=%.12g "
+                    "signedDistanceDeg=%.12g withinInterval=%u mixedLaneTIR=%u "
+                    "laneTIR=%u laneNoTIR=%u minLane=%u maxLane=%u "
+                    "minNi=%.12g minNo=%.12g maxNi=%.12g maxNo=%.12g "
+                    "parentTIR=%u parentVsLaneDiffering=%u "
+                    "sameRealHitPoint=1 nativeChildVerified=0 childRays=0 "
+                    "extraSamplerDraws=0 physicsChanged=0\n",
+                    nativeSide15im?"LIGHT":"EYE",parentTicket15im,
+                    intervalValid15ix?1u:0u,eligible15ix,blocked15ix,
+                    intervalValid15ix?minCritical15ix:-1.,
+                    intervalValid15ix?maxCritical15ix:-1.,
+                    intervalValid15ix?maxCritical15ix-minCritical15ix:-1.,
+                    incidentAngle15iv,signedDistance15ix,within15ix?1u:0u,
+                    (laneTir15ix>0u && laneNoTir15ix>0u)?1u:0u,
+                    laneTir15ix,laneNoTir15ix,minLane15ix,maxLane15ix,
+                    minNi15ix,minNo15ix,maxNi15ix,maxNo15ix,parentTir15iw,diff15iw);
+                // 15iy: event SUPPORT audit on the same native parent hit.
+                // A TIR lane must never propose refraction.  Material Kr/Kt
+                // spectra, child event masses and reverse densities have NOT
+                // been evaluated: this deliberately does not predict child PDFs.
+                unsigned validLanes15iy=0u, forbidTransmit15iy=0u;
+                unsigned allowTransmit15iy=0u, inconsistent15iy=0u;
+                unsigned parentTxChildTir15iy=0u, parentTirChildTx15iy=0u;
+                const bool parentTx15iy=selected15im==2u;
+                for (unsigned lane15iy=0u;lane15iy<count15iw && lane15iy<8u;++lane15iy) {
+                    if (!laneValid15iw[lane15iy]) continue;
+                    ++validLanes15iy;
+                    const bool tir15iy=tir15iw[lane15iy]!=0u;
+                    const bool txGeometricallyAllowed15iy=!tir15iy;
+                    if (tir15iy) ++forbidTransmit15iy;
+                    else ++allowTransmit15iy;
+                    if (parentTx15iy && tir15iy) ++parentTxChildTir15iy;
+                    if (nativeTir15iv && txGeometricallyAllowed15iy) ++parentTirChildTx15iy;
+                    // Invariant: the Snell flag and branch-support mask agree.
+                    if ((tir15iy && txGeometricallyAllowed15iy) ||
+                            (!tir15iy && !txGeometricallyAllowed15iy)) ++inconsistent15iy;
+                    if ((laneTir15ix>0u && laneNoTir15ix>0u) ||
+                            (tir15iy != nativeTir15iv))
+                        if (MLHeroLegacyDiagnosticsEnabled15cq()) fprintf(f15im,"phase15iy CHILD_EVENT_SUPPORT_LANE side=%s ticket=%llu "
+                            "lane=%u wavelength=%.9g laneIOR=%.12g tir=%u "
+                            "transmissionGeometricallyAllowed=%u reflectionGeometricallyAllowed=1 "
+                            "parentEvent=%u parentTIR=%u parentChildTIRDiffer=%u "
+                            "materialKrKtSupport=UNVERIFIED childEventMass=UNAVAILABLE "
+                            "nativeChildSample=0 childRays=0 physicsChanged=0\n",
+                            nativeSide15im?"LIGHT":"EYE",parentTicket15im,lane15iy,
+                            (double)wavelengths15iw[lane15iy],(double)ni15iw[lane15iy],
+                            tir15iy?1u:0u,txGeometricallyAllowed15iy?1u:0u,
+                            selected15im,nativeTir15iv?1u:0u,
+                            (tir15iy!=nativeTir15iv)?1u:0u);
+                }
+                const bool mixed15iy=forbidTransmit15iy>0u && allowTransmit15iy>0u;
+                const bool coverageOk15iy=got15iw && valid15iw &&
+                    validLanes15iy==count15iw &&
+                    validLanes15iy==forbidTransmit15iy+allowTransmit15iy &&
+                    inconsistent15iy==0u &&
+                    mixed15iy==(laneTir15ix>0u && laneNoTir15ix>0u);
+                if (MLHeroLegacyDiagnosticsEnabled15cq()) fprintf(f15im,"phase15iy CHILD_EVENT_SUPPORT_SUMMARY side=%s ticket=%llu "
+                    "valid=%u lanes=%u transmissionForbiddenByTIR=%u "
+                    "transmissionGeometricallyAllowed=%u mixedTIR=%u "
+                    "parentTransmitChildTIR=%u parentTIRChildTransmissionPossible=%u "
+                    "invariantPass=%u invariantFail=%u "
+                    "nativeChildSample=0 childMaterialKrKt=UNAVAILABLE "
+                    "childForwardDiscretePDF=UNAVAILABLE childReverseDiscretePDF=UNAVAILABLE "
+                    "jointSpectralMIS=NOT_IMPLEMENTED childRays=0 physicsChanged=0\n",
+                    nativeSide15im?"LIGHT":"EYE",parentTicket15im,
+                    valid15iw?1u:0u,validLanes15iy,forbidTransmit15iy,
+                    allowTransmit15iy,mixed15iy?1u:0u,
+                    parentTxChildTir15iy,parentTirChildTx15iy,
+                    coverageOk15iy?1u:0u,coverageOk15iy?0u:1u);
+                // 15iz: read-only native-style sampling mass per real-hit lane.
+                unsigned massValid15iz=0u,massCount15iz=0u,massInvalid15iz=0u;
+                float kr15iz=0.f,kt15iz=0.f,rFilter15iz[8]={},tFilter15iz[8]={};
+                float pTx15iz[8]={},pRefl15iz[8]={};
+                unsigned laneOK15iz[8]={},rSupport15iz[8]={},tSupport15iz[8]={},black15iz[8]={};
+                const bool gotMass15iz=GetMLHeroLaneMass15iz(&massValid15iz,
+                    &massCount15iz,&massInvalid15iz,&kr15iz,&kt15iz,
+                    rFilter15iz,tFilter15iz,pTx15iz,pRefl15iz,
+                    laneOK15iz,rSupport15iz,tSupport15iz,black15iz);
+                unsigned invariantFail15iz=0u,massTIR15iz=0u,massSupported15iz=0u;
+                for (unsigned q15iz=0u;q15iz<massCount15iz && q15iz<8u;++q15iz) {
+                    if (!laneOK15iz[q15iz]) { ++invariantFail15iz; continue; }
+                    if (tir15iw[q15iz]) ++massTIR15iz;
+                    if (rSupport15iz[q15iz]||tSupport15iz[q15iz]) ++massSupported15iz;
+                    const double sum15iz=(double)pTx15iz[q15iz]+pRefl15iz[q15iz];
+                    if ((tir15iw[q15iz] && (tSupport15iz[q15iz] || pTx15iz[q15iz]!=0.f)) ||
+                        (black15iz[q15iz] ? sum15iz!=0. : fabs(sum15iz-1.)>1.e-6) ||
+                        (tSupport15iz[q15iz]==0u && pTx15iz[q15iz]!=0.f) ||
+                        (rSupport15iz[q15iz]==0u && pRefl15iz[q15iz]!=0.f))
+                        ++invariantFail15iz;
+                    if (mixed15iy || tir15iw[q15iz]!=nativeTir15iv)
+                        if (MLHeroLegacyDiagnosticsEnabled15cq()) fprintf(f15im,"phase15iz CHILD_EVENT_MASS_LANE side=%s ticket=%llu "
+                            "lane=%u wavelength=%.9g tir=%u krRGBFilter=%.9g ktRGBFilter=%.9g "
+                            "reflectFilter=%.12g transmitFilter=%.12g "
+                            "reflectSupport=%u transmitSupport=%u bothBlack=%u "
+                            "reflectMass=%.12g transmitMass=%.12g "
+                            "discreteMeasure=1 spectralKrKt=RGB_FILTER_PROXY "
+                            "nativeChildSample=0 reverseMass=UNAVAILABLE childRays=0 physicsChanged=0\n",
+                            nativeSide15im?"LIGHT":"EYE",parentTicket15im,q15iz,
+                            (double)wavelengths15iw[q15iz],tir15iw[q15iz],
+                            (double)kr15iz,(double)kt15iz,(double)rFilter15iz[q15iz],
+                            (double)tFilter15iz[q15iz],rSupport15iz[q15iz],
+                            tSupport15iz[q15iz],black15iz[q15iz],
+                            (double)pRefl15iz[q15iz],(double)pTx15iz[q15iz]);
+                }
+                // 15ja: independent policy replay at seven controlled u values.
+                // Both formulations operate on 15iz counterfactual lobe filters;
+                // this is NOT a native Child BSDF::Sample call or PDF verification.
+                const float u15ja[] = {0.f,.249999f,.25f,.499999f,.5f,.75f,.999999f};
+                unsigned pass15ja=0u,fail15ja=0u,tirCases15ja=0u;
+                unsigned differentFromParent15ja=0u, blackCases15ja=0u;
+                for (unsigned lane15ja=0u; lane15ja<massCount15iz && lane15ja<8u; ++lane15ja) {
+                    if (!laneOK15iz[lane15ja]) { ++fail15ja; continue; }
+                    const bool r15ja=(rSupport15iz[lane15ja]!=0u);
+                    const bool t15ja=(tSupport15iz[lane15ja]!=0u);
+                    const float rf15ja=rFilter15iz[lane15ja];
+                    const float tf15ja=tFilter15iz[lane15ja];
+                    const float independentTx15ja= !r15ja ? (t15ja ? 1.f:0.f) :
+                        (!t15ja ? 0.f : Clamp(tf15ja/(rf15ja+tf15ja),.25f,.75f));
+                    if (!r15ja && !t15ja) ++blackCases15ja;
+                    if (tir15iw[lane15ja]) ++tirCases15ja;
+                    unsigned localPass15ja=0u,localFail15ja=0u;
+                    for (unsigned k15ja=0u;k15ja<7u;++k15ja) {
+                        const float u=u15ja[k15ja];
+                        // Independent branch tree mirrors native Glass::Sample:
+                        // zero support first, then transmit for u < threshold.
+                        const unsigned policyEvent15ja=(!r15ja&&!t15ja)?0u:
+                            (u<independentTx15ja?2u:1u);
+                        const unsigned cachedEvent15ja=black15iz[lane15ja]?0u:
+                            (u<pTx15iz[lane15ja]?2u:1u);
+                        const double policyPdf15ja=policyEvent15ja==0u?0.:
+                            (policyEvent15ja==2u?(double)independentTx15ja:1.-independentTx15ja);
+                        const double cachedPdf15ja=cachedEvent15ja==0u?0.:
+                            (cachedEvent15ja==2u?(double)pTx15iz[lane15ja]:
+                                (double)pRefl15iz[lane15ja]);
+                        const bool ok15ja=policyEvent15ja==cachedEvent15ja &&
+                            fabs(policyPdf15ja-cachedPdf15ja)<2.e-6 &&
+                            !(tir15iw[lane15ja] && policyEvent15ja==2u) &&
+                            std::isfinite(cachedPdf15ja);
+                        if (ok15ja) {++localPass15ja;++pass15ja;}
+                        else {++localFail15ja;++fail15ja;}
+                    }
+                    if (fabs((double)pTx15iz[lane15ja]-(double)threshold15ir)>1.e-5)
+                        ++differentFromParent15ja;
+                    if (mixed15iy || localFail15ja)
+                        if (MLHeroLegacyDiagnosticsEnabled15cq()) fprintf(f15im,"phase15ja CHILD_POLICY_REPLAY_LANE side=%s ticket=%llu "
+                            "lane=%u wavelength=%.9g tir=%u parentThreshold=%.9g "
+                            "childThreshold=%.9g pass=%u fail=%u black=%u "
+                            "uSet=0,0.249999,0.25,0.499999,0.5,0.75,0.999999 "
+                            "nativeChildSample=0 reversePdf=UNAVAILABLE childRays=0 physicsChanged=0\n",
+                            nativeSide15im?"LIGHT":"EYE",parentTicket15im,lane15ja,
+                            (double)wavelengths15iw[lane15ja],tir15iw[lane15ja],
+                            (double)threshold15ir,(double)pTx15iz[lane15ja],
+                            localPass15ja,localFail15ja,black15iz[lane15ja]);
+                }
+                if (MLHeroLegacyDiagnosticsEnabled15cq()) fprintf(f15im,"phase15ja CHILD_POLICY_REPLAY_SUMMARY side=%s ticket=%llu "
+                    "lanes=%u cases=%u pass=%u fail=%u tirLanes=%u "
+                    "childThresholdDifferentFromParent=%u blackLanes=%u "
+                    "source=15iz_real_parent_RGB_KrKt_counterfactual_lane_lobes "
+                    "independentPolicyTree=1 nativeChildSample=0 childPdfVerified=0 "
+                    "reversePdf=UNAVAILABLE jointMIS=NOT_IMPLEMENTED "
+                    "childRays=0 physicsChanged=0\n",
+                    nativeSide15im?"LIGHT":"EYE",parentTicket15im,massCount15iz,
+                    pass15ja+fail15ja,pass15ja,fail15ja,tirCases15ja,
+                    differentFromParent15ja,blackCases15ja);
+                // 15jb: observations from actual native GlassMaterial::Sample,
+                // executed under isolated TLS in the material implementation.
+                unsigned valid15jb=0u,count15jb=0u,fail15jb=0u;
+                unsigned sampled15jb[8]={},event15jb[8]={},expected15jb[8]={},match15jb[8]={};
+                float pdf15jb[8]={},expectedPdf15jb[8]={},norm15jb[8]={};
+                float dirResidual15jc[8]={},snellResidual15jc[8]={};
+                unsigned dirPass15jc[8]={},tirBlocked15jc[8]={};
+                const bool got15jb=GetMLHeroNativeChild15jb(&valid15jb,&count15jb,
+                    &fail15jb,sampled15jb,event15jb,expected15jb,match15jb,
+                    pdf15jb,expectedPdf15jb,norm15jb,
+                    dirResidual15jc,snellResidual15jc,dirPass15jc,tirBlocked15jc);
+                unsigned checked15jb=0u,pass15jb=0u;
+                for(unsigned k15jb=0u;k15jb<count15jb && k15jb<8u;++k15jb) {
+                    if(!sampled15jb[k15jb]) continue;
+                    ++checked15jb;
+                    if(match15jb[k15jb]) ++pass15jb;
+                    if (mixed15iy || !match15jb[k15jb])
+                        if (MLHeroCurrentHeavyDiagnosticsEnabled15cq() || !match15jb[k15jb]) fprintf(f15im,"phase15jb NATIVE_CHILD_SAMPLE_LANE side=%s ticket=%llu "
+                            "lane=%u wavelength=%.9g tir=%u nativeEvent=%u "
+                            "expectedEvent=%u nativePdf=%.12g expectedPdf=%.12g "
+                            "directionNorm=%.9g pass=%u nativeChildSample=1 "
+                            "jointMIS=NOT_IMPLEMENTED childRays=0 physicsChanged=0\n",
+                            nativeSide15im?"LIGHT":"EYE",parentTicket15im,k15jb,
+                            (double)wavelengths15iw[k15jb],tir15iw[k15jb],
+                            event15jb[k15jb],expected15jb[k15jb],
+                            (double)pdf15jb[k15jb],(double)expectedPdf15jb[k15jb],
+                            (double)norm15jb[k15jb],match15jb[k15jb]);
+                }
+                unsigned checked15jc=0u,pass15jc=0u,fail15jc=0u,tir15jc=0u;
+                double maxResidual15jc=0.,maxSnell15jc=0.;
+                for(unsigned lane15jc=0u;lane15jc<count15jb && lane15jc<8u;++lane15jc) {
+                    if(!sampled15jb[lane15jc]) continue;
+                    ++checked15jc;
+                    if(dirPass15jc[lane15jc]) ++pass15jc;
+                    else ++fail15jc;
+                    tir15jc+=tirBlocked15jc[lane15jc];
+                    maxResidual15jc=Max(maxResidual15jc,(double)dirResidual15jc[lane15jc]);
+                    maxSnell15jc=Max(maxSnell15jc,(double)snellResidual15jc[lane15jc]);
+                    if(mixed15iy || !dirPass15jc[lane15jc])
+                        if (MLHeroCurrentHeavyDiagnosticsEnabled15cq() || !dirPass15jc[lane15jc]) fprintf(f15im,"phase15jc NATIVE_CHILD_DIRECTION_LANE side=%s ticket=%llu "
+                            "lane=%u wavelength=%.9g event=%u tir=%u tirBlocked=%u "
+                            "vectorResidual=%.12g snellResidual=%.12g directionPass=%u "
+                            "nativeSample=1 independentDoubleEquation=1 "
+                            "reversePdf=UNAVAILABLE childRays=0 physicsChanged=0\n",
+                            nativeSide15im?"LIGHT":"EYE",parentTicket15im,lane15jc,
+                            (double)wavelengths15iw[lane15jc],event15jb[lane15jc],
+                            tir15iw[lane15jc],tirBlocked15jc[lane15jc],
+                            (double)dirResidual15jc[lane15jc],(double)snellResidual15jc[lane15jc],
+                            dirPass15jc[lane15jc]);
+                }
+                fprintf(f15im,"phase15jc NATIVE_CHILD_DIRECTION_SUMMARY side=%s ticket=%llu "
+                    "valid=%u checked=%u pass=%u fail=%u tirBlocked=%u "
+                    "maxVectorResidual=%.12g maxSnellResidual=%.12g "
+                    "nativeSample=1 independentDoubleEquation=1 tlsRestored=1 "
+                    "reversePdf=UNAVAILABLE jointMIS=NOT_IMPLEMENTED childRays=0 physicsChanged=0\n",
+                    nativeSide15im?"LIGHT":"EYE",parentTicket15im,
+                    (got15jb&&valid15jb)?1u:0u,checked15jc,pass15jc,fail15jc,tir15jc,
+                    maxResidual15jc,maxSnell15jc);
+                fprintf(f15im,"phase15jb NATIVE_CHILD_SAMPLE_SUMMARY side=%s ticket=%llu "
+                    "valid=%u lanes=%u checked=%u pass=%u fail=%u "
+                    "nativeChildSample=1 parentTLSRestored=1 reversePdf=UNAVAILABLE "
+                    "jointMIS=NOT_IMPLEMENTED childRays=0 physicsChanged=0\n",
+                    nativeSide15im?"LIGHT":"EYE",parentTicket15im,
+                    (got15jb&&valid15jb)?1u:0u,count15jb,checked15jb,
+                    pass15jb,fail15jb);
+                if (MLHeroLegacyDiagnosticsEnabled15cq()) fprintf(f15im,"phase15iz CHILD_EVENT_MASS_SUMMARY side=%s ticket=%llu "
+                    "valid=%u lanes=%u invalid=%u tirLanes=%u materialSupportedLanes=%u "
+                    "invariantPass=%u invariantFail=%u parentEvent=%u "
+                    "krRGBFilter=%.9g ktRGBFilter=%.9g "
+                    "materialTextures=ACTUAL_PARENT_RGB_KrKt filmTextureDiagnosticRead=1 "
+                    "forwardDiscreteMass=NATIVE_POLICY_COUNTERFACTUAL_NOT_CHILD_SAMPLE "
+                    "reverseMass=UNAVAILABLE jointSpectralMIS=NOT_IMPLEMENTED "
+                    "childRays=0 physicsChanged=0\n",
+                    nativeSide15im?"LIGHT":"EYE",parentTicket15im,
+                    (gotMass15iz&&massValid15iz&&massCount15iz==count15iw)?1u:0u,
+                    massCount15iz,massInvalid15iz,massTIR15iz,massSupported15iz,
+                    invariantFail15iz==0u?1u:0u,invariantFail15iz,selected15im,
+                    (double)kr15iz,(double)kt15iz);
+                fclose(f15im);
+            }
+        }
+    }
+    if (!MLHeroCurrentHeavyDiagnosticsEnabled15cq() || bsdf.GetMaterialType() != GLASS)
+        return;
+    const unsigned side = bsdf.hitPoint.fromLight ? 1u : 0u;
+    const unsigned long long ticket = mlHero15ihTotal[side].fetch_add(1ull, std::memory_order_relaxed) + 1ull;
+    const bool black = sample.Black();
+    const bool reflect = !black && ((event & REFLECT) != 0);
+    const bool transmit = !black && ((event & TRANSMIT) != 0);
+    if (black) mlHero15ihBlack[side].fetch_add(1ull, std::memory_order_relaxed);
+    else if (reflect) mlHero15ihReflected[side].fetch_add(1ull, std::memory_order_relaxed);
+    else if (transmit) mlHero15ihTransmitted[side].fetch_add(1ull, std::memory_order_relaxed);
+    else mlHero15ihOther[side].fetch_add(1ull, std::memory_order_relaxed);
+    // Bounded detail plus periodic complete counters. No sampler draws, BSDF calls or geometry intersections.
+    if ((ticket > 96ull) && ((ticket & (ticket - 1ull)) != 0ull)) return;
+    unsigned int tirReason15ii=0u, selected15ii=0u, fromLight15ii=0u;
+    float wave15ii=-1.f, nc15ii=0.f, ntBase15ii=0.f, ntLambda15ii=0.f;
+    float cos15ii=0.f, eta15ii=0.f, sinT215ii=0.f, threshold15ii=0.f;
+    unsigned long long internalTotal15ii=0ull, internalTIR15ii=0ull, internalBlack15ii=0ull;
+    const bool hasNative15ii=GetMLHeroGlassTIRSample15ii(&tirReason15ii, &selected15ii,
+        &wave15ii, &nc15ii, &ntBase15ii, &ntLambda15ii,
+        &cos15ii, &eta15ii, &sinT215ii, &threshold15ii,
+        &fromLight15ii, &internalTotal15ii, &internalTIR15ii, &internalBlack15ii);
+    const double cosIncidence = fabs((double)Dot(bsdf.hitPoint.fixedDir, bsdf.hitPoint.shadeN));
+    std::lock_guard<std::recursive_mutex> guard(mlHeroDebugLogMutex);
+    FILE *f = MLHeroOpenAnyLog15gj("a");
+    if (!f) return;
+    fprintf(f, "phase15ih GLASS_SAMPLE_OUTCOME side=%s ticket=%llu event=%u black=%u reflect=%u transmit=%u "
+        "pdf=%.9g cosSampled=%.9g absCosFixedShade=%.9g materialID=%u "
+        "total=%llu reflected=%llu transmitted=%llu blackCount=%llu other=%llu "
+        "rejectedTransmissionAttempt=UNKNOWN internalTIRDecision=UNKNOWN "
+        "nativeSampleOnly=1 noExtraSamplerDraws=1 noExtraBSDFCalls=1 "
+        "diagnosticOnly=1 filmChanged=0 misChanged=0 rrChanged=0\n",
+        side ? "LIGHT" : "EYE", ticket, (unsigned)event, black ? 1u : 0u,
+        reflect ? 1u : 0u, transmit ? 1u : 0u,
+        (double)pdf, (double)cosSampled, cosIncidence,
+        (unsigned)bsdf.GetMaterialID(),
+        ticket,
+        mlHero15ihReflected[side].load(std::memory_order_relaxed),
+        mlHero15ihTransmitted[side].load(std::memory_order_relaxed),
+        mlHero15ihBlack[side].load(std::memory_order_relaxed),
+        mlHero15ihOther[side].load(std::memory_order_relaxed));
+    fprintf(f, "phase15ii INTERNAL_GLASS_TIR side=%s ticket=%llu native=%u "
+        "reason=%u selected=%u lambda=%.9g nc=%.9g ntBase=%.9g ntLambda=%.9g "
+        "cosFixed=%.9g eta=%.9g sinT2=%.9g threshold=%.9g "
+        "nativeFromLight=%u total=%llu totalInternalTIR=%llu totalBlack=%llu "
+        "tirReason_0_notTested_1_TIR_2_valid=1 selected_0_black_1_reflect_2_transmit=1 "
+        "nativeDecision=1 diagnosticOnly=1 physicsChanged=0\n",
+        side ? "LIGHT" : "EYE", ticket, hasNative15ii ? 1u : 0u,
+        tirReason15ii, selected15ii, (double)wave15ii,
+        (double)nc15ii, (double)ntBase15ii, (double)ntLambda15ii,
+        (double)cos15ii, (double)eta15ii, (double)sinT215ii,
+        (double)threshold15ii, fromLight15ii, internalTotal15ii,
+        internalTIR15ii, internalBlack15ii);
+    fclose(f);
+}
+
 // ML HERO phase 15ct: RoughGlass Sample/Evaluate/Pdf consistency diagnostics.
 // Diagnostic only: evaluates the already sampled direction at the current HERO
 // wavelength and never changes path throughput, direction, event or PDF.
@@ -131,6 +1369,8 @@ static inline bool MLHeroLegacyHeavyDiagnosticsEnabled15cq() {
 static std::atomic<unsigned long long> mlHero15ctRoughGlassSamples[4];
 static std::atomic<unsigned long long> mlHero15ctRoughGlassEvalBlack[4];
 static std::atomic<unsigned long long> mlHero15ctRoughGlassEventMismatch[4];
+// Diagnostic-only: bounded first event mismatches per sampled side/event.
+static std::atomic<unsigned int> mlHero15ctMismatchDetails[4];
 static std::atomic<double> mlHero15ctRoughGlassPdfRelErrSum[4];
 static std::atomic<double> mlHero15ctRoughGlassPdfRelErrMax[4];
 static std::atomic<double> mlHero15ctRoughGlassSampleRelErrSum[4];
@@ -1181,9 +2421,6 @@ static inline const char *MLHeroMaterialTypeName15cl(const u_int t) {
 
 // ML HERO central diagnostics configuration. Change the phase in ONE place;
 // the log filename and banner follow automatically.
-#define ML_HERO_BUILD "HERO_170"
-#define ML_HERO_TEST_PHASE "15gb"
-#define ML_HERO_FEATURE "Central CPU diagnostic log filenames; renderer physics unchanged from 15ga"
 // 15di A/B experiment: 1 = companion lanes keep the shared HERO event PDF
 // already owned by the sampled path; 0 = legacy Mode2 bsdfPdfW/laneEventPdfW
 // reweighting. HERO OFF and Glass Modes 0/1 are untouched.
@@ -1460,6 +2697,399 @@ static std::atomic<double> mlHero15fwPeak[MLHERO_15EW_STAGES][2];
 static thread_local float mlHeroFilmX15fw = -1.f, mlHeroFilmY15fw = -1.f;
 static thread_local u_int mlHeroThread15fw = 0u, mlHeroStep15fw = 0u;
 static std::atomic<unsigned long long> mlHero15fwConnectionDetails(0ull);
+// 15km: all MIS writes in the live CPU BIDIR path have before/after coverage.
+static std::atomic<unsigned long long> mlHero15kmNew[slg::mlhero15km::StageCount][2],
+    mlHero15kmInherited[slg::mlhero15km::StageCount][2],
+    mlHero15kmNewDetails[slg::mlhero15km::StageCount][2],
+    mlHero15kmInheritedDetails[slg::mlhero15km::StageCount][2],
+    mlHero15kmWriteFailures[slg::mlhero15km::StageCount][2];
+static void MLHeroReset15km() {
+    for(unsigned s=0;s<slg::mlhero15km::StageCount;++s)for(unsigned side=0;side<2;++side) {
+        mlHero15kmNew[s][side].store(0ull,std::memory_order_relaxed);
+        mlHero15kmInherited[s][side].store(0ull,std::memory_order_relaxed);
+        mlHero15kmNewDetails[s][side].store(0ull,std::memory_order_relaxed);
+        mlHero15kmInheritedDetails[s][side].store(0ull,std::memory_order_relaxed);
+        mlHero15kmWriteFailures[s][side].store(0ull,std::memory_order_relaxed);
+    }
+}
+static void MLHeroMISTransition15km(unsigned stage,unsigned side,
+        const slg::mlhero15km::State &before,const PathVertexVM &v,
+        const slg::mlhero15km::Inputs &inputs) {
+    using namespace slg::mlhero15km;
+    const State after(v.dVCM,v.dVC,v.dVM);
+    if(!after.Bad())return;
+    const bool newlyBad=(after.Bad()&~before.Bad())!=0u;
+    auto &events=newlyBad?mlHero15kmNew[stage][side]:mlHero15kmInherited[stage][side];
+    events.fetch_add(1ull,std::memory_order_relaxed);
+    auto &details=newlyBad?mlHero15kmNewDetails[stage][side]:mlHero15kmInheritedDetails[stage][side];
+    const auto ticket=details.fetch_add(1ull,std::memory_order_relaxed);
+    if(ticket>=(newlyBad?16ull:2ull))return;
+    const Probe p=Analyze(stage,before,after,inputs);
+    std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
+    FILE *f=MLHeroOpenAnyLog15gj("a");
+    if(!f){mlHero15kmWriteFailures[stage][side].fetch_add(1ull,std::memory_order_relaxed);return;}
+    const bool hit=stage==LightGeometry||stage==EyeGeometry||stage==Bounce;
+    fprintf(f,"phase15km MIS_TRANSITION stage=%s side=%s kind=%s detail=%llu thread=%u sample=%u filmX=%.9g filmY=%.9g depth=%u beforeBad=%u afterBad=%u newBad=%u before=(%.9g,%.9g,%.9g) after=(%.9g,%.9g,%.9g) componentOrder=dVCM_dVC_dVM maskBits=1_2_4 diagnosticOnly=1\n",
+        Name(stage),side?"LIGHT":"EYE",newlyBad?"NEW_COMPONENT_NONFINITE":"INHERITED_NONFINITE",ticket,
+        mlHeroThread15fw,mlHeroStep15fw,mlHeroFilmX15fw,mlHeroFilmY15fw,hit?v.depth:0u,
+        p.beforeBad,p.afterBad,p.newBad,before.cm,before.vc,before.vm,after.cm,after.vc,after.vm);
+    fprintf(f,"phase15km MIS_INPUT stage=%s side=%s kind=%s detail=%llu forwardPdf=%.9g reversePdf=%.9g cosine=%.9g distance=%.9g distanceApplied=%u specular=%u event=%u rrQ=%.9g misVmFactor=%.9g misVcFactor=%.9g sourceID=%u sourceType=%u lightCompetitor=%u pdfMeaning=%s\n",
+        Name(stage),side?"LIGHT":"EYE",newlyBad?"NEW":"INHERITED",ticket,
+        inputs.forward,inputs.reverse,inputs.cosine,inputs.distance,inputs.distanceApplied?1u:0u,
+        inputs.specular?1u:0u,inputs.event,inputs.rr,inputs.vmFactor,inputs.vcFactor,
+        inputs.sourceID,inputs.sourceType,inputs.lightCompetitor?1u:0u,
+        stage==LightInit?"emission_and_direct":(stage==EyeInit?"camera":"BSDF_after_RR_or_unused_geometry"));
+    fprintf(f,"phase15km MIS_REFERENCE stage=%s side=%s kind=%s detail=%llu doubleAfter=(%.17g,%.17g,%.17g) doubleFactor=%.17g doubleReverseSquare=%.17g doubleHistoryVC=%.17g doubleHistoryVM=%.17g floatFactor=%.9g floatReverseSquare=%.9g floatHistoryVC=%.9g floatHistoryVM=%.9g referenceScope=single_operation_from_actual_float_history referenceApplied=0\n",
+        Name(stage),side?"LIGHT":"EYE",newlyBad?"NEW":"INHERITED",ticket,
+        p.cm,p.vc,p.vm,p.factor,p.reverseSquare,p.historyVC,p.historyVM,
+        p.floatFactor,p.floatReverseSquare,p.floatHistoryVC,p.floatHistoryVM);
+    if(hit) {
+        fprintf(f,"phase15km MIS_HIT stage=%s side=%s kind=%s detail=%llu materialID=%u materialType=%u name=\"%s\" parentSelected=%u parentPath=%llu previousBounceDepth=%u previousForwardPdf=%.9g previousRRq=%.9g position=(%.9g,%.9g,%.9g) shadeN=(%.9g,%.9g,%.9g) fixedDir=(%.9g,%.9g,%.9g)\n",
+            Name(stage),side?"LIGHT":"EYE",newlyBad?"NEW":"INHERITED",ticket,
+            v.bsdf.GetMaterialID(),(unsigned)v.bsdf.GetMaterialType(),v.bsdf.GetMaterialName().c_str(),
+            v.mlHeroParentHistory15ke.selected?1u:0u,v.mlHeroParentHistory15ke.ticket,
+            v.mlHeroLastDepth15fw,v.mlHeroLastPdf15fw,v.mlHeroLastRR15fw,
+            v.bsdf.hitPoint.p.x,v.bsdf.hitPoint.p.y,v.bsdf.hitPoint.p.z,
+            v.bsdf.hitPoint.shadeN.x,v.bsdf.hitPoint.shadeN.y,v.bsdf.hitPoint.shadeN.z,
+            v.bsdf.hitPoint.fixedDir.x,v.bsdf.hitPoint.fixedDir.y,v.bsdf.hitPoint.fixedDir.z);
+    }
+    if(ferror(f))mlHero15kmWriteFailures[stage][side].fetch_add(1ull,std::memory_order_relaxed);
+    if(fclose(f)!=0)mlHero15kmWriteFailures[stage][side].fetch_add(1ull,std::memory_order_relaxed);
+}
+// 15km END
+// 15kn: recovered legacy failures and remaining failures use separate detail quotas.
+static std::atomic<unsigned long long> mlHero15knLegacyBad[slg::mlhero15kn::StageCount][2],
+    mlHero15knRecovered[slg::mlhero15kn::StageCount][2],
+    mlHero15knActualBad[slg::mlhero15kn::StageCount][2],
+    mlHero15knRoundedZero[slg::mlhero15kn::StageCount][2],
+    mlHero15knDetails[slg::mlhero15kn::StageCount][2][2],
+    mlHero15knWriteFailures[slg::mlhero15kn::StageCount][2];
+static void MLHeroReset15kn() {
+    for(unsigned s=0;s<slg::mlhero15kn::StageCount;++s)for(unsigned side=0;side<2;++side) {
+        mlHero15knLegacyBad[s][side].store(0ull,std::memory_order_relaxed);
+        mlHero15knRecovered[s][side].store(0ull,std::memory_order_relaxed);
+        mlHero15knActualBad[s][side].store(0ull,std::memory_order_relaxed);
+        mlHero15knRoundedZero[s][side].store(0ull,std::memory_order_relaxed);
+        mlHero15knWriteFailures[s][side].store(0ull,std::memory_order_relaxed);
+        for(unsigned k=0;k<2;++k)mlHero15knDetails[s][side][k].store(0ull,std::memory_order_relaxed);
+    }
+}
+static void MLHeroMISPrecisionAudit15kn(unsigned stage,const PathVertexVM &v,
+        const slg::mlhero15kn::State &before,const slg::mlhero15kn::State &legacy,
+        const slg::mlhero15kn::Result &precise,float oldCosine,double preciseCosine,
+        float forward,float reverse,float distance) {
+    using namespace slg::mlhero15kn;
+    const State actual(v.dVCM,v.dVC,v.dVM);
+    const bool roundedZero=oldCosine==0.f && preciseCosine>0. && std::isfinite(preciseCosine);
+    if(!legacy.Bad()&&!actual.Bad()&&!roundedZero)return;
+    const unsigned side=v.bsdf.hitPoint.fromLight?1u:0u;
+    if(legacy.Bad())mlHero15knLegacyBad[stage][side].fetch_add(1ull,std::memory_order_relaxed);
+    if(legacy.Bad()&&!actual.Bad())mlHero15knRecovered[stage][side].fetch_add(1ull,std::memory_order_relaxed);
+    if(actual.Bad())mlHero15knActualBad[stage][side].fetch_add(1ull,std::memory_order_relaxed);
+    if(roundedZero)mlHero15knRoundedZero[stage][side].fetch_add(1ull,std::memory_order_relaxed);
+    const unsigned kind=actual.Bad()?1u:0u;
+    const auto ticket=mlHero15knDetails[stage][side][kind].fetch_add(1ull,std::memory_order_relaxed);
+    if(ticket>=16ull)return;
+    std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
+    FILE *f=MLHeroOpenAnyLog15gj("a");
+    if(!f){mlHero15knWriteFailures[stage][side].fetch_add(1ull,std::memory_order_relaxed);return;}
+    fprintf(f,"phase15kn MIS_PRECISION_DETAIL stage=%s side=%s kind=%s detail=%llu thread=%u sample=%u filmX=%.9g filmY=%.9g depth=%u materialID=%u materialType=%u name=\"%s\" before=(%.9g,%.9g,%.9g) legacy=(%.9g,%.9g,%.9g) actual=(%.9g,%.9g,%.9g) precise=(%.17g,%.17g,%.17g) beforeBad=%u legacyBad=%u actualBad=%u oldCosine=%.9g preciseCosine=%.17g roundedZero=%u forwardPdf=%.9g reversePdf=%.9g distance=%.9g diagnosticOnly=1\n",
+        Name(stage),side?"LIGHT":"EYE",kind?"REMAINING_NONFINITE":"RECOVERED_OR_ROUNDED_ZERO",ticket,
+        mlHeroThread15fw,mlHeroStep15fw,mlHeroFilmX15fw,mlHeroFilmY15fw,v.depth,
+        v.bsdf.GetMaterialID(),(unsigned)v.bsdf.GetMaterialType(),v.bsdf.GetMaterialName().c_str(),
+        before.cm,before.vc,before.vm,legacy.cm,legacy.vc,legacy.vm,actual.cm,actual.vc,actual.vm,
+        precise.cm,precise.vc,precise.vm,before.Bad(),legacy.Bad(),actual.Bad(),oldCosine,preciseCosine,
+        roundedZero?1u:0u,forward,reverse,distance);
+    if(ferror(f))mlHero15knWriteFailures[stage][side].fetch_add(1ull,std::memory_order_relaxed);
+    if(fclose(f)!=0)mlHero15knWriteFailures[stage][side].fetch_add(1ull,std::memory_order_relaxed);
+}
+// 15kn END
+// 15ko: emit bounded windows at the first output drift, separately from inherited drift.
+static void MLHeroDirectionTrace15ko(const PathVertexVM &v,const Vector &finalDirection,
+        float pdf,float cosine,unsigned event) {
+    using namespace slg::mlhero15ko;
+    if(!current.valid)return;
+    Step s=current;s.depth=v.depth;s.material=(unsigned)v.bsdf.GetMaterialType();s.event=event;
+    s.ray=V::From(finalDirection);s.pdf=pdf;s.cosine=cosine;
+    const unsigned side=v.bsdf.hitPoint.fromLight?1u:0u;
+    Ring &ring=rings[side];ring.Push(s,mlHeroStep15fw);
+    const unsigned mask=s.Mask();if(!mask)return;
+    // Input-unit failures cannot consume the quota for newly introduced output drift.
+    const unsigned kind=(mask&1u)?1u:0u;
+    events[side][kind].fetch_add(1ull,std::memory_order_relaxed);
+    const auto ticket=details[side][kind].fetch_add(1ull,std::memory_order_relaxed);
+    if(ticket>=16ull)return;
+    std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
+    FILE *f=MLHeroOpenAnyLog15gj("a");
+    if(!f){writeFailures[side][kind].fetch_add(1ull,std::memory_order_relaxed);return;}
+    fprintf(f,"phase15ko DIRECTION_WINDOW side=%s kind=%s detail=%llu thread=%u sample=%u filmX=%.9g filmY=%.9g depth=%u materialID=%u name=\"%s\" mask=%u steps=%u diagnosticOnly=1\n",
+        side?"LIGHT":"EYE",kind?"INHERITED_INPUT_DRIFT":"UNIT_INPUT_STAGE_DRIFT",ticket,
+        mlHeroThread15fw,mlHeroStep15fw,mlHeroFilmX15fw,mlHeroFilmY15fw,v.depth,
+        v.bsdf.GetMaterialID(),v.bsdf.GetMaterialName().c_str(),mask,ring.count);
+    for(unsigned i=0;i<ring.count;++i){
+        const Step &a=ring.At(i);
+        fprintf(f,"phase15ko DIRECTION_STEP side=%s kind=%u detail=%llu index=%u depth=%u materialType=%u volume=%u preciseFrame=%u event=%u mask=%u inputNorm2=%.17g localFixedNorm2=%.17g localSampleNorm2=%.17g worldSampleNorm2=%.17g finalRayNorm2=%.17g frameNorm2=(%.17g,%.17g,%.17g) frameDots=(%.17g,%.17g,%.17g) pdf=%.9g cosine=%.9g\n",
+            side?"LIGHT":"EYE",kind,ticket,i,a.depth,a.material,a.volume?1u:0u,a.preciseFrame?1u:0u,a.event,a.Mask(),
+            a.input.Norm2(),a.localFixed.Norm2(),a.localSample.Norm2(),a.worldSample.Norm2(),a.ray.Norm2(),
+            a.x.Norm2(),a.y.Norm2(),a.z.Norm2(),Dot(a.x,a.y),Dot(a.x,a.z),Dot(a.y,a.z),a.pdf,a.cosine);
+        fprintf(f,"phase15ko DIRECTION_VECTORS side=%s kind=%u detail=%llu index=%u input=(%.17g,%.17g,%.17g) localFixed=(%.17g,%.17g,%.17g) localSample=(%.17g,%.17g,%.17g) worldSample=(%.17g,%.17g,%.17g) finalRay=(%.17g,%.17g,%.17g)\n",
+            side?"LIGHT":"EYE",kind,ticket,i,a.input.x,a.input.y,a.input.z,a.localFixed.x,a.localFixed.y,a.localFixed.z,
+            a.localSample.x,a.localSample.y,a.localSample.z,a.worldSample.x,a.worldSample.y,a.worldSample.z,a.ray.x,a.ray.y,a.ray.z);
+    }
+    if(ferror(f))writeFailures[side][kind].fetch_add(1ull,std::memory_order_relaxed);
+    if(fclose(f)!=0)writeFailures[side][kind].fetch_add(1ull,std::memory_order_relaxed);
+}
+// 15ko END
+// 15la BEGIN: bounded read-only Schlick proposal audit.
+static void MLHeroSchlickReport15la(const slg::mlhero15la::Record&r){
+    std::lock_guard<std::recursive_mutex>lock(mlHeroDebugLogMutex);
+    FILE*f=MLHeroOpenAnyLog15gj("a");
+    if(!f){slg::mlhero15la::writeFailures[r.side].fetch_add(1ull,std::memory_order_relaxed);return;}
+    slg::mlhero15la::WriteRecord(f,r,mlHeroThread15fw,mlHeroStep15fw);
+    if(ferror(f))slg::mlhero15la::writeFailures[r.side].fetch_add(1ull,std::memory_order_relaxed);
+    if(fclose(f)!=0)slg::mlhero15la::writeFailures[r.side].fetch_add(1ull,std::memory_order_relaxed);
+}
+// 15la END
+
+// 15kv BEGIN logger
+static const char*MLHeroSurfaceKind15kv(unsigned kind){
+    return kind==0?"BEFORE_BUMP_NORMAL_INVALID":(kind==1?"BUMP_INTRODUCED_NORMAL_INVALID":"BASIS_OR_DIFFERENTIAL_INVALID");
+}
+static void MLHeroSurfaceReport15kv(const slg::mlhero15kv::Trace&t){
+    using namespace slg::mlhero15kv;
+    std::lock_guard<std::recursive_mutex>lock(mlHeroDebugLogMutex);FILE*f=MLHeroOpenAnyLog15gj("a");
+    if(!f){writeFailures[t.side][t.kind].fetch_add(1ull,std::memory_order_relaxed);return;}
+    fprintf(f,"phase15kv SURFACE_ORIGIN side=%s kind=%s detail=%llu thread=%u sample=%u init=%s materialID=%u materialType=%u name=\"%s\" objectID=%u meshType=%u triangle=%u bary=(%.17g,%.17g,%.17g) bump=%u bumpType=%u bumpName=\"%s\" bumpDistance=%.17g beforeNormalMask=%u afterNormalMask=%u beforeDifferentialMask=%u afterDifferentialMask=%u directionDepth=UNAVAILABLE firstObservedStage=BSDF_INIT noFallbackApplied=%u recoveryOutcome=%u diagnosticOnly=1\n",
+        t.side?"LIGHT":"EYE",MLHeroSurfaceKind15kv(t.kind),t.detail,mlHeroThread15fw,mlHeroStep15fw,
+        t.initKind?"SURFACE_POINT":"RAY_HIT",t.materialID,t.materialType,t.materialName,t.objectID,t.meshType,t.triangle,
+        1.-t.b1-t.b2,t.b1,t.b2,t.bump?1u:0u,t.bumpType,t.bumpName,t.bumpDistance,
+        t.before.NormalMask(),t.after.NormalMask(),t.before.DifferentialMask(),t.after.DifferentialMask(),t.recoveryOutcome==1?0u:1u,t.recoveryOutcome);
+    auto vector=[&](const char*field,V a){fprintf(f,"phase15kv SURFACE_VECTOR side=%s kind=%u detail=%llu field=%s v=(%.17g,%.17g,%.17g) normSquared=%.17g finite=%u\n",
+        t.side?"LIGHT":"EYE",t.kind,t.detail,field,a.x,a.y,a.z,a.Norm2(),a.Finite()?1u:0u);};
+    vector("position",t.position);vector("fixedDir",t.fixed);
+    vector("before.geometryN",t.before.geometry);vector("before.interpolatedN",t.before.interpolated);vector("before.shadeN",t.before.shade);
+    vector("before.dpdu",t.before.dpdu);vector("before.dpdv",t.before.dpdv);vector("before.dndu",t.beforeDndu);vector("before.dndv",t.beforeDndv);
+    vector("after.geometryN",t.after.geometry);vector("after.interpolatedN",t.after.interpolated);vector("after.shadeN",t.after.shade);
+    vector("after.dpdu",t.after.dpdu);vector("after.dpdv",t.after.dpdv);vector("after.dndu",t.afterDndu);vector("after.dndv",t.afterDndv);
+    vector("frame.X",t.frameX);vector("frame.Y",t.frameY);vector("frame.Z",t.frameZ);
+    fprintf(f,"phase15kv SURFACE_TRIANGLE side=%s kind=%u detail=%llu vertexIndices=(%u,%u,%u) hasVertexNormals=%u weightedNormalMeaning=DIAGNOSTIC_WORLD_VERTEX_BLEND_NOT_NATIVE_INSTANCE_REPLAY\n",
+        t.side?"LIGHT":"EYE",t.kind,t.detail,t.vertexIndex[0],t.vertexIndex[1],t.vertexIndex[2],t.vertexNormals?1u:0u);
+    for(unsigned i=0;i<3;++i){vector(i==0?"vertex0":(i==1?"vertex1":"vertex2"),t.vertex[i]);
+        if(t.vertexNormals)vector(i==0?"normal0":(i==1?"normal1":"normal2"),t.normal[i]);}
+    if(t.vertexNormals)vector("weightedWorldVertexNormal",t.weightedNormal);
+    vector("faceCross",t.faceCross);
+    if(t.recoveryOutcome)fprintf(f,"phase15kx SURFACE_RECOVERY side=%s kind=%u detail=%llu outcome=%s evidence=BEFORE_RECOVERY_BEFORE_BUMP policy=GEOMETRY_NORMAL_LOCAL_FLAT_NORMAL_DERIVATIVES meshArrayChanged=0\n",
+        t.side?"LIGHT":"EYE",t.kind,t.detail,t.recoveryOutcome==1?"RECOVERED":"UNRECOVERABLE");
+    // 15kw: detail/side/kind join exactly to the enclosing 15kv report.
+    fprintf(f,"phase15kw RAW_NORMAL_ORIGIN side=%s kind=%u detail=%llu rawAvailable=%u rawNormals=%u rawNonfiniteMask=%u rawZeroMask=%u transformApplied=%u data=CURRENT_MEMORY_BASE_MESH importFileState=UNAVAILABLE physicsChanged=0\n",
+        t.side?"LIGHT":"EYE",t.kind,t.detail,t.rawAvailable?1u:0u,t.rawNormals?1u:0u,
+        t.rawNonfiniteMask,t.rawZeroMask,t.transformApplied?1u:0u);
+    auto rawVector=[&](const char*field,V a){fprintf(f,"phase15kw RAW_NORMAL_VECTOR side=%s kind=%u detail=%llu field=%s v=(%.17g,%.17g,%.17g) normSquared=%.17g finite=%u\n",
+        t.side?"LIGHT":"EYE",t.kind,t.detail,field,a.x,a.y,a.z,a.Norm2(),a.Finite()?1u:0u);};
+    if(t.rawAvailable){
+        for(unsigned i=0;i<3;++i){
+            rawVector(i==0?"rawVertex0":i==1?"rawVertex1":"rawVertex2",t.rawVertex[i]);
+            if(t.rawNormals){
+                rawVector(i==0?"rawNormal0":i==1?"rawNormal1":"rawNormal2",t.rawNormal[i]);
+                rawVector(i==0?"baseSignedNormal0":i==1?"baseSignedNormal1":"baseSignedNormal2",t.baseShade[i]);
+                rawVector(i==0?"normalPreNormalize0":i==1?"normalPreNormalize1":"normalPreNormalize2",t.preNormalize[i]);
+            }
+        }
+        rawVector("rawFaceCross",t.rawFaceCross);
+        if(t.rawNormals){
+            rawVector("rawBlendDouble",t.rawBlendDouble);rawVector("rawBlendFloat",t.rawBlendFloat);
+            rawVector("baseNativeInterpolated",t.baseInterpolated);
+            rawVector("interpolatedPreNormalize",t.interpolatedPreNormalize);
+        }
+        for(unsigned r=0;r<4;++r)fprintf(f,"phase15kw NORMAL_TRANSFORM side=%s kind=%u detail=%llu row=%u matrix=(%.17g,%.17g,%.17g,%.17g) inverse=(%.17g,%.17g,%.17g,%.17g) normalRule=INVERSE_TRANSPOSE finalHandednessSignExcluded=1\n",
+            t.side?"LIGHT":"EYE",t.kind,t.detail,r,
+            t.matrix[r][0],t.matrix[r][1],t.matrix[r][2],t.matrix[r][3],
+            t.inverseMatrix[r][0],t.inverseMatrix[r][1],t.inverseMatrix[r][2],t.inverseMatrix[r][3]);
+    }
+    if(ferror(f))writeFailures[t.side][t.kind].fetch_add(1ull,std::memory_order_relaxed);
+    if(fclose(f)!=0)writeFailures[t.side][t.kind].fetch_add(1ull,std::memory_order_relaxed);
+}
+// 15kv END logger
+
+// 15ku BEGIN: arrived native GLASS event masses, isolated from all production PDFs.
+static std::atomic<unsigned long long> mlHero15kuArrived[2][7],mlHero15kuOtherDelta[2];
+static void MLHeroReset15ku(){
+    for(unsigned s=0;s<2;++s){mlHero15kuOtherDelta[s].store(0ull,std::memory_order_relaxed);
+        for(unsigned k=0;k<7;++k)mlHero15kuArrived[s][k].store(0ull,std::memory_order_relaxed);}
+}
+static void MLHeroGlassFactors15ku(FILE*f,const char*side,const PathVertexVM&v,
+        unsigned kind,unsigned long long detail){
+    const auto&a=v.mlHeroPathFactors15kq;const auto&g=a.glassFactors15ku;
+    fprintf(f,"phase15ku CONNECTION_GLASS_FACTORS kind=%u detail=%llu side=%s path=%llu depth=%u prefixValid=%u prefixTruncated=%u glassEdges=%u matchedPairs=%u missingPairs=%u otherDeltaEdges=%u zeroReverseObservations=%u hasGlass=%u glassCoverageComplete=%u allDeltaAreGlass=%u logForwardMatchedGlassMass=%.17g logReverseMatchedGlassMass=%.17g logReverseOverForwardMatchedGlassMass=%.17g logForwardRRForMatchedGlass=%.17g accumulation=ALL_ARRIVED_EDGES_UP_TO_1024 detailedStepsStored=%u detailedStepsOmitted=%u measure=CONDITIONAL_GLASS_EVENT_MASS_SUBSET reverseRR=UNAVAILABLE deltaMeasureConversion=UNAVAILABLE continuousGeometryAndEndpoints=EXCLUDED wavelengthJointPdf=UNAVAILABLE strategyPdfRatio=UNAVAILABLE fullPathPdf=UNAVAILABLE nativeMISChanged=0 diagnosticOnly=1\n",
+        kind,detail,side,a.ticket,v.depth,a.valid?1u:0u,a.truncated?1u:0u,
+        g.glassEdges,g.matched,g.missing,g.otherDelta,g.zeroReverse,g.glassEdges?1u:0u,
+        g.Complete(a.valid,a.truncated)?1u:0u,g.otherDelta==0?1u:0u,
+        g.logForwardMatched,g.logReverseMatched,g.logReverseOverForwardMatched,g.logForwardRRMatched,
+        a.connectionStepCount,a.connectionStepsOmitted);
+}
+// 15ku END
+
+// 15kt BEGIN
+// Categories preserve coverage of both transport modes, events and incidence sides.
+static std::atomic<unsigned long long> mlHero15ktStats[2][2][2][7],mlHero15ktDetails[2][2][2][2],mlHero15ktWriteFailures[2];
+static void MLHeroReset15kt(){
+    for(unsigned s=0;s<2;++s){mlHero15ktWriteFailures[s].store(0ull,std::memory_order_relaxed);
+        for(unsigned t=0;t<2;++t)for(unsigned in=0;in<2;++in){
+            for(unsigned i=0;i<7;++i)mlHero15ktStats[s][t][in][i].store(0ull,std::memory_order_relaxed);
+            for(unsigned k=0;k<2;++k)mlHero15ktDetails[s][t][in][k].store(0ull,std::memory_order_relaxed);
+        }
+    }
+}
+static void MLHeroReverseConnection15kt(FILE*f,const char*side,unsigned kind,unsigned long long detail,
+        unsigned long long path,unsigned index,const slg::mlhero15kq::ConnectionStep15ks&x){
+    const auto&a=x.glassReverse15kt;if(a.status==slg::mlhero15kt::NOT_ATTEMPTED)return;
+    fprintf(f,"phase15kt CONNECTION_REVERSE kind=%u detail=%llu side=%s path=%llu index=%u sourceDepth=%u status=%u forwardReplayMatches=%u reverseDirectionSupported=%u nativeForwardMass=%.17g forwardReplayMass=%.9g conditionalReverseMass=%.9g nativeRecurrenceScalar=%.17g recurrenceObserved=%u reverseTIR=%u forwardIntoObject=%u reverseIntoObject=%u reverseFromLight=%u forwardThreshold=%.9g reverseThreshold=%.9g wavelength=%.9g exteriorIOR=%.9g interiorIORBase=%.9g fixedCosine=%.9g reverseFixedCosine=%.9g reverseDirectionResidual=%.17g measure=DISCRETE_EVENT_CONDITIONAL reverseRR=UNAVAILABLE fullPathPdf=UNAVAILABLE diagnosticOnly=1\n",
+        kind,detail,side,path,index,x.sourceDepth,a.status,a.forwardMatches?1u:0u,a.supported?1u:0u,
+        x.forward,a.forwardMass,a.reverseMass,x.reverse,x.reverseSeen?1u:0u,a.reverseTir?1u:0u,
+        a.forwardIntoObject?1u:0u,a.reverseIntoObject?1u:0u,a.reverseFromLight?1u:0u,
+        a.forwardThreshold,a.reverseThreshold,a.wavelength,a.nc,a.nt,a.fixedCosine,a.reverseCosine,a.directionResidual);
+}
+static void MLHeroCaptureReverse15kt(PathVertexVM&v,const Vector&sampled,BSDFEvent event,float pdf){
+    auto&state=v.mlHeroPathFactors15kq;
+    if(!state.selected||state.truncated||state.edges>=slg::mlhero15kq::EdgeBudget||v.bsdf.GetMaterialType()!=GLASS)return;
+    const auto a=v.bsdf.EvaluateMLHeroGlassReverse15kt(sampled,event,pdf);
+    state.glassReverse15kt=a;
+    const unsigned side=v.bsdf.hitPoint.fromLight?1u:0u,tx=(event&TRANSMIT)?1u:0u,
+        inside=a.fixedCosine<0.f?1u:0u;
+    auto*counts=mlHero15ktStats[side][tx][inside];
+    counts[0].fetch_add(1ull,std::memory_order_relaxed);
+    const bool evaluated=a.status==slg::mlhero15kt::EVALUATED;
+    if(evaluated){
+        counts[1].fetch_add(1ull,std::memory_order_relaxed);
+        if(!a.forwardMatches)counts[2].fetch_add(1ull,std::memory_order_relaxed);
+        if(!a.supported)counts[3].fetch_add(1ull,std::memory_order_relaxed);
+        if(a.supported&&!slg::mlhero15kt::CloseMass(a.reverseMass,pdf))counts[4].fetch_add(1ull,std::memory_order_relaxed);
+        if(a.reverseMass==0.f)counts[6].fetch_add(1ull,std::memory_order_relaxed);
+    }else counts[5].fetch_add(1ull,std::memory_order_relaxed);
+    const unsigned anomaly=(!evaluated||!a.forwardMatches||!a.supported)?1u:0u;
+    const auto ticket=mlHero15ktDetails[side][tx][inside][anomaly].fetch_add(1ull,std::memory_order_relaxed);
+    if(ticket>=16ull)return;
+    std::lock_guard<std::recursive_mutex>lock(mlHeroDebugLogMutex);FILE*f=MLHeroOpenAnyLog15gj("a");
+    if(!f){mlHero15ktWriteFailures[side].fetch_add(1ull,std::memory_order_relaxed);return;}
+    fprintf(f,"phase15kt REVERSE_EVENT side=%s event=%s incidence=%s detail=%llu anomaly=%u path=%llu depth=%u thread=%u sample=%u status=%u forwardReplayMatches=%u reverseDirectionSupported=%u nativeForwardMass=%.9g forwardReplayMass=%.9g conditionalReverseMass=%.9g forwardThreshold=%.9g reverseThreshold=%.9g reverseTIR=%u reverseFromLight=%u forwardIntoObject=%u reverseIntoObject=%u wavelength=%.9g exteriorIOR=%.9g interiorIORBase=%.9g fixedCosine=%.9g reverseFixedCosine=%.9g reverseDirectionResidual=%.17g measure=DISCRETE_EVENT_CONDITIONAL reverseRR=UNAVAILABLE nativeMISChanged=0 diagnosticOnly=1\n",
+        side?"LIGHT":"EYE",tx?"TRANSMIT":"REFLECT",inside?"NEGATIVE_LOCAL_Z":"POSITIVE_LOCAL_Z",
+        ticket,anomaly,state.ticket,v.depth,mlHeroThread15fw,mlHeroStep15fw,a.status,a.forwardMatches?1u:0u,a.supported?1u:0u,
+        pdf,a.forwardMass,a.reverseMass,a.forwardThreshold,a.reverseThreshold,a.reverseTir?1u:0u,a.reverseFromLight?1u:0u,
+        a.forwardIntoObject?1u:0u,a.reverseIntoObject?1u:0u,a.wavelength,a.nc,a.nt,a.fixedCosine,a.reverseCosine,a.directionResidual);
+    if(ferror(f))mlHero15ktWriteFailures[side].fetch_add(1ull,std::memory_order_relaxed);
+    if(fclose(f)!=0)mlHero15ktWriteFailures[side].fetch_add(1ull,std::memory_order_relaxed);
+}
+// 15kt END
+
+static std::atomic<unsigned long long> mlHero15kqTickets[2],mlHero15kqArrivals[2],
+    mlHero15kqInvalid[2],mlHero15kqTruncated[2],mlHero15kqWriteFailures[2],mlHero15kqConnections[4];
+static std::atomic<unsigned long long> mlHero15ksGlassObserved[2],mlHero15ksMassMismatch[2];
+static void MLHeroReset15kq(){
+    MLHeroReset15kt();
+    MLHeroReset15ku();
+    for(unsigned side=0;side<2;++side){mlHero15ksGlassObserved[side].store(0ull,std::memory_order_relaxed);
+        mlHero15ksMassMismatch[side].store(0ull,std::memory_order_relaxed);}
+    for(unsigned s=0;s<2;++s){mlHero15kqTickets[s].store(0ull,std::memory_order_relaxed);
+        mlHero15kqArrivals[s].store(0ull,std::memory_order_relaxed);mlHero15kqInvalid[s].store(0ull,std::memory_order_relaxed);
+        mlHero15kqTruncated[s].store(0ull,std::memory_order_relaxed);mlHero15kqWriteFailures[s].store(0ull,std::memory_order_relaxed);}
+    for(unsigned k=0;k<4;++k)mlHero15kqConnections[k].store(0ull,std::memory_order_relaxed);
+}
+static void MLHeroPathPrefix15kq(FILE*f,const char*side,const PathVertexVM&v){
+    const auto &a=v.mlHeroPathFactors15kq;
+    fprintf(f,"phase15kq PATH_PREFIX side=%s path=%llu depth=%u edges=%u continuous=%u discrete=%u volumeEdges=%u validKnownFactors=%u truncated=%u logContinuousPdfW=%.17g logDiscreteMass=%.17g logForwardRR=%.17g logContinuousTargetJacobian=%.17g logReverseContinuousPdfW=%.17g reverseFactorsMissing=%u rootNative=%.17g rootDirect=%.17g rootPick=%.17g fullPathPdf=UNAVAILABLE mediumDistancePdf=UNAVAILABLE reverseRR=UNAVAILABLE deltaReverseMass=UNAVAILABLE wavelengthJointPdf=UNAVAILABLE endpointMeasureSplit=UNAVAILABLE\n",
+        side,a.ticket,a.depth,a.edges,a.continuous,a.discrete,a.volumeEdges,a.valid?1u:0u,a.truncated?1u:0u,
+        a.logContinuous,a.logDiscrete,a.logRR,a.logJacobian,a.logReverseContinuous,a.reverseMissing,
+        a.rootNative,a.rootDirect,a.rootPick);
+}
+template<class P>static void MLHeroPathStart15kq(PathVertexVM&v,unsigned side,const P&origin,
+        double native,double direct,double pick,unsigned rootType){
+    using namespace slg::mlhero15kq;
+    auto&a=v.mlHeroPathFactors15kq;a=State();
+    if(mlHero15kqTickets[side].load(std::memory_order_relaxed)>=CandidateBudget)return;
+    a.ticket=mlHero15kqTickets[side].fetch_add(1ull,std::memory_order_relaxed);a.selected=a.ticket<CandidateBudget;
+    if(!a.selected)return;
+    a.position=V::From(origin);a.rootPosition=a.position;a.rootNative=native;a.rootDirect=direct;a.rootPick=pick;a.rootType=rootType;
+    a.valid=std::isfinite(native)&&native>0.&&std::isfinite(pick)&&pick>0.;
+    if(a.ticket>=RootDetailBudget)return;
+    std::lock_guard<std::recursive_mutex>lock(mlHeroDebugLogMutex);FILE*f=MLHeroOpenAnyLog15gj("a");
+    if(!f){mlHero15kqWriteFailures[side].fetch_add(1ull,std::memory_order_relaxed);return;}
+    fprintf(f,"phase15kq PATH_ROOT side=%s path=%llu thread=%u sample=%u rootType=%u nativePdf=%.17g nativeDirectPdf=%.17g pickPdf=%.17g origin=(%.17g,%.17g,%.17g) cameraOrigin=clipped_ray_origin lightOrigin=emitted_ray_origin endpointMeasureSplit=UNAVAILABLE diagnosticOnly=1\n",
+        side?"LIGHT":"EYE",a.ticket,mlHeroThread15fw,mlHeroStep15fw,rootType,native,direct,pick,a.position.x,a.position.y,a.position.z);
+    if(fclose(f)!=0)mlHero15kqWriteFailures[side].fetch_add(1ull,std::memory_order_relaxed);
+}
+static void MLHeroPathArrival15kq(PathVertexVM&v){
+    auto&a=v.mlHeroPathFactors15kq;if(!a.selected)return;
+    const unsigned side=v.bsdf.hitPoint.fromLight?1u:0u;const bool wasTruncated=a.truncated;
+    if(!a.Arrive(v.depth,v.bsdf.hitPoint.p,v.bsdf.hitPoint.shadeN,v.bsdf.IsVolume(),(unsigned)v.bsdf.GetMaterialType())){
+        if(a.truncated&&!wasTruncated)mlHero15kqTruncated[side].fetch_add(1ull,std::memory_order_relaxed);
+        return;
+    }
+    mlHero15kqArrivals[side].fetch_add(1ull,std::memory_order_relaxed);
+    if(v.depth>1u){
+        if(a.sourceGlass15ku){
+            mlHero15kuArrived[side][0].fetch_add(1ull,std::memory_order_relaxed);
+            const unsigned outcome=a.glassFactors15ku.lastOutcome;
+            if(outcome>=1u&&outcome<=6u)mlHero15kuArrived[side][outcome].fetch_add(1ull,std::memory_order_relaxed);
+        }else if(a.delta)mlHero15kuOtherDelta[side].fetch_add(1ull,std::memory_order_relaxed);
+    }
+    if(v.depth>1u&&a.nativeSeen){
+        mlHero15ksGlassObserved[side].fetch_add(1ull,std::memory_order_relaxed);
+        if(!a.nativeMassMatches)mlHero15ksMassMismatch[side].fetch_add(1ull,std::memory_order_relaxed);
+    }
+    if(!a.valid)mlHero15kqInvalid[side].fetch_add(1ull,std::memory_order_relaxed);
+    if(a.ticket>=slg::mlhero15kq::RootDetailBudget||a.edges>slg::mlhero15kq::EdgeDetailBudget)return;
+    std::lock_guard<std::recursive_mutex>lock(mlHeroDebugLogMutex);FILE*f=MLHeroOpenAnyLog15gj("a");
+    if(!f){mlHero15kqWriteFailures[side].fetch_add(1ull,std::memory_order_relaxed);return;}
+    fprintf(f,"phase15kq PATH_EDGE side=%s path=%llu thread=%u sample=%u depth=%u materialType=%u volume=%u distanceSquared=%.17g targetCosine=%.17g targetJacobian=%.17g jacobianAppliedToContinuousLog=%u edgeRoot=%u sampledDelta=%u sampledForward=%.17g sampledReverse=%.17g sampledRR=%.17g volumeDistanceDensity=UNAVAILABLE deltaJacobian=UNAVAILABLE diagnosticOnly=1\n",
+        side?"LIGHT":"EYE",a.ticket,mlHeroThread15fw,mlHeroStep15fw,v.depth,(unsigned)v.bsdf.GetMaterialType(),v.bsdf.IsVolume()?1u:0u,
+        a.lastDistance2,a.lastTargetCosine,a.lastJacobian,a.lastJacobianApplied?1u:0u,v.depth==1u?1u:0u,
+        a.delta?1u:0u,a.forward,a.reverse,a.rr);
+    MLHeroPathPrefix15kq(f,side?"LIGHT":"EYE",v);
+    if(fclose(f)!=0)mlHero15kqWriteFailures[side].fetch_add(1ull,std::memory_order_relaxed);
+}
+static void MLHeroPathRootSnapshot15kr(FILE*f,const char*side,const PathVertexVM&v){
+    const auto&a=v.mlHeroPathFactors15kq;
+    fprintf(f,"phase15kr CONNECTION_ROOT side=%s path=%llu rootType=%u rootNative=%.17g rootDirect=%.17g rootPick=%.17g origin=(%.17g,%.17g,%.17g) snapshot=VALUE_OWNED endpointMeasureSplit=UNAVAILABLE\n",
+        side,a.ticket,a.rootType,a.rootNative,a.rootDirect,a.rootPick,a.rootPosition.x,a.rootPosition.y,a.rootPosition.z);
+}
+static void MLHeroConnectionSteps15ks(FILE*f,const char*side,const PathVertexVM&v,unsigned kind,unsigned long long detail){
+    const auto&a=v.mlHeroPathFactors15kq;
+    fprintf(f,"phase15ks CONNECTION_CHAIN kind=%u detail=%llu side=%s path=%llu depth=%u stored=%u omitted=%u completeSampledEdgeHistory=%u validKnownFactors=%u truncatedPrefix=%u rootEdge=SEPARATE reverseRR=UNAVAILABLE deltaReverseMass=UNAVAILABLE fullPathPdf=UNAVAILABLE\n",
+        kind,detail,side,a.ticket,v.depth,a.connectionStepCount,a.connectionStepsOmitted,
+        (!a.connectionStepsOmitted&&!a.truncated&&a.connectionStepCount+1u==a.edges)?1u:0u,a.valid?1u:0u,a.truncated?1u:0u);
+    for(unsigned i=0;i<a.connectionStepCount;++i){const auto&x=a.connectionSteps[i];
+        MLHeroReverseConnection15kt(f,side,kind,detail,a.ticket,i,x);
+        fprintf(f,"phase15ks CONNECTION_STEP kind=%u detail=%llu side=%s path=%llu index=%u sourceDepth=%u targetDepth=%u sourceMaterial=%u targetMaterial=%u event=%u sourceVolume=%u targetVolume=%u validEdge=%u measure=%s forwardNative=%.17g nativeReverseScalar=%.17g reverseObserved=%u reverseMeaning=%s forwardRR=%.17g distanceSquared=%.17g targetJacobian=%.17g jacobianApplied=%u nativeGlassObserved=%u transmitThreshold=%.17g selectedNativeMass=%.17g nativeMassMatchesForward=%u reverseRR=UNAVAILABLE deltaReverseMass=UNAVAILABLE\n",
+            kind,detail,side,a.ticket,i,x.sourceDepth,x.targetDepth,x.sourceMaterial,x.targetMaterial,x.event,
+            x.sourceVolume?1u:0u,x.targetVolume?1u:0u,x.valid?1u:0u,x.delta?"DISCRETE_EVENT":"SOLID_ANGLE",
+            x.forward,x.reverse,x.reverseSeen?1u:0u,!x.reverseSeen?"UNAVAILABLE":(x.delta?"RECURRENCE_ONLY":"NATIVE_REVERSE_SOLID_ANGLE"),
+            x.rr,x.distance2,x.jacobian,(!x.delta&&x.valid)?1u:0u,x.nativeSeen?1u:0u,x.threshold,x.nativeMass,x.nativeMassMatches?1u:0u);
+    }
+}
+static void MLHeroPathConnection15kq(const PathVertexVM&eye,const PathVertexVM&light,
+        float distance,float cosEye,float cosLight,float eyeW,float eyeR,float lightW,float lightR,
+        float eyeA,float lightA,float mis){
+    const auto&e=eye.mlHeroPathFactors15kq;const auto&l=light.mlHeroPathFactors15kq;
+    if(!e.selected||!l.selected)return;
+    const unsigned kind=((e.discrete||l.discrete)?1u:0u)+((e.anyVolume||l.anyVolume)?2u:0u);
+    const auto ticket=mlHero15kqConnections[kind].fetch_add(1ull,std::memory_order_relaxed);if(ticket>=16ull)return;
+    std::lock_guard<std::recursive_mutex>lock(mlHeroDebugLogMutex);FILE*f=MLHeroOpenAnyLog15gj("a");
+    if(!f){mlHero15kqWriteFailures[0].fetch_add(1ull,std::memory_order_relaxed);return;}
+    fprintf(f,"phase15kq PATH_CONNECTION kind=%u detail=%llu thread=%u sample=%u eyePath=%llu lightPath=%llu eyeDepth=%u lightDepth=%u eyeMaterial=%u lightMaterial=%u eyeVolume=%u lightVolume=%u distance=%.9g eyeCosine=%.9g lightCosine=%.9g eyeForwardW=%.9g eyeReverseW=%.9g lightForwardW=%.9g lightReverseW=%.9g actualEyePdfA=%.9g actualLightPdfA=%.9g actualMIS=%.9g fullPathPdf=UNAVAILABLE diagnosticOnly=1\n",
+        kind,ticket,mlHeroThread15fw,mlHeroStep15fw,e.ticket,l.ticket,eye.depth,light.depth,
+        (unsigned)eye.bsdf.GetMaterialType(),(unsigned)light.bsdf.GetMaterialType(),eye.bsdf.IsVolume()?1u:0u,light.bsdf.IsVolume()?1u:0u,
+        distance,cosEye,cosLight,eyeW,eyeR,lightW,lightR,eyeA,lightA,mis);
+    MLHeroGlassFactors15ku(f,"EYE",eye,kind,ticket);MLHeroGlassFactors15ku(f,"LIGHT",light,kind,ticket);
+    MLHeroConnectionSteps15ks(f,"EYE",eye,kind,ticket);MLHeroConnectionSteps15ks(f,"LIGHT",light,kind,ticket);
+    MLHeroPathRootSnapshot15kr(f,"EYE",eye);MLHeroPathRootSnapshot15kr(f,"LIGHT",light);
+    MLHeroPathPrefix15kq(f,"EYE",eye);MLHeroPathPrefix15kq(f,"LIGHT",light);
+    if(fclose(f)!=0)mlHero15kqWriteFailures[0].fetch_add(1ull,std::memory_order_relaxed);
+}
+// 15kq END
+
+
+
+
 static void MLHeroFiniteAudit15fw(const u_int stage, const char *role, const Spectrum &v,
         const PathVertexVM *eye, const PathVertexVM *light, const float factor,
         const float pdf, const float geometry, const float filmX, const float filmY,
@@ -1731,6 +3361,68 @@ void MLHeroRoughGlass15gfReport(bool fromLight, bool transmit,
         sampleWeight, evaluateWeight, ratio, cosFixed, cosSampled);
     fclose(f);
 }
+
+// 15ki BEGIN logger
+static void MLHeroRecordRoughPrecision15ki(const BSDF &bsdf,const Vector &worldSampled,
+        float samplePdf,float evaluatePdf) {
+    using namespace slg::mlhero15ki;
+    const Snapshot s=current;
+    if(!s.valid)return;
+    const unsigned c=(s.fromLight?2u:0u)+(s.transmit?1u:0u);
+    unsigned long long ticket=0;
+    int band=Select(c,samplePdf,evaluatePdf,ticket);
+    if(band<0) {
+        if(!s.precise15kl||!slg::mlhero15kl::SelectExtra(s.fromLight,samplePdf,evaluatePdf,ticket))return;
+        band=3; // 15kl extra frame records: 0.1% to below 1%, at most 16/side.
+    }
+    const slg::mlhero15kl::Frame precise(bsdf.GetFrame());
+    const auto roundTripPrecise=s.precise15kl?precise.ToLocal(worldSampled):
+        slg::mlhero15kk::V(bsdf.GetFrame().ToLocal(worldSampled));
+    const Vector roundTrip(roundTripPrecise.x,roundTripPrecise.y,roundTripPrecise.z);
+    const Comparison q=MLHeroCompareRoughGlass15ki(bsdf.hitPoint,roundTripPrecise);
+    const Vector wh(s.wh.x,s.wh.y,s.wh.z);
+    const double sampleReferenceD=ReferenceZ(s.roughness,s.wh)*
+        SchlickDistribution_SchlickA(wh,s.anisotropy)*INV_PI;
+    const double sampleReference=s.sampleD>0.f?s.samplePdf*sampleReferenceD/s.sampleD:0.;
+    const double localReference=q.local.d>0.?q.localPdf*q.local.referenceD/q.local.d:0.;
+    const double roundReference=q.roundTrip.d>0.?q.roundTripPdf*q.roundTrip.referenceD/q.roundTrip.d:0.;
+    std::lock_guard<std::recursive_mutex> guard(mlHeroDebugLogMutex);
+    FILE *f=MLHeroOpenAnyLog15gj("a");if(!f)return;
+    fprintf(f,"phase15ki ROUGH_PDF_PRECISION case=%u band=%d ticket=%llu side=%s event=%s materialID=%u vndf=%u fresnelImportance=%u nc=%.12g nt=%.12g roughnessProduct=%.12g anisotropy=%.12g samplePdf=%.12g nativeSamplePdf=%.12g originalLocalQueryPdf=%.12g roundTripQueryPdf=%.12g bsdfEvaluatePdf=%.12g nativeRel=%.12g roundTripRel=%.12g totalRel=%.12g referenceNativeRel=%.12g referenceTotalRel=%.12g diagnosticOnly=1\n",
+        c,band,ticket,s.fromLight?"LIGHT":"EYE",s.transmit?"TRANSMIT":"REFLECT",bsdf.GetMaterialID(),
+        s.vndf?1u:0u,s.importance?1u:0u,s.nc,s.nt,s.roughness,s.anisotropy,
+        samplePdf,s.samplePdf,q.localPdf,q.roundTripPdf,evaluatePdf,
+        Relative(s.samplePdf,q.localPdf),Relative(q.localPdf,q.roundTripPdf),Relative(samplePdf,evaluatePdf),
+        Relative(sampleReference,localReference),Relative(sampleReference,roundReference));
+    fprintf(f,"phase15ki ROUGH_SAMPLE_FACTORS case=%u band=%d ticket=%llu fixed=(%.12g,%.12g,%.12g) sampled=(%.12g,%.12g,%.12g) roundTrip=(%.12g,%.12g,%.12g) sampledWh=(%.12g,%.12g,%.12g) D=%.12g referenceD=%.12g specPdf=%.12g probability=%.12g referencePdf=%.12g\n",
+        c,band,ticket,s.fixed.x,s.fixed.y,s.fixed.z,s.sampled.x,s.sampled.y,s.sampled.z,
+        roundTrip.x,roundTrip.y,roundTrip.z,s.wh.x,s.wh.y,s.wh.z,
+        s.sampleD,sampleReferenceD,s.sampleSpecPdf,s.probability,sampleReference);
+    if(s.transmit) {
+        const auto &a=q.sampledAngles,&b=q.local.angles,&c=q.roundTrip.angles;
+        fprintf(f,"phase15kj CRITICAL_ANGLE_PROBE case=%u band=%d ticket=%llu fixedNorm2=%.17g sampleWhNorm2=%.17g normalizedCosSample=%.17g normalizedCosLocal=%.17g normalizedCosRoundTrip=%.17g snellDiscriminantSample=%.17g snellDiscriminantLocal=%.17g snellDiscriminantRoundTrip=%.17g nativeSampleProbability=%.12g nativeLocalProbability=%.12g nativeRoundTripProbability=%.12g normalizedDoubleTransmissionSample=%.17g normalizedDoubleTransmissionLocal=%.17g normalizedDoubleTransmissionRoundTrip=%.17g referenceOnly=1\n",
+            (s.fromLight?2u:0u)+1u,band,ticket,a.fixedNorm,a.normalNorm,a.cosine,b.cosine,c.cosine,
+            a.discriminant,b.discriminant,c.discriminant,s.probability,q.local.probability,q.roundTrip.probability,
+            a.transmission,b.transmission,c.transmission);
+    }
+    for(unsigned k=0;k<2;++k){
+        const auto &a=k?q.roundTrip:q.local;
+        fprintf(f,"phase15ki ROUGH_QUERY_FACTORS case=%u band=%d ticket=%llu stage=%s reconstructedWh=(%.12g,%.12g,%.12g) D=%.12g referenceD=%.12g specPdf=%.12g probability=%.12g jacobian=%.12g factorizedPdf=%.12g queriedPdf=%.12g referencePdf=%.12g\n",
+            c,band,ticket,k?"WORLD_ROUND_TRIP":"ORIGINAL_LOCAL",a.wh.x,a.wh.y,a.wh.z,
+            a.d,a.referenceD,a.specPdf,a.probability,a.jacobian,a.pdf,k?q.roundTripPdf:q.localPdf,
+            k?roundReference:localReference);
+    }
+    if(s.precise15kl) {
+        const auto w=precise.ToWorld(s.sampledPrecise15kl),r=roundTripPrecise,l=s.sampledPrecise15kl;
+        fprintf(f,"phase15kl FRAME_PRECISION case=%u band=%d ticket=%llu localPrecise=(%.17g,%.17g,%.17g) roundTripPrecise=(%.17g,%.17g,%.17g) worldRounded=(%.17g,%.17g,%.17g) worldRounding=(%.17g,%.17g,%.17g) basisX=(%.17g,%.17g,%.17g) basisY=(%.17g,%.17g,%.17g) basisZ=(%.17g,%.17g,%.17g) fixedPrecise=(%.17g,%.17g,%.17g) finalRayPrecision=FLOAT diagnosticOnly=1\n",
+            c,band,ticket,l.x,l.y,l.z,r.x,r.y,r.z,double(worldSampled.x),double(worldSampled.y),double(worldSampled.z),
+            double(worldSampled.x)-w.x,double(worldSampled.y)-w.y,double(worldSampled.z)-w.z,
+            precise.x.x,precise.x.y,precise.x.z,precise.y.x,precise.y.y,precise.y.z,precise.z.x,precise.z.y,precise.z.z,
+            s.fixedPrecise15kl.x,s.fixedPrecise15kl.y,s.fixedPrecise15kl.z);
+    }
+    fclose(f);
+}
+// 15ki END logger
 
 static inline FILE *MLHeroOpenCurrentLog15cq(const char *mode) {
     return MLHeroCurrentDiagnosticsEnabled15cq() ? MLHeroOpenAnyLog15gj(mode) : nullptr;
@@ -3408,12 +5100,20 @@ void BiDirCPURenderThread::AOVWarmUp(
 			Vector sampledDir;
 			float cosSampledDir, lastPdfW;
 			BSDFEvent lastBSDFEvent;
+            // 15je: arm native Child audit ONLY for bounded production parent calls.
+            const bool arm15je = MLHeroCurrentDiagnosticsEnabled15cq() &&
+                bsdf.GetMaterialType() == GLASS &&
+                (mlHeroNativeGlassChildReservations15je[bsdf.hitPoint.fromLight ? 1u : 0u]
+                    .fetch_add(1ull, std::memory_order_relaxed) < 64ull);
+            MLHeroSetNativeGlassChildArmed15je(arm15je);
 			const Spectrum bsdfSample = bsdf.Sample(&sampledDir,
 						sampler.GetSample(sampleOffset + 1),
 						sampler.GetSample(sampleOffset + 2),
 						&lastPdfW, &cosSampledDir, &lastBSDFEvent);
+            MLHeroSetNativeGlassChildArmed15je(false);
 
 			assert (!bsdfSample.IsNaN() && !bsdfSample.IsInf());
+			MLHeroGlassSampleAudit15ih(bsdf, bsdfSample, lastBSDFEvent, lastPdfW, cosSampledDir);
 			if (bsdfSample.Black())
 				break;
 			assert (!isnan(lastPdfW) && !isinf(lastPdfW));
@@ -3656,6 +5356,9 @@ void BiDirCPURenderThread::ConnectVertices(const float time,
 					(misVmWeightFactor + eyeVertex.dVCM + eyeVertex.dVC * MIS(eyeBsdfRevPdfW));
 
 				const float misWeight = 1.f / (lightWeight + 1.f + eyeWeight);
+                if(engine->GetType()==slg::BIDIRCPU && engine->mlHeroEnabled && MLHeroCurrentDiagnosticsEnabled15cq())MLHeroPathConnection15kq(eyeVertex,lightVertex,p2pDistance,
+                    cosThetaAtCamera,cosThetaAtLight,eyeBsdfPdfW,eyeBsdfRevPdfW,lightBsdfPdfW,lightBsdfRevPdfW,
+                    eyeBsdfPdfA,lightBsdfPdfA,misWeight);
                 if(mlHeroState15fh.enabled) MLHeroCandidate15fn(0u,eyeVertex.depth,lightVertex.depth,
                     eyeVertex.bsdf.GetMaterialType(),misWeight,
                     MLHeroConnectionWeight15fn(PdfWtoA(rawEyeForward15fn,p2pDistance,cosThetaAtLight),
@@ -5015,6 +6718,118 @@ void BiDirCPURenderThread::DirectLightSampling(const float time,
 	}
 }
 
+// 15kf: diagnose the actual DirectHitLight MIS and final contribution. No fix.
+static std::atomic<unsigned long long> mlHero15kfEvents[3];
+static std::atomic<unsigned long long> mlHero15kfDetails[3];
+static std::atomic<unsigned long long> mlHero15kfZeroHistoryRecovered[3];
+static const char *MLHeroDirectHitStage15kf(unsigned stage) {
+    return stage == 0u ? "MIS" : (stage == 1u ? "SPECTRAL_RESULT" : "RGB_RESULT");
+}
+static void MLHeroDirectHitAudit15kf(unsigned stage, const PathVertexVM &eye,
+        const Spectrum &lightRadiance, float directPdfA, float emissionPdfW,
+        float lightPickPdf, float weightCamera, float misWeight,
+        bool competitorApplicable, const Spectrum *contribution,
+        const LightSource *sourceLight = nullptr) {
+    if (!MLHeroCurrentDiagnosticsEnabled15cq()) return;
+    const bool contributionFinite = !contribution || MLHeroFinite15ew(*contribution);
+    if (std::isfinite(weightCamera) && std::isfinite(misWeight) && contributionFinite) return;
+    mlHero15kfEvents[stage].fetch_add(1ull, std::memory_order_relaxed);
+    const auto terms = slg::mlhero15kf::Analyze(directPdfA, emissionPdfW,
+        lightPickPdf, competitorApplicable ? eye.dVCM : 0.f,
+        competitorApplicable ? eye.dVC : 0.f, weightCamera, misWeight);
+    if (competitorApplicable && terms.candidateRecoversNonfiniteMIS)
+        mlHero15kfZeroHistoryRecovered[stage].fetch_add(1ull, std::memory_order_relaxed);
+    const auto ticket = mlHero15kfDetails[stage].fetch_add(1ull, std::memory_order_relaxed);
+    if (ticket >= slg::mlhero15kf::DetailBudgetPerStage) return;
+    std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
+    FILE *f = MLHeroOpenCurrentLog15cq("a");
+    if (!f) return;
+    const char *reason = competitorApplicable ?
+        slg::mlhero15kf::Reason(terms, weightCamera, misWeight, contributionFinite) :
+        "PRIMARY_NONFINITE_CONTRIBUTION";
+    fprintf(f, "phase15kf DIRECT_HIT_DETAIL stage=%s detail=%llu reason=%s "
+        "thread=%u sample=%u filmX=%.9g filmY=%.9g depth=%u "
+        "parentSelected=%u parentPath=%llu competitorApplicable=%u "
+        "lightRGB=(%.9g,%.9g,%.9g) directPdfA=%.12g emissionPdfW=%.12g lightPickPdf=%.12g "
+        "dVCM=%.12g dVC=%.12g actualWeightCamera=%.12g actualMIS=%.12g "
+        "contributionPresent=%u contributionFinite=%u contributionRGB=(%.9g,%.9g,%.9g)\n",
+        MLHeroDirectHitStage15kf(stage), ticket, reason, mlHeroThread15fw, mlHeroStep15fw,
+        mlHeroFilmX15fw, mlHeroFilmY15fw, eye.depth,
+        eye.mlHeroParentHistory15ke.selected ? 1u : 0u, eye.mlHeroParentHistory15ke.ticket,
+        competitorApplicable ? 1u : 0u, lightRadiance.c[0], lightRadiance.c[1], lightRadiance.c[2],
+        directPdfA, emissionPdfW, lightPickPdf, eye.dVCM, eye.dVC, weightCamera, misWeight,
+        contribution ? 1u : 0u, contributionFinite ? 1u : 0u,
+        contribution ? contribution->c[0] : 0.f, contribution ? contribution->c[1] : 0.f,
+        contribution ? contribution->c[2] : 0.f);
+    fprintf(f, "phase15kf DIRECT_HIT_TERMS stage=%s detail=%llu "
+        "inputsFinite=%u directProduct=%.12g directSquare=%.12g directTerm=%.12g "
+        "emissionProduct=%.12g emissionSquare=%.12g emissionTerm=%.12g "
+        "directInfTimesZero=%u emissionInfTimesZero=%u reconstructedWeight=%.12g "
+        "reconstructionMatchesActual=%u zeroHistoryCandidateWeight=%.12g "
+        "zeroHistoryCandidateMIS=%.12g candidateRecoversNonfiniteMIS=%u "
+        "doubleDirectTerm=%.17g doubleEmissionTerm=%.17g doubleWeight=%.17g "
+        "doubleMIS=%.17g candidateApplied=0\n",
+        MLHeroDirectHitStage15kf(stage), ticket, terms.inputsFinite ? 1u : 0u,
+        terms.directProduct, terms.directSquare, terms.directTerm,
+        terms.emissionProduct, terms.emissionSquare, terms.emissionTerm,
+        terms.directInfTimesZero ? 1u : 0u, terms.emissionInfTimesZero ? 1u : 0u,
+        terms.reconstructedWeight, terms.reconstructedMatchesActual ? 1u : 0u,
+        terms.zeroHistoryCandidateWeight, terms.zeroHistoryCandidateMIS,
+        terms.candidateRecoversNonfiniteMIS ? 1u : 0u, terms.directReference,
+        terms.emissionReference, terms.doubleWeight, terms.doubleMIS);
+
+    const auto &source15kg=slg::mlhero15kg::current;
+    const bool matched15kg=competitorApplicable && slg::mlhero15kg::Matches(source15kg,
+        static_cast<const void *>(sourceLight),directPdfA,emissionPdfW);
+    fprintf(f, "phase15kg EMISSION_PDF_SOURCE stage=%s detail=%llu matched=%u cause=%s "
+        "captureValid=%u branch=%s meshIndex=%u triangleIndex=%u "
+        "triangleArea=%.12g invTriangleArea=%.12g meshArea=%.12g invMeshArea=%.12g "
+        "emittedThetaDegrees=%.12g cosThetaMax=%.12g cosOutLight=%.12g "
+        "hasEmissionProfile=%u directWritten=%u emissionWritten=%u "
+        "sourceDirectPdfA=%.12g sourceEmissionPdfW=%.12g functionPdfObserved=%u\n",
+        MLHeroDirectHitStage15kf(stage),ticket,matched15kg?1u:0u,
+        matched15kg && source15kg.functionPdfObserved && source15kg.denominator==0. &&
+            source15kg.functionPdf==0.f ? "POLAR_ZERO_DENSITY_GUARD" :
+            slg::mlhero15kg::Cause(source15kg,matched15kg),source15kg.valid?1u:0u,
+        slg::mlhero15kg::BranchName(source15kg.branch),source15kg.meshIndex,source15kg.triangleIndex,
+        source15kg.triangleArea,source15kg.inverseTriangleArea,source15kg.meshArea,source15kg.inverseMeshArea,
+        source15kg.emittedTheta,source15kg.cosThetaMax,source15kg.cosOutLight,
+        source15kg.emissionFunction?1u:0u,source15kg.directWritten?1u:0u,source15kg.emissionWritten?1u:0u,
+        source15kg.directPdfA,source15kg.emissionPdfW,source15kg.functionPdfObserved?1u:0u);
+    if (matched15kg && source15kg.functionPdfObserved) {
+        fprintf(f, "phase15kg SPHERICAL_PDF stage=%s detail=%llu localDir=(%.12g,%.12g,%.12g) "
+            "thetaRadians=%.12g phiRadians=%.12g sinTheta=%.12g uv=(%.12g,%.12g) "
+            "distributionPdf=%.12g denominator=%.17g nativeFunctionPdf=%.12g "
+            "denominatorZero=%u numeratorFinite=%u nativeFunctionPdfFinite=%u\n",
+            MLHeroDirectHitStage15kf(stage),ticket,source15kg.localX,source15kg.localY,source15kg.localZ,
+            source15kg.theta,source15kg.phi,source15kg.sinTheta,source15kg.u,source15kg.v,
+            source15kg.distributionPdf,source15kg.denominator,source15kg.functionPdf,
+            source15kg.denominator==0.?1u:0u,std::isfinite(source15kg.distributionPdf)?1u:0u,
+            std::isfinite(source15kg.functionPdf)?1u:0u);
+    }
+    MLHeroVertex15ew(f, "EYE", &eye);
+    // Reconstruct only on a bounded anomaly. These are pure functions of the
+    // already available RGB light and saved lane metadata, not texture queries.
+    if (stage == 1u) {
+        const RGBColor rgb(lightRadiance.c[0], lightRadiance.c[1], lightRadiance.c[2]);
+        for (unsigned lane=0u; lane<Min(eye.mlHeroLaneCount,8u); ++lane) {
+            const float lambda=eye.mlHeroLaneWaveLength[lane];
+            const float sw=eye.mlHeroLaneSampleWeight[lane];
+            const float tp=eye.mlHeroLaneThroughput[lane].c[0];
+            const float spd=MLHeroRGBIllumSample380_780(rgb,lambda);
+            const Spectrum cie=MLHeroCIEEstimatorColor(lambda,sw);
+            const float scalar=tp*spd*misWeight;
+            const Spectrum laneRGB=cie*scalar;
+            fprintf(f, "phase15kf DIRECT_HIT_LANE detail=%llu lane=%u lambda=%.9g sampleWeight=%.9g "
+                "eyeScalar=%.12g lightSPD=%.12g actualMIS=%.12g reconstructedScalar=%.12g "
+                "cieRGB=(%.9g,%.9g,%.9g) reconstructedLaneRGB=(%.9g,%.9g,%.9g) reconstructionOnly=1\n",
+                ticket,lane,lambda,sw,tp,spd,misWeight,scalar,
+                cie.c[0],cie.c[1],cie.c[2],laneRGB.c[0],laneRGB.c[1],laneRGB.c[2]);
+        }
+    }
+    fclose(f);
+}
+
 void BiDirCPURenderThread::DirectHitLight(
 	LightSourceConstRef light,
 	const Spectrum &lightRadiance,
@@ -5058,6 +6873,10 @@ void BiDirCPURenderThread::DirectHitLight(
 				eyeVertex.mlHeroSecondaryWavelengthsTerminated, false,
 				eyeVertex.mlHeroTerminationBrightnessRatio, 1.f);
 			MLHeroRecordWavelengthBias15bs(3u, 0u, eyeVertex, ciePacket);
+
+            if (MLHeroCurrentDiagnosticsEnabled15cq() && !MLHeroFinite15ew(ciePacket))
+                MLHeroDirectHitAudit15kf(1u, eyeVertex, lightRadiance,
+                    0.f, 0.f, 0.f, 0.f, 1.f, false, &ciePacket, &light);
 			MLHeroAddAudit15ew(*radiance, ciePacket, 4u, &eyeVertex);
 
 			static std::atomic<bool> mlHeroPhase15rDepth1Logged(false);
@@ -5137,6 +6956,10 @@ void BiDirCPURenderThread::DirectHitLight(
 				eyeVertex.mlHeroSecondaryWavelengthsTerminated, false,
 				eyeVertex.mlHeroTerminationBrightnessRatio, 1.f);
 			MLHeroRecordWavelengthBias15bs(3u, 0u, eyeVertex, mlHero15bjContribution);
+
+            if (MLHeroCurrentDiagnosticsEnabled15cq() && !MLHeroFinite15ew(mlHero15bjContribution))
+                MLHeroDirectHitAudit15kf(2u, eyeVertex, lightRadiance,
+                    0.f, 0.f, 0.f, 0.f, 1.f, false, &mlHero15bjContribution, &light);
 			MLHeroAddAudit15ew(*radiance, mlHero15bjContribution, 5u, &eyeVertex);
 		}
 
@@ -5157,6 +6980,11 @@ void BiDirCPURenderThread::DirectHitLight(
 	const float weightCamera = MIS(directPdfA * lightPickPdf) * eyeVertex.dVCM +
 		MIS(emissionPdfW * lightPickPdf) * eyeVertex.dVC;
 	const float misWeight = 1.f / (weightCamera + 1.f);
+    if (MLHeroCurrentDiagnosticsEnabled15cq() &&
+            (!std::isfinite(weightCamera) || !std::isfinite(misWeight)))
+        MLHeroDirectHitAudit15kf(0u, eyeVertex, lightRadiance, directPdfA,
+            emissionPdfW, lightPickPdf, weightCamera, misWeight, true, nullptr, &light);
+
 
 	// ML HERO phase 15bo: a direct-hit path whose eye subpath already crossed
 	// a perfect dispersive HERO-only event is compared against the upper bound
@@ -5198,6 +7026,10 @@ void BiDirCPURenderThread::DirectHitLight(
 			eyeVertex.mlHeroSecondaryWavelengthsTerminated, false,
 			eyeVertex.mlHeroTerminationBrightnessRatio, 1.f);
 		MLHeroRecordWavelengthBias15bs(3u, 0u, eyeVertex, ciePacket);
+        if (MLHeroCurrentDiagnosticsEnabled15cq() && !MLHeroFinite15ew(ciePacket))
+            MLHeroDirectHitAudit15kf(1u, eyeVertex, lightRadiance, directPdfA,
+                emissionPdfW, lightPickPdf, weightCamera, misWeight, true, &ciePacket, &light);
+
 		MLHeroAddAudit15ew(*radiance, ciePacket, 4u, &eyeVertex);
 
 		static std::atomic<bool> mlHeroPhase15rLogged(false);
@@ -5281,6 +7113,10 @@ void BiDirCPURenderThread::DirectHitLight(
 			eyeVertex.mlHeroSecondaryWavelengthsTerminated, false,
 			eyeVertex.mlHeroTerminationBrightnessRatio, 1.f);
 		MLHeroRecordWavelengthBias15bs(3u, 0u, eyeVertex, mlHero15bjContribution);
+        if (MLHeroCurrentDiagnosticsEnabled15cq() && !MLHeroFinite15ew(mlHero15bjContribution))
+            MLHeroDirectHitAudit15kf(2u, eyeVertex, lightRadiance, directPdfA,
+                emissionPdfW, lightPickPdf, weightCamera, misWeight, true, &mlHero15bjContribution, &light);
+
 		MLHeroAddAudit15ew(*radiance, mlHero15bjContribution, 5u, &eyeVertex);
 	}
 
@@ -5320,6 +7156,177 @@ void BiDirCPURenderThread::DirectHitLight(
 	}
 }
 
+// 15ke: bounded linked observations of actual production parent bounces.
+// Every path owns its linkage state; copied light vertices retain that state.
+static std::atomic<unsigned long long> mlHero15keTickets[2];
+static std::atomic<unsigned long long> mlHero15keRecords[2], mlHero15keEnds[2];
+static std::atomic<unsigned long long> mlHero15keGaps[2], mlHero15keInvalid[2];
+static std::atomic<unsigned long long> mlHero15keTruncated[2], mlHero15keMixed[2];
+static std::atomic<unsigned long long> mlHero15keWriteFailures[2];
+
+static const char *MLHeroMaterialLabel15ke(const PathVertexVM &v) {
+    if (v.bsdf.IsVolume()) return "VOLUME";
+    switch (v.bsdf.GetMaterialType()) {
+        case MATTE: return "MATTE";
+        case GLASS: return "GLASS";
+        case ROUGHGLASS: return "ROUGHGLASS";
+        case MIRROR: return "MIRROR";
+        case METAL2: return "METAL2";
+        case GLOSSY2: return "GLOSSY2";
+        case MATTETRANSLUCENT: return "MATTETRANSLUCENT";
+        default: return "OTHER";
+    }
+}
+
+class MLHeroParentBounce15ke {
+    PathVertexVM &vertex;
+    slg::mlhero15ke::Record record;
+    bool enabled;
+    unsigned side;
+public:
+    MLHeroParentBounce15ke(PathVertexVM &v, bool on) : vertex(v), enabled(on),
+            side(on && v.bsdf.hitPoint.fromLight ? 1u : 0u) {
+        if (!enabled) return;
+        auto &s = vertex.mlHeroParentHistory15ke;
+        if (!s.initialized) {
+            s = slg::mlhero15ke::State(); s.initialized = true;
+            // After quota exhaustion, avoid an atomic increment on every path.
+            if (mlHero15keTickets[side].load(std::memory_order_relaxed) < slg::mlhero15ke::PathBudget) {
+                s.ticket = mlHero15keTickets[side].fetch_add(1ull, std::memory_order_relaxed);
+                s.selected = s.ticket < slg::mlhero15ke::PathBudget;
+            }
+            if (s.selected) {
+                std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
+                FILE *f = MLHeroOpenCurrentLog15cq("a");
+                if (f) {
+                    fprintf(f, "phase15ke PARENT_PATH_BEGIN side=%s path=%llu thread=%u sample=%u "
+                        "originDepth=%u sourceEndpoint=UNAVAILABLE nativeParentOnly=1\n",
+                        side ? "LIGHT" : "EYE", s.ticket, mlHeroThread15fw, mlHeroStep15fw, vertex.depth);
+                    fclose(f);
+                } else {
+                    s.writeFailed = true;
+                    mlHero15keWriteFailures[side].fetch_add(1ull, std::memory_order_relaxed);
+                }
+            }
+        }
+        enabled = s.selected;
+        if (!enabled) return;
+        record.depth = vertex.depth;
+        record.material = static_cast<unsigned>(vertex.bsdf.GetMaterialType());
+    }
+    void Sample(const BSDFEvent event, float pdf, float cosine) {
+        if(vertex.mlHeroPathFactors15kq.selected){
+            auto &a=vertex.mlHeroPathFactors15kq;
+            a.Sample((event&SPECULAR)!=0,pdf);
+            a.SampleContext((unsigned)vertex.bsdf.GetMaterialType(),(unsigned)event,vertex.bsdf.IsVolume(),vertex.bsdf.GetMaterialType()==GLASS);
+            if(vertex.bsdf.GetMaterialType()==GLASS){
+                unsigned valid=0,reflection=0,transmission=0,black=0;
+                float reflectionFilter=0.f,transmissionFilter=0.f,threshold=0.f,passThrough=0.f;
+                if(GetMLHeroNativeLobe15ir(&valid,&reflection,&transmission,&black,
+                        &reflectionFilter,&transmissionFilter,&threshold,&passThrough)&&valid&&!black){
+                    const bool tx=(event&TRANSMIT)!=0,rx=(event&REFLECT)!=0;
+                    if(tx!=rx&&((tx&&transmission)||(rx&&reflection)))
+                        a.NativeGlass(threshold,tx?threshold:1.f-threshold);
+                }
+            }
+        }
+        if (enabled) record.Sample(static_cast<unsigned>(event), (event & SPECULAR) != 0, pdf, cosine);
+    }
+    void Black() { if (enabled) record.outcome = "BLACK_SAMPLE"; }
+    void Reverse(float pdf) {
+        if(vertex.mlHeroPathFactors15kq.selected)vertex.mlHeroPathFactors15kq.Reverse(pdf);
+        if (enabled) record.Reverse(pdf);
+    }
+    void Roulette(float q, bool killed) {
+        if(vertex.mlHeroPathFactors15kq.selected)vertex.mlHeroPathFactors15kq.Roulette(q,killed);
+        if (enabled) record.Roulette(q, killed);
+    }
+    void Accept() {
+        if(vertex.mlHeroPathFactors15kq.selected)vertex.mlHeroPathFactors15kq.Accept();
+        if (enabled) record.Accept();
+    }
+    ~MLHeroParentBounce15ke() {
+        if (!enabled) return;
+        auto &s = vertex.mlHeroParentHistory15ke;
+        if (s.records >= slg::mlhero15ke::StepBudget) {
+            if (!s.truncated) {
+                s.truncated = true;
+                mlHero15keTruncated[side].fetch_add(1ull, std::memory_order_relaxed);
+                std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
+                FILE *f = MLHeroOpenCurrentLog15cq("a");
+                if (f) {
+                    fprintf(f, "phase15ke PARENT_PATH_TRUNCATED side=%s path=%llu nextDepth=%u limit=%u\n",
+                        side ? "LIGHT" : "EYE", s.ticket, record.depth, slg::mlhero15ke::StepBudget);
+                    fclose(f);
+                } else {
+                    s.writeFailed = true;
+                    mlHero15keWriteFailures[side].fetch_add(1ull, std::memory_order_relaxed);
+                }
+            }
+            return;
+        }
+        const unsigned previousDepth = s.lastDepth;
+        const bool linked = s.Advance(record);
+        const bool typed = record.TypedChecksPass();
+        mlHero15keRecords[side].fetch_add(1ull, std::memory_order_relaxed);
+        if (!linked) mlHero15keGaps[side].fetch_add(1ull, std::memory_order_relaxed);
+        if (!typed) mlHero15keInvalid[side].fetch_add(1ull, std::memory_order_relaxed);
+        std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
+        FILE *f = MLHeroOpenCurrentLog15cq("a");
+        if (!f) {
+            s.writeFailed = true;
+            mlHero15keWriteFailures[side].fetch_add(1ull, std::memory_order_relaxed);
+            return;
+        }
+        fprintf(f, "phase15ke PARENT_PATH_STEP side=%s path=%llu seq=%u thread=%u sample=%u "
+            "depth=%u previousDepth=%u linked=%u material=%s materialType=%u volume=%u "
+            "event=%u sampled=%u accepted=%u outcome=%s delta=%u "
+            "sampleMeasure=%s samplePdf=%.12g reverseMeasure=%s reversePdf=%.12g "
+            "nativeReverseObserved=%u nativeReverseScalar=%.12g "
+            "rrApplied=%u rrSurvival=%.12g rrKilled=%u cosine=%.12g "
+            "heroLambda=%.9g laneCount=%u typedChecksPass=%u\n",
+            side ? "LIGHT" : "EYE", s.ticket, s.records, mlHeroThread15fw, mlHeroStep15fw,
+            record.depth, previousDepth, linked ? 1u : 0u,
+            MLHeroMaterialLabel15ke(vertex), record.material, vertex.bsdf.IsVolume() ? 1u : 0u,
+            record.event, record.sampled ? 1u : 0u, record.accepted ? 1u : 0u, record.outcome,
+            record.delta ? 1u : 0u, slg::mlhero15ke::MeasureName(record.sampleMeasure), record.samplePdf,
+            slg::mlhero15ke::MeasureName(record.reverseMeasure), record.queriedReversePdf,
+            record.reverseObserved ? 1u : 0u, record.nativeReverseScalar,
+            record.rrApplied ? 1u : 0u, record.rrProbability, record.rrKilled ? 1u : 0u, record.cosine,
+            vertex.mlHeroLaneCount ? vertex.mlHeroLaneWaveLength[0] : -1.f,
+            vertex.mlHeroLaneCount, typed ? 1u : 0u);
+        fclose(f);
+    }
+};
+
+// Only the original local eye/light path owns this guard; vertex copies do not
+// emit duplicate end records. A trace-loop exit need not be a BSDF rejection.
+class MLHeroParentPathEnd15ke {
+    PathVertexVM &vertex;
+    unsigned side;
+public:
+    MLHeroParentPathEnd15ke(PathVertexVM &v, unsigned s) : vertex(v), side(s) { }
+    ~MLHeroParentPathEnd15ke() {
+        auto &s = vertex.mlHeroParentHistory15ke;
+        if (!s.initialized || !s.selected) return;
+        mlHero15keEnds[side].fetch_add(1ull, std::memory_order_relaxed);
+        if (s.mixedMaterials) mlHero15keMixed[side].fetch_add(1ull, std::memory_order_relaxed);
+        std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
+        FILE *f = MLHeroOpenCurrentLog15cq("a");
+        if (!f) {
+            mlHero15keWriteFailures[side].fetch_add(1ull, std::memory_order_relaxed);
+            return;
+        }
+        fprintf(f, "phase15ke PARENT_PATH_END side=%s path=%llu records=%u acceptedBounces=%u "
+            "lastDepth=%u contiguous=%u mixedMaterials=%u truncated=%u priorWriteFailed=%u "
+            "endReason=TRACE_SCOPE_EXIT completeBounceHistory=%u fullPathPdf=UNAVAILABLE\n",
+            side ? "LIGHT" : "EYE", s.ticket, s.records, s.acceptedBounces, s.lastDepth,
+            s.contiguous ? 1u : 0u, s.mixedMaterials ? 1u : 0u, s.truncated ? 1u : 0u,
+            s.writeFailed ? 1u : 0u, s.contiguous && !s.truncated && !s.writeFailed ? 1u : 0u);
+        fclose(f);
+    }
+};
+
 bool BiDirCPURenderThread::TraceLightPath(const float time,
 		const SamplerUPtr& sampler, CameraConstRef camera,
 		vector<PathVertexVM> &lightPathVertices,
@@ -5337,6 +7344,7 @@ bool BiDirCPURenderThread::TraceLightPath(const float time,
 
 	// Initialize the light path
 	PathVertexVM lightVertex;
+    MLHeroParentPathEnd15ke endLight15ke(lightVertex, 1u);
 	lightVertex.lightID = light->GetID();
 	
 	float lightEmitPdfW, lightDirectPdfW, cosThetaAtLight;
@@ -5355,6 +7363,8 @@ bool BiDirCPURenderThread::TraceLightPath(const float time,
 		const Spectrum mlHeroRawLightEmit = lightVertex.throughput;
 		const float mlHeroRawEmitPdfW = lightEmitPdfW;
 		const float mlHeroRawDirectPdfW = lightDirectPdfW;
+        if(engine->GetType()==slg::BIDIRCPU && engine->mlHeroEnabled && MLHeroCurrentDiagnosticsEnabled15cq())MLHeroPathStart15kq(lightVertex,1u,lightRay.o,
+            lightEmitPdfW,lightDirectPdfW,lightPickPdf,(unsigned)light->GetType());
 
 		lightEmitPdfW *= lightPickPdf;
 		lightDirectPdfW *= lightPickPdf;
@@ -5426,6 +7436,7 @@ bool BiDirCPURenderThread::TraceLightPath(const float time,
 
 		// I don't store the light vertex 0 because direct lighting will take
 		// care of these kind of paths
+        const bool auditInit15km=engine->GetType()==slg::BIDIRCPU && MLHeroCurrentDiagnosticsEnabled15cq();
 		lightVertex.dVCM = MIS(lightDirectPdfW / lightEmitPdfW);
 		// If the light source is not intersectable, it can not be
 		// sampled with BSDF
@@ -5435,6 +7446,13 @@ bool BiDirCPURenderThread::TraceLightPath(const float time,
 		} else
 			lightVertex.dVC = 0.f;
 		lightVertex.dVM = lightVertex.dVC * misVcWeightFactor;
+        if(auditInit15km) {
+            slg::mlhero15km::Inputs i;i.forward=lightEmitPdfW;i.reverse=lightDirectPdfW;
+            i.cosine=light->IsEnvironmental()?1.f:cosThetaAtLight;i.vcFactor=misVcWeightFactor;
+            i.lightCompetitor=light->IsEnvironmental()||light->IsIntersectable();
+            i.sourceID=light->GetID();i.sourceType=(unsigned)light->GetType();
+            MLHeroMISTransition15km(slg::mlhero15km::LightInit,1u,{},lightVertex,i);
+        }
 
 		lightVertex.depth = 1;
 		while (lightVertex.depth <= engine->maxLightPathDepth) {
@@ -5463,13 +7481,38 @@ bool BiDirCPURenderThread::TraceLightPath(const float time,
 				// ML HERO phase 15j: trace scalar purity after the connection factor.
 				MLHeroLogLightScalarTrace(lightVertex, "after-connection");
 		
+                if(lightVertex.mlHeroPathFactors15kq.selected)MLHeroPathArrival15kq(lightVertex);
+                const bool auditGeometry15km=engine->GetType()==slg::BIDIRCPU && MLHeroCurrentDiagnosticsEnabled15cq();
+                const slg::mlhero15km::State beforeGeometry15km=auditGeometry15km?
+                    slg::mlhero15km::State(lightVertex.dVCM,lightVertex.dVC,lightVertex.dVM):slg::mlhero15km::State();
+                if(engine->GetType()==slg::BIDIRCPU && engine->mlHeroEnabled) {
+                    const slg::mlhero15kn::State a(lightVertex.dVCM,lightVertex.dVC,lightVertex.dVM);
+                    const double cosine=slg::mlhero15kn::AbsDot(lightVertex.bsdf.hitPoint.shadeN,lightRay.d);
+                    const bool distanceApplied=(lightVertex.depth>1)||!light->IsEnvironmental();
+                    const auto precise=slg::mlhero15kn::Geometry(a,cosine,nextEventRayHit.t,distanceApplied);
+                    const auto rounded=precise.Rounded();
+                    lightVertex.dVCM=rounded.cm;lightVertex.dVC=rounded.vc;lightVertex.dVM=rounded.vm;
+                    if(auditGeometry15km) {
+                        const float oldCosine=AbsDot(lightVertex.bsdf.hitPoint.shadeN,lightRay.d);
+                        const auto legacy=slg::mlhero15kn::LegacyGeometry(a,oldCosine,nextEventRayHit.t,distanceApplied,false);
+                        MLHeroMISPrecisionAudit15kn(slg::mlhero15kn::LightGeometry,lightVertex,a,legacy,precise,
+                            oldCosine,cosine,0.f,0.f,nextEventRayHit.t);
+                    }
+                } else {
 				// Infinite lights use MIS based on solid angle instead of area
 				if((lightVertex.depth > 1) || !light->IsEnvironmental())
 					lightVertex.dVCM *= MIS(nextEventRayHit.t * nextEventRayHit.t);
 				const float factor = 1.f / MIS(AbsDot(lightVertex.bsdf.hitPoint.shadeN, lightRay.d));
 				lightVertex.dVCM *= factor;
 				lightVertex.dVC *= factor;
-				lightVertex.dVM *= factor;
+				lightVertex.dVM *= factor;                }
+
+                if(auditGeometry15km) {
+                    slg::mlhero15km::Inputs i;i.cosine=AbsDot(lightVertex.bsdf.hitPoint.shadeN,lightRay.d);
+                    i.distance=nextEventRayHit.t;i.distanceApplied=(lightVertex.depth>1)||!light->IsEnvironmental();
+                    i.sourceID=light->GetID();i.sourceType=(unsigned)light->GetType();
+                    MLHeroMISTransition15km(slg::mlhero15km::LightGeometry,1u,beforeGeometry15km,lightVertex,i);
+                }
 
 				// Store the vertex only if it isn't specular
 				if (!lightVertex.bsdf.IsDelta()) {
@@ -5571,6 +7614,9 @@ static void MLHeroRRCandidate15fs(PathVertexVM *v, const Vector &direction,
 bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 		const u_int sampleOffset, PathVertexVM *pathVertex, Ray *nextEventRay) const {
 	BiDirCPURenderEngine *engine = (BiDirCPURenderEngine *)renderEngine;
+    MLHeroParentBounce15ke history15ke(*pathVertex,
+        engine->GetType() == BIDIRCPU && MLHeroCurrentDiagnosticsEnabled15cq());
+
 
 	// phase15bu: capture the surviving HERO throughput at the start of this bounce.
 	// The reference throughput is propagated with the exact same scalar transport
@@ -5596,10 +7642,102 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 	Vector sampledDir;
 	BSDFEvent &event = pathVertex->bsdfEvent;
 	float bsdfPdfW, cosSampledDir;
+    // 15je: reserve before the actual parent Sample so native child replay
+    // cannot spend tickets on unrelated GlassMaterial::Sample invocations.
+    const bool arm15je = MLHeroCurrentDiagnosticsEnabled15cq() &&
+        pathVertex->bsdf.GetMaterialType() == GLASS &&
+        (mlHeroNativeGlassChildReservations15je[pathVertex->bsdf.hitPoint.fromLight ? 1u : 0u]
+            .fetch_add(1ull, std::memory_order_relaxed) < 64ull);
+    MLHeroSetNativeGlassChildArmed15je(arm15je);
+    slg::mlhero15ki::Begin(MLHeroCurrentDiagnosticsEnabled15cq() &&
+        pathVertex->bsdf.GetMaterialType()==ROUGHGLASS);
+    const bool directionAudit15ko=engine->GetType()==slg::BIDIRCPU && engine->mlHeroEnabled && MLHeroCurrentDiagnosticsEnabled15cq();
+    slg::mlhero15ko::Begin(directionAudit15ko);
 	const Spectrum bsdfSample = pathVertex->bsdf.Sample(&sampledDir,
 			sampler->GetSample(sampleOffset),
 			sampler->GetSample(sampleOffset + 1),
 			&bsdfPdfW, &cosSampledDir, &event);
+    slg::mlhero15ko::armed=false;
+    slg::mlhero15ki::armed=false;
+    MLHeroSetNativeGlassChildArmed15je(false);
+    if (bsdfSample.Black()) history15ke.Black();
+    else history15ke.Sample(event, bsdfPdfW, cosSampledDir);
+    if(!bsdfSample.Black()&&engine->GetType()==slg::BIDIRCPU&&engine->mlHeroEnabled&&MLHeroCurrentDiagnosticsEnabled15cq())
+        MLHeroCaptureReverse15kt(*pathVertex,sampledDir,event,bsdfPdfW);
+    // Phase 15kb: observe the ACTUAL CPU BIDIR RoughGlass parent sample.
+    // Pdf() is only queried for continuous non-delta events; neither the
+    // sampling state nor the production MIS density is modified.
+    if (MLHeroCurrentDiagnosticsEnabled15cq() &&
+            pathVertex->bsdf.GetMaterialType() == ROUGHGLASS &&
+            !bsdfSample.Black() && !(event & SPECULAR)) {
+        const unsigned kbSide = pathVertex->bsdf.hitPoint.fromLight ? 1u : 0u;
+        const unsigned long long kbTicket =
+            mlHero15kbNativeRoughPdfTickets[kbSide].fetch_add(1ull, std::memory_order_relaxed);
+        if (kbTicket < 64ull) {
+            float kbForwardQueried = -1.f, kbReverseQueried = -1.f;
+            pathVertex->bsdf.Pdf(sampledDir, &kbForwardQueried, &kbReverseQueried);
+            const bool kbSampleValid = std::isfinite((double)bsdfPdfW) && bsdfPdfW > 0.f;
+            const bool kbForwardValid = std::isfinite((double)kbForwardQueried) && kbForwardQueried >= 0.f;
+            const bool kbReverseValid = std::isfinite((double)kbReverseQueried) && kbReverseQueried >= 0.f;
+            const double kbAbsDiff = kbSampleValid && kbForwardValid ?
+                fabs((double)bsdfPdfW - (double)kbForwardQueried) : -1.;
+            const double kbRelDiff = kbAbsDiff >= 0. ?
+                kbAbsDiff / Max(1e-12, Max(fabs((double)bsdfPdfW), fabs((double)kbForwardQueried))) : -1.;
+            const bool kbPass = kbSampleValid && kbForwardValid && kbReverseValid;
+            // 15kc: independently stored typed parent snapshot; no reuse as child PDF.
+            MLHeroParentPdfSnapshot15kc kcParent;
+            kcParent.Capture(bsdfPdfW, kbForwardQueried, kbReverseQueried);
+            const bool kcTypedPass = kcParent.IsInternallyConsistent();
+            const bool kcAvailabilityMatches15kb =
+                kcParent.sampleAvailable == kbSampleValid &&
+                kcParent.queryForwardAvailable == kbForwardValid &&
+                kcParent.queryReverseAvailable == kbReverseValid;
+            std::lock_guard<std::recursive_mutex> kbLock(mlHeroDebugLogMutex);
+            FILE *kbLog = MLHeroOpenAnyLog15gj("a");
+            if (kbLog) {
+                fprintf(kbLog,
+                    "phase15kb NATIVE_ROUGHGLASS_PARENT_PDF side=%s ticket=%llu "
+                    "source=PRODUCTION_PARENT_BSDF_SAMPLE materialID=%u "
+                    "sampledEvent=%u continuousNonDelta=1 "
+                    "sampleForwardPdfW=%.12g queryForwardPdfW=%.12g queryReversePdfW=%.12g "
+                    "sampleForwardValid=%u queryForwardValid=%u queryReverseValid=%u "
+                    "forwardAbsDifference=%.12g forwardRelDifference=%.12g "
+                    "pdfValuesFiniteAndAvailable=%u forwardReverseMeasure=SOLID_ANGLE "
+                    "sampleQueryAgreementNotAssumed=1 "
+                    "childSpecificPdf=UNAVAILABLE childPrefix=UNAVAILABLE "
+                    "fullJointMISReady=0 physicalChildRays=0 physicsChanged=0 misChanged=0 rrChanged=0\n",
+                    kbSide ? "LIGHT" : "EYE", kbTicket,
+                    pathVertex->bsdf.GetMaterialID(), (unsigned)event,
+                    (double)bsdfPdfW, (double)kbForwardQueried, (double)kbReverseQueried,
+                    kbSampleValid ? 1u : 0u, kbForwardValid ? 1u : 0u,
+                    kbReverseValid ? 1u : 0u, kbAbsDiff, kbRelDiff, kbPass ? 1u : 0u);
+                fprintf(kbLog,
+                    "phase15kc TYPED_PARENT_PDF_REFERENCE side=%s ticket=%llu depth=%u "
+                    "source=PRODUCTION_PARENT_BSDF_SAMPLE material=ROUGHGLASS event=%u "
+                    "scope=SINGLE_BOUNCE_SNAPSHOT storage=VALUE_OWNED "
+                    "sampleMeasure=%s forwardMeasure=%s reverseMeasure=%s "
+                    "sampleAvailable=%u forwardAvailable=%u reverseAvailable=%u "
+                    "samplePdfW=%.12g forwardPdfW=%.12g reversePdfW=%.12g "
+                    "typedChecksPass=%u availabilityMatches15kb=%u "
+                    "parentPathPrefix=UNAVAILABLE parentPathJointPdf=UNAVAILABLE "
+                    "childPdf=UNAVAILABLE childPathPdf=UNAVAILABLE "
+                    "reversePathState=UNVALIDATED rrFactor=UNAVAILABLE "
+                    "geometryJacobian=UNAVAILABLE connectionStrategy=UNAVAILABLE "
+                    "physicalChildRays=0 physicsChanged=0 misChanged=0 rrChanged=0\n",
+                    kbSide ? "LIGHT" : "EYE", kbTicket, pathVertex->depth, (unsigned)event,
+                    kcParent.sampleAvailable ? "SOLID_ANGLE" : "UNAVAILABLE",
+                    kcParent.queryForwardAvailable ? "SOLID_ANGLE" : "UNAVAILABLE",
+                    kcParent.queryReverseAvailable ? "SOLID_ANGLE" : "UNAVAILABLE",
+                    kcParent.sampleAvailable ? 1u : 0u,
+                    kcParent.queryForwardAvailable ? 1u : 0u,
+                    kcParent.queryReverseAvailable ? 1u : 0u,
+                    kcParent.sampleForward, kcParent.queryForward, kcParent.queryReverse,
+                    kcTypedPass ? 1u : 0u, kcAvailabilityMatches15kb ? 1u : 0u);
+                fclose(kbLog);
+            }
+        }
+    }
+	MLHeroGlassSampleAudit15ih(pathVertex->bsdf, bsdfSample, event, bsdfPdfW, cosSampledDir);
 	if (bsdfSample.Black())
 		return false;
 
@@ -5626,14 +7764,37 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 			const bool eventMatches15ct =
 				((event & REFLECT) == (evalEvent15ct & REFLECT)) &&
 				((event & TRANSMIT) == (evalEvent15ct & TRANSMIT));
-			if (!eventMatches15ct)
+			if (!eventMatches15ct) {
 				mlHero15ctRoughGlassEventMismatch[case15ct].fetch_add(1ull, std::memory_order_relaxed);
+				if (MLHeroCurrentHeavyDiagnosticsEnabled15cq()) {
+					const unsigned int detail15ct = mlHero15ctMismatchDetails[case15ct].fetch_add(1u, std::memory_order_relaxed);
+					if (detail15ct < 16u) {
+						std::lock_guard<std::recursive_mutex> mismatchLock15ct(mlHeroDebugLogMutex);
+						FILE *mismatchLog15ct = MLHeroOpenAnyLog15gj("a");
+						if (mismatchLog15ct) {
+							fprintf(mismatchLog15ct,
+								"phase15ct EVENT_MISMATCH_DETAIL ticket=%u case=%u side=%s sampledEvent=%u evaluatedEvent=%u sampledReflect=%u sampledTransmit=%u evalReflect=%u evalTransmit=%u samplePdf=%.9g evaluatePdf=%.9g sampleRGB=(%.9g,%.9g,%.9g) evaluateRGB=(%.9g,%.9g,%.9g) sampledDir=(%.9g,%.9g,%.9g) materialID=%u name=\"%s\" diagnosticOnly=1\n",
+								detail15ct, case15ct, fromLight15ct ? "LIGHT" : "EYE",
+								(unsigned int)event, (unsigned int)evalEvent15ct,
+								(event & REFLECT) ? 1u : 0u, (event & TRANSMIT) ? 1u : 0u,
+								(evalEvent15ct & REFLECT) ? 1u : 0u, (evalEvent15ct & TRANSMIT) ? 1u : 0u,
+								bsdfPdfW, evalPdf15ct,
+								bsdfSample.c[0], bsdfSample.c[1], bsdfSample.c[2],
+								eval15ct.c[0], eval15ct.c[1], eval15ct.c[2],
+								sampledDir.x, sampledDir.y, sampledDir.z,
+								pathVertex->bsdf.GetMaterialID(), pathVertex->bsdf.GetMaterialName().c_str());
+							fclose(mismatchLog15ct);
+						}
+					}
+				}
+			}
 
 			const double pdfDen15ct = Max(1e-12, Max(fabs((double)bsdfPdfW), fabs((double)evalPdf15ct)));
 			const double pdfRelErr15ct = fabs((double)bsdfPdfW - (double)evalPdf15ct) / pdfDen15ct;
 			mlHero15ctRoughGlassPdfRelErrSum[case15ct].fetch_add(pdfRelErr15ct, std::memory_order_relaxed);
 			MLHeroAtomicMax15co(mlHero15ctRoughGlassPdfRelErrMax[case15ct], pdfRelErr15ct);
 
+            MLHeroRecordRoughPrecision15ki(pathVertex->bsdf,sampledDir,bsdfPdfW,evalPdf15ct);
 			const Spectrum reconstructed15ct = eval15ct / evalPdf15ct;
 			const double sampleDen15ct = Max(1e-12,
 				Max(fabs((double)bsdfSample.c[0]),
@@ -5818,7 +7979,7 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 			// the dispersion-used flag, so restore that flag explicitly as well.
 			SetMLHeroActiveLane(savedLane15cw);
 			if (savedDispersionUsed15cw)
-				MarkMLDispersionUsed();
+				::MarkMLDispersionUsed();
 		}
 	}
 
@@ -6003,6 +8164,7 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 		bsdfRevPdfW = bsdfPdfW;
 	else
 		pathVertex->bsdf.Pdf(sampledDir, NULL, &bsdfRevPdfW);
+    history15ke.Reverse(bsdfRevPdfW);
 
 
     if (mlHeroState15fh.enabled) MLHeroRRAudit15fk(pathVertex->bsdf.hitPoint.fromLight ? 1u : 0u,pathVertex->depth,pathVertex->bsdf.GetMaterialType(),event,bsdfSample,bsdfPdfW,bsdfRevPdfW,engine->rrImportanceCap,RenderEngine::RussianRouletteProb(bsdfSample,engine->rrImportanceCap),pathVertex->depth >= engine->rrDepth,pathVertex->depth >= engine->rrDepth,true);
@@ -6044,6 +8206,7 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
         const float random15fs=sampler->GetSample(sampleOffset + 2);
         // A selected zero-probability candidate must not divide by zero when u=0.
         const bool killed15fs=(selected15ft && prob<=0.f) || prob < random15fs;
+        history15ke.Roulette(prob, killed15fs);
         if(audit15fs)MLHeroRRLiveRecord15ft(pathVertex->bsdf.hitPoint.fromLight?1u:0u,
             pathVertex->depth,selected15ft,baseline15ft,prob,random15fs,killed15fs);
         if(audit15fs)MLHeroRRRecord15fs(pathVertex->bsdf.hitPoint.fromLight?1u:0u,
@@ -6790,6 +8953,4642 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
         const u_int glassSide15ev = pathVertex->bsdf.hitPoint.fromLight ? 1u : 0u;
         u_int glassRejected15ev = 0u;
         float glassHeroDelta15ev = 0.f;
+        // 15gl-B stage 1: independent two-lane probe, intentionally READ ONLY.
+        // Only the Splitting checkbox enables this diagnostic. Sampling, ray,
+        // throughput, RR and all BIDIR MIS recurrences remain the existing path.
+        // This must not be called a live splitting implementation.
+        if (engine->mlHeroSplittingRequested15gl && glassDispersiveTx15ev &&
+                MLHeroCurrentDiagnosticsEnabled15cq() &&
+                pathVertex->mlHeroLaneCount >= 2u &&
+                !pathVertex->mlHeroSecondaryWavelengthsTerminated) {
+            const unsigned side15gl = pathVertex->bsdf.hitPoint.fromLight ? 1u : 0u;
+            const unsigned long long ticket15gl =
+                mlHeroSplitTickets15gy[side15gl].fetch_add(1ull, std::memory_order_relaxed);
+            if (ticket15gl < 32ull) {
+                // Companion choice: half a packet away, not a fixed wavelength.
+                // Both lanes belong to the actual stratified HERO packet.
+                // 15jt: diagnostic-only choice of one of four opposite pairs.
+                // A separate local PRNG leaves the production sampler untouched.
+                // This code path is gated to eight-lane packets in the existing probe.
+                const u_int half15jt = pathVertex->mlHeroLaneCount / 2u;
+                const std::uint64_t choiceBits15jt = MLHeroMix64_15hb(
+                    (std::uint64_t)engine->seedBase ^ 0x15a717a717a717a7ull ^
+                    MLHeroMix64_15hb((std::uint64_t)ticket15gl + 0x9e3779b97f4a7c15ull) ^
+                    (side15gl ? 0xf3c64e9831d02a57ull : 0x89e4dab58d13c6f1ull));
+                const u_int choice15jt = half15jt > 0u ?
+                    (u_int)(choiceBits15jt % (std::uint64_t)half15jt) : 0u;
+                const u_int laneIDs15gl[2] = {choice15jt, choice15jt + half15jt};
+                std::lock_guard<std::recursive_mutex> lock15gl(mlHeroDebugLogMutex);
+                FILE *file15gl = MLHeroOpenAnyLog15gj("a");
+                if (file15gl) {
+                    fprintf(file15gl,
+                        "phase15gl SPLIT_PROBE side=%s ticket=%llu materialID=%u "
+                        "laneCount=%u event=%u previewOnly=1 spawnRays=0 "
+                        "transportChanged=0 misChanged=0 rrChanged=0\n",
+                        side15gl ? "LIGHT" : "EYE", ticket15gl,
+                        pathVertex->bsdf.GetMaterialID(), pathVertex->mlHeroLaneCount,
+                        (unsigned)event);
+                    // 15ha: all eight packet slots are captured from the
+                    // existing vertex. NO sampler access and NO new path state.
+                    const bool linearMode15ha = engine->mlHeroSamplingMode != 2 &&
+                        engine->mlHeroSamplingMode != 3;
+                    const MLHeroPacketAudit15ha packet15ha =
+                        MLHeroAuditPacket15ha(*pathVertex, laneIDs15gl[0],
+                            laneIDs15gl[1], linearMode15ha);
+                    fprintf(file15gl,
+                        "phase15ha PACKET_OWNERSHIP side=%s ticket=%llu "
+                        "packetCount=%u selectedA=%u selectedB=%u "
+                        "lambdaA=%.9g lambdaB=%.9g "
+                        "samplingMode=%d linearGridCheckable=%u "
+                        "packetFinite=%u boundsOK=%u uniqueOK=%u "
+                        "pdfIdentityOK=%u maxPdfIdentityError=%.12g "
+                        "linearGridOK=%u maxLinearGridError=%.12g "
+                        "halfPacketPairOK=%u pairSpanNm=%.9g "
+                        "selectedSlotFraction=%.12g "
+                        "minWavelengthPdf=%.12g maxWavelengthPdf=%.12g "
+                        "sharedWavelengthSamplerDimension=1 "
+                        "pairChoice=LOCAL_DIAGNOSTIC_PRNG randomSubsetSelection=1 "
+                        "randomSubsetInclusionPdfAvailable=1 "
+                        "packetMarginalUniformityProof=NOT_EVALUATED "
+                        "diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0\n",
+                        side15gl ? "LIGHT" : "EYE", ticket15gl,
+                        packet15ha.count, packet15ha.selectedA, packet15ha.selectedB,
+                        pathVertex->mlHeroLaneWaveLength[laneIDs15gl[0]],
+                        pathVertex->mlHeroLaneWaveLength[laneIDs15gl[1]],
+                        engine->mlHeroSamplingMode,
+                        packet15ha.linearGridCheckable ? 1u : 0u,
+                        packet15ha.packetFinite ? 1u : 0u,
+                        packet15ha.boundsOK ? 1u : 0u,
+                        packet15ha.uniqueOK ? 1u : 0u,
+                        packet15ha.pdfIdentityOK ? 1u : 0u,
+                        packet15ha.maxPdfIdentityError,
+                        packet15ha.linearGridOK ? 1u : 0u,
+                        packet15ha.maxLinearGridError,
+                        packet15ha.halfPacketPairOK ? 1u : 0u,
+                        packet15ha.pairSpanNm,
+                        packet15ha.selectedSlotFraction,
+                        packet15ha.minPdf, packet15ha.maxPdf);
+                    fprintf(file15gl,
+                        "phase15ha SAMPLER_OWNERSHIP side=%s ticket=%llu "
+                        "packetCreatedFromOneSamplerU=1 "
+                        "quarterCyclingConfigured=%u "
+                        "nextChildBSDFSampleMode=LOCAL_COUNTER_STREAM_15HB "
+                        "independentChildSamplerState=0 localDiagnosticStreams=1 "
+                        "diagnosticExtraSamplerCalls=0 "
+                        "independentSamplerValidated=0 "
+                        "filmChanged=0 misChanged=0 rrChanged=0\n",
+                        side15gl ? "LIGHT" : "EYE", ticket15gl,
+                        engine->mlHeroQuarterCycling ? 1u : 0u);
+                    // 15hb: separated *diagnostic* PRNG states. This packet's
+                    // renderSeed/side/ticket/lane form reproducible streams;
+                    // ticket order can vary across multi-threaded runs.
+                    // None of these draws consume the production Sampler.
+                    MLHeroChildDebugStream15hb childStreams15hb[2] = {
+                        MLHeroMakeStream15hb((std::uint64_t)engine->seedBase,
+                            side15gl, ticket15gl, laneIDs15gl[0]),
+                        MLHeroMakeStream15hb((std::uint64_t)engine->seedBase,
+                            side15gl, ticket15gl, laneIDs15gl[1])
+                    };
+                    MLHeroChildDebugDraws15hb childDraws15hb[2];
+                    const bool distinctKeys15hb =
+                        childStreams15hb[0].key != childStreams15hb[1].key;
+                    fprintf(file15gl,
+                        "phase15hb STREAM_PAIR_BEGIN side=%s ticket=%llu "
+                        "laneA=%u laneB=%u keyDistinct=%u "
+                        "counterStartsZero=1 sharedMutableState=0 "
+                        "parentSamplerCalls=0 productionSamplerStateUntouched=1 "
+                        "diagnosticOnly=1 physicalChildEnabled=0\n",
+                        side15gl ? "LIGHT" : "EYE", ticket15gl,
+                        laneIDs15gl[0], laneIDs15gl[1], distinctKeys15hb ? 1u : 0u);
+                    // 15gz: two separate, local records; both proposals remain
+                    // counterfactual, and neither is integrated into the film.
+                    MLHeroPairLedger15gz pairLedger15gz[2];
+                    // 15hc: these are LOCAL read-only candidate ledgers.
+                    MLHeroMISRecurrence15hc glassMIS15hc[2];
+                    MLHeroMISRecurrence15hc nextMIS15hc[2];
+                    bool nextEventIsDelta15hc[2] = {false, false};
+                    bool nextPdfObserved15hc[2] = {false, false};
+                    // 15hd: reverse PDF is only well-defined as solid-angle
+                    // density for a sampled non-delta event.
+                    MLHeroNonDeltaMIS15hd nextNonDeltaMIS15hd[2];
+                    bool nextReversePdfObserved15hd[2] = {false, false};
+                    bool nextNonDeltaEvent15hd[2] = {false, false};
+                    bool nextForwardPdfConsistent15hd[2] = {false, false};
+                    for (u_int child15gl = 0u; child15gl < 2u; ++child15gl) {
+                        const u_int lane15gl = laneIDs15gl[child15gl];
+                        childDraws15hb[child15gl] =
+                            MLHeroDrawChild15hb(childStreams15hb[child15gl]);
+                        const MLHeroChildDebugDraws15hb &draw15hb =
+                            childDraws15hb[child15gl];
+                        const MLHeroChildDebugStream15hb &stream15hb =
+                            childStreams15hb[child15gl];
+                        fprintf(file15gl,
+                            "phase15hb CHILD_STREAM side=%s ticket=%llu child=%u "
+                            "lane=%u key=%llu counter=%llu "
+                            "sampleU0=%.9g sampleU1=%.9g rrPreview=%.9g "
+                            "drawsValid=%u localCounterStream=1 "
+                            "rrPreviewApplied=0 extraParentSamplerCalls=0 "
+                            "productionSamplerStateUntouched=1 "
+                            "streamSeparationValidated=%u "
+                            "statisticalIndependenceProven=0 productionChildSamplerValidated=0 "
+                            "misValidated=0 filmChanged=0\n",
+                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                            lane15gl, (unsigned long long)stream15hb.key,
+                            (unsigned long long)stream15hb.counter,
+                            draw15hb.u0, draw15hb.u1, draw15hb.rrPreview,
+                            draw15hb.finiteAndOpen ? 1u : 0u,
+                            distinctKeys15hb ? 1u : 0u);
+                        float nc15gl=0.f, base15gl=0.f, nt15gl=0.f;
+                        float fresnel15gl=0.f, eta15gl=0.f, eta2_15gl=0.f;
+                        float transport15gl=0.f, delta15gl=0.f;
+                        float cosFixed15gl=0.f, sinI2_15gl=0.f, sinT2_15gl=0.f;
+                        float lanePdf15gl=0.f;
+                        bool tir15gl=false;
+                        Spectrum value15gl(0.f);
+                        const bool ok15gl = pathVertex->bsdf.EvaluateMLHeroGlassDebugAtWaveLength(
+                            sampledDir, event, bsdfPdfW,
+                            pathVertex->mlHeroLaneWaveLength[lane15gl],
+                            &nc15gl, &base15gl, &nt15gl, &fresnel15gl,
+                            &eta15gl, &eta2_15gl, &transport15gl,
+                            &delta15gl, &value15gl, &cosFixed15gl,
+                            &sinI2_15gl, &sinT2_15gl, &tir15gl, &lanePdf15gl);
+                        fprintf(file15gl,
+                            "phase15gl SPLIT_PROBE_LANE side=%s ticket=%llu child=%u "
+                            "lane=%u lambda=%.9g helperOK=%u tir=%u eta=%.9g "
+                            "fresnel=%.9g directionDelta=%.9g sinT2=%.9g "
+                            "laneEventPdf=%.9g sampledRayOnly=1\n",
+                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                            lane15gl, pathVertex->mlHeroLaneWaveLength[lane15gl],
+                            ok15gl ? 1u : 0u, tir15gl ? 1u : 0u,
+                            eta15gl, fresnel15gl, delta15gl, sinT2_15gl,
+                            lanePdf15gl);
+                        // 15gm: independent READ-ONLY candidate path-state snapshot.
+                        // These are two local records, never enqueued or connected.
+                        // The actual refracted child direction and child MIS PDF
+                        // must be derived before a physical branch can exist.
+                        struct MLHeroChildState15gm {
+                            u_int lane, depth;
+                            float lambda, sampleWeight, wavelengthPdf;
+                            float throughput, dVCM, dVC, dVM;
+                            float eventPdf, eta, fresnel, directionDelta;
+                            bool helperOK, tir;
+                        };
+                        const MLHeroChildState15gm childState15gm = {
+                            lane15gl, pathVertex->depth,
+                            pathVertex->mlHeroLaneWaveLength[lane15gl],
+                            pathVertex->mlHeroLaneSampleWeight[lane15gl],
+                            pathVertex->mlHeroLaneWaveLengthPdf[lane15gl],
+                            pathVertex->mlHeroLaneThroughput[lane15gl].c[0],
+                            pathVertex->dVCM, pathVertex->dVC, pathVertex->dVM,
+                            lanePdf15gl, eta15gl, fresnel15gl, delta15gl,
+                            ok15gl, tir15gl
+                        };
+                        // 15ik: inspect a typed, owned-by-value candidate record.
+                        // Not a physical child. Unknown PDFs/normalizer stay UNAVAILABLE.
+                        MLHeroSpectralChildState15ik state15ik;
+                        state15ik.lane = lane15gl;
+                        state15ik.depth = pathVertex->depth;
+                        state15ik.fromLight = side15gl;
+                        state15ik.lambdaNm = childState15gm.lambda;
+                        state15ik.wavelengthPdfPerNm = childState15gm.wavelengthPdf;
+                        state15ik.wavelengthSampleWeight = childState15gm.sampleWeight;
+                        state15ik.parentThroughputScalar = childState15gm.throughput;
+                        state15ik.mediumBefore = pathVertex->volInfo;
+                        state15ik.mediumAfter = state15ik.mediumBefore;
+                        // Phase A3: candidate proposal is a discrete EVENT mass,
+                        // never a solid-angle PDF and never a verified native mass.
+                        // Finite bounded helper outputs can be recorded WITHOUT
+                        // declaring the forward/reverse sampling probabilities known.
+                        const bool proposalAvailable15il = ok15gl &&
+                            std::isfinite((double)lanePdf15gl) &&
+                            lanePdf15gl >= 0.f && lanePdf15gl <= 1.f;
+                        if (proposalAvailable15il) {
+                            state15ik.eventProposalForward.available = true;
+                            state15ik.eventProposalForward.measure =
+                                MLHeroChildMeasure15ik::DISCRETE_EVENT_MASS;
+                            state15ik.eventProposalForward.value = (double)lanePdf15gl;
+                        }
+                        // 15in: the helper reports the probability of the *parent's*
+                        // observed event evaluated at this child wavelength. Obtain
+                        // both complementary branch proposals without resampling.
+                        // These are counterfactual probabilities, NOT native child
+                        // PDF validation, and never used in throughput or MIS.
+                        const bool observedReflect15in = (event & REFLECT) != 0;
+                        const bool observedTransmit15in = (event & TRANSMIT) != 0;
+                        const bool exclusiveEvent15in = observedReflect15in != observedTransmit15in;
+                        const bool bothBranchKnown15in = proposalAvailable15il && exclusiveEvent15in;
+                        const double reflectMass15in = bothBranchKnown15in ?
+                            (observedReflect15in ? (double)lanePdf15gl : 1.0 - (double)lanePdf15gl) : -1.0;
+                        const double transmitMass15in = bothBranchKnown15in ?
+                            (observedTransmit15in ? (double)lanePdf15gl : 1.0 - (double)lanePdf15gl) : -1.0;
+                        const bool complementValid15in = bothBranchKnown15in &&
+                            std::isfinite(reflectMass15in) && std::isfinite(transmitMass15in) &&
+                            reflectMass15in >= 0. && reflectMass15in <= 1. &&
+                            transmitMass15in >= 0. && transmitMass15in <= 1. &&
+                            fabs(reflectMass15in + transmitMass15in - 1.) <= 1.e-5;
+                        if (complementValid15in) {
+                            state15ik.reflectProposalForward.available = true;
+                            state15ik.reflectProposalForward.measure = MLHeroChildMeasure15ik::DISCRETE_EVENT_MASS;
+                            state15ik.reflectProposalForward.value = reflectMass15in;
+                            state15ik.transmitProposalForward.available = true;
+                            state15ik.transmitProposalForward.measure = MLHeroChildMeasure15ik::DISCRETE_EVENT_MASS;
+                            state15ik.transmitProposalForward.value = transmitMass15in;
+                        }
+                        fprintf(file15gl,
+                            "phase15in CHILD_BRANCH_PROPOSAL side=%s ticket=%llu child=%u "
+                            "lane=%u lambda=%.9g parentReflect=%u parentTransmit=%u "
+                            "proposalReflect=%.9g proposalTransmit=%.9g "
+                            "branchKnown=%u complementValid=%u tirCandidate=%u "
+                            "nativeChildVerified=0 forwardNativeKnown=0 reverseNativeKnown=0 "
+                            "childJointPdfKnown=0 samplerDraws=0 childRays=0 "
+                            "misChanged=0 rrChanged=0 physicsChanged=0\n",
+                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                            lane15gl, state15ik.lambdaNm,
+                            observedReflect15in ? 1u : 0u, observedTransmit15in ? 1u : 0u,
+                            reflectMass15in, transmitMass15in,
+                            bothBranchKnown15in ? 1u : 0u, complementValid15in ? 1u : 0u,
+                            tir15gl ? 1u : 0u);
+                        // 15io: INDEPENDENT double-precision Snell/Fresnel reference.
+                        // This does NOT reconstruct Kr/Kt texture filters or thin-film;
+                        // it therefore cannot independently validate branch masses.
+                        const double etaRef15io = (double)eta15gl;
+                        const double ciRef15io = fabs((double)cosFixed15gl);
+                        const double sin2Ref15io = Max(0., 1. - ciRef15io * ciRef15io);
+                        const double st2Ref15io = etaRef15io * etaRef15io * sin2Ref15io;
+                        const bool inputRef15io = ok15gl && std::isfinite(etaRef15io) &&
+                            std::isfinite(ciRef15io) && etaRef15io > 0. &&
+                            ciRef15io >= 0. && ciRef15io <= 1.00001 && std::isfinite(st2Ref15io);
+                        const bool tirRef15io = inputRef15io && st2Ref15io >= 1.;
+                        const double ctRef15io = inputRef15io && !tirRef15io ?
+                            sqrt(Max(0., 1. - st2Ref15io)) : 0.;
+                        // eta is incident-IOR / transmitted-IOR. Fresnel amplitude
+                        // ratios expressed in eta and the two unsigned cosines.
+                        const double denSRef15io = etaRef15io * ciRef15io + ctRef15io;
+                        const double denPRef15io = ciRef15io + etaRef15io * ctRef15io;
+                        const bool validRef15io = inputRef15io &&
+                            (tirRef15io || (denSRef15io > 1.e-15 && denPRef15io > 1.e-15));
+                        const double rsRef15io = validRef15io && !tirRef15io ?
+                            (etaRef15io * ciRef15io - ctRef15io) / denSRef15io : 0.;
+                        const double rpRef15io = validRef15io && !tirRef15io ?
+                            (ciRef15io - etaRef15io * ctRef15io) / denPRef15io : 0.;
+                        const double fresnelRef15io = !validRef15io ? -1. :
+                            (tirRef15io ? 1. : .5 * (rsRef15io * rsRef15io + rpRef15io * rpRef15io));
+                        const double fresnelDiff15io = validRef15io ?
+                            fabs(fresnelRef15io - (double)fresnel15gl) : -1.;
+                        const bool snellConsistent15io = validRef15io &&
+                            fabs(st2Ref15io - (double)sinT2_15gl) <= 2.e-5 * Max(1., fabs(st2Ref15io));
+                        const bool fresnelConsistent15io = validRef15io &&
+                            fresnelDiff15io <= 2.e-4 && (tirRef15io == tir15gl);
+                        fprintf(file15gl,
+                            "phase15io CHILD_SNELL_FRESNEL_REFERENCE side=%s ticket=%llu child=%u "
+                            "lane=%u lambda=%.9g eta=%.12g cosIncident=%.12g "
+                            "sinT2Reference=%.12g sinT2Helper=%.12g tirReference=%u tirHelper=%u "
+                            "fresnelReference=%.12g fresnelHelper=%.12g fresnelDifference=%.12g "
+                            "referenceValid=%u snellConsistent=%u fresnelConsistent=%u "
+                            "branchMassIndependent=0 reason=KR_KT_FILM_TRANSPORT_NOT_INDEPENDENT "
+                            "nativeChildVerified=0 reverseKnown=0 jointPdfKnown=0 childRays=0 "
+                            "physicsChanged=0\n",
+                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                            lane15gl, state15ik.lambdaNm, etaRef15io, ciRef15io,
+                            st2Ref15io, (double)sinT2_15gl, tirRef15io ? 1u : 0u,
+                            tir15gl ? 1u : 0u, fresnelRef15io, (double)fresnel15gl,
+                            fresnelDiff15io, validRef15io ? 1u : 0u,
+                            snellConsistent15io ? 1u : 0u, fresnelConsistent15io ? 1u : 0u);
+                        // 15ip: independently reconstruct child branch weights from
+                        // REAL material texture reads at the actual parent hit point,
+                        // and the independent double-precision Fresnel reference 15io.
+                        // This is deliberately NOT a second invocation of the 15ba
+                        // helper. Only film-free cases are eligible; we retain the
+                        // native shader's Spectrum::Filter and Black semantics.
+                        const slg::Material &material15ip =
+                            engine->renderConfig.GetScene().GetMaterials().GetMaterial(
+                                pathVertex->bsdf.GetMaterialName());
+                        const slg::GlassMaterial *glass15ip =
+                            dynamic_cast<const slg::GlassMaterial *>(&material15ip);
+                        const bool textureReady15ip = glass15ip && validRef15io &&
+                            complementValid15in;
+                        Spectrum kr15ip(0.f), kt15ip(0.f);
+                        double filmThickness15ip = -1.;
+                        if (textureReady15ip) {
+                            kr15ip = glass15ip->GetKr()->GetSpectrumValue(pathVertex->bsdf.hitPoint).Clamp(0.f, 1.f);
+                            kt15ip = glass15ip->GetKt()->GetSpectrumValue(pathVertex->bsdf.hitPoint).Clamp(0.f, 1.f);
+                            filmThickness15ip = glass15ip->GetFilmThickness() ?
+                                (double)glass15ip->GetFilmThickness()->GetFloatValue(pathVertex->bsdf.hitPoint) : 0.;
+                        }
+                        const bool filmFree15ip = textureReady15ip &&
+                            std::isfinite(filmThickness15ip) && filmThickness15ip <= 0.;
+                        // Use the transport direction in the native helper: EYE
+                        // evaluates Fresnel at transmitted cosine, LIGHT at incidence.
+                        // The EYE factor is eta^2; LIGHT uses |cosI/cosT|.
+                        // Fresnel power reflectance is reciprocal for this lossless
+                        // dielectric interface; the transmitted-direction evaluation
+                        // uses the same physical F with the Snell-related angle.
+                        const double fTx15ip = validRef15io ? fresnelRef15io : -1.;
+                        const double transTransport15ip = !validRef15io || tirRef15io || fTx15ip < 0. ? 0. :
+                            (1. - fTx15ip) * (side15gl ?
+                                (ctRef15io > 1.e-20 ? ciRef15io / ctRef15io : 0.) :
+                                etaRef15io * etaRef15io);
+                        const Spectrum reflectWeight15ip = kr15ip * (float)fresnelRef15io;
+                        const Spectrum transmitWeight15ip = kt15ip * (float)transTransport15ip;
+                        const bool reflectPresent15ip = !reflectWeight15ip.Black();
+                        const bool transmitPresent15ip = !transmitWeight15ip.Black();
+                        const double reflFilter15ip = (double)reflectWeight15ip.Filter();
+                        const double transFilter15ip = (double)transmitWeight15ip.Filter();
+                        const double denominator15ip = reflFilter15ip + transFilter15ip;
+                        const bool massInputs15ip = filmFree15ip && fTx15ip >= 0. &&
+                            std::isfinite(transTransport15ip) && transTransport15ip >= 0. &&
+                            std::isfinite(denominator15ip) && reflFilter15ip >= 0. && transFilter15ip >= 0.;
+                        const double rawTransmit15ip = massInputs15ip && reflectPresent15ip &&
+                            transmitPresent15ip && denominator15ip > 0. ?
+                            transFilter15ip / denominator15ip : -1.;
+                        const double expectedTransmit15ip = !massInputs15ip ? -1. :
+                            !reflectPresent15ip ? (transmitPresent15ip ? 1. : -1.) :
+                            !transmitPresent15ip ? 0. :
+                            (rawTransmit15ip >= 0. ? std::min(.75, std::max(.25, rawTransmit15ip)) : -1.);
+                        const double expectedReflect15ip = expectedTransmit15ip >= 0. ?
+                            1. - expectedTransmit15ip : -1.;
+                        const bool massValid15ip = massInputs15ip && expectedTransmit15ip >= 0. &&
+                            expectedReflect15ip >= 0.;
+                        const double massError15ip = massValid15ip ?
+                            std::max(fabs(expectedReflect15ip - reflectMass15in),
+                                     fabs(expectedTransmit15ip - transmitMass15in)) : -1.;
+                        const bool massMatch15ip = massValid15ip && massError15ip <= 2.e-4;
+                        fprintf(file15gl,
+                            "phase15ip CHILD_MATERIAL_TRANSPORT_REFERENCE side=%s ticket=%llu child=%u "
+                            "lane=%u lambda=%.9g eligible=%u filmFree=%u filmThickness=%.9g "
+                            "tirReference=%u tirHelper=%u fromLight=%u "
+                            "krFilter=%.12g ktFilter=%.12g independentF=%.12g "
+                            "independentTransmitF=%.12g transport=%.12g "
+                            "reflectWeightFilter=%.12g transmitWeightFilter=%.12g "
+                            "rawTransmit=%.12g referenceReflect=%.12g referenceTransmit=%.12g "
+                            "proposalReflect=%.12g proposalTransmit=%.12g maxAbsError=%.12g "
+                            "massMatch=%u materialRead=actualParentHitPoint "
+                            "thinFilmUnsupported=%u nativeChildVerified=0 reverseKnown=0 "
+                            "jointPdfKnown=0 diagnosticOnly=1 noExtraSampling=1 childRays=0 "
+                            "filmChanged=0 misChanged=0 rrChanged=0 physicsChanged=0\n",
+                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                            lane15gl, (double)state15ik.lambdaNm,
+                            massValid15ip ? 1u : 0u, filmFree15ip ? 1u : 0u,
+                            filmThickness15ip, tirRef15io ? 1u : 0u,
+                            tir15gl ? 1u : 0u, side15gl ? 1u : 0u,
+                            (double)kr15ip.Filter(), (double)kt15ip.Filter(), fresnelRef15io,
+                            fTx15ip, transTransport15ip, reflFilter15ip, transFilter15ip,
+                            rawTransmit15ip, expectedReflect15ip, expectedTransmit15ip,
+                            reflectMass15in, transmitMass15in, massError15ip,
+                            massMatch15ip ? 1u : 0u,
+                            textureReady15ip && !filmFree15ip ? 1u : 0u);
+                        state15ik.spectralTIRCandidate = ok15gl && tir15gl;
+                        // These fields intentionally remain UNAVAILABLE until a
+                        // wavelength-specific native event PDF is proven:
+                        // eventForward, eventReverse, directionForward,
+                        // directionReverse, rrForward, rrReverse, jointPathProbability.
+                        // The helper's laneEventPdf is not promoted to a complete
+                        // native per-child event-mass or a reverse sampling PDF.
+                        const bool contract15ik = MLHeroChildContractValid15ik(state15ik);
+                        fprintf(file15gl,
+                            "phase15ik CHILD_CONTRACT side=%s ticket=%llu child=%u "
+                            "lane=%u lambda=%.9g wavelengthPdf=%.9g valid=%u "
+                            "mediumCopy=1 directionValidated=0 forwardEventKnown=0 "
+                            "reverseEventKnown=0 reverseDirectionKnown=0 "
+                            "jointPdfKnown=0 normalizerValidated=0 spawnRays=0 "
+                            "candidateOnly=1 physicsChanged=0\n",
+                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                            state15ik.lane, state15ik.lambdaNm,
+                            state15ik.wavelengthPdfPerNm, contract15ik ? 1u : 0u);
+                        fprintf(file15gl,
+                            "phase15il EVENT_MEASURE side=%s ticket=%llu child=%u "
+                            "lane=%u lambda=%.9g helperOK=%u tirCandidate=%u "
+                            "proposalAvailable=%u proposalMass=%.9g proposalMeasure=DISCRETE_EVENT "
+                            "forwardNativeKnown=0 reverseNativeKnown=0 directionPdfKnown=0 "
+                            "jointPathPdfKnown=0 spectralMassValidated=0 "
+                            "contractValid=%u childRayConstructed=0 physicalChildEnabled=0 "
+                            "filmChanged=0 misChanged=0 rrChanged=0\n",
+                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                            lane15gl, state15ik.lambdaNm, ok15gl ? 1u : 0u,
+                            state15ik.spectralTIRCandidate ? 1u : 0u,
+                            proposalAvailable15il ? 1u : 0u,
+                            proposalAvailable15il ? lanePdf15gl : -1.f,
+                            contract15ik ? 1u : 0u);
+                        fprintf(file15gl,
+                            "phase15gm CHILD_STATE side=%s ticket=%llu child=%u "
+                            "lane=%u depth=%u lambda=%.9g sampleWeight=%.9g "
+                            "wavelengthPdf=%.9g throughputPreGlass=%.9g "
+                            "parentDVCM=%.9g parentDVC=%.9g parentDVM=%.9g "
+                            "candidateEventPdf=%.9g candidateEta=%.9g "
+                            "candidateFresnel=%.9g candidateDirectionDelta=%.9g "
+                            "helperOK=%u tir=%u childRayConstructed=0 "
+                            "childMISComputed=0 childWeightApplied=0 "
+                            "snapshotOnly=1 spawnRays=0 physicsChanged=0\n",
+                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                            childState15gm.lane, childState15gm.depth,
+                            childState15gm.lambda, childState15gm.sampleWeight,
+                            childState15gm.wavelengthPdf, childState15gm.throughput,
+                            childState15gm.dVCM, childState15gm.dVC, childState15gm.dVM,
+                            childState15gm.eventPdf, childState15gm.eta,
+                            childState15gm.fresnel, childState15gm.directionDelta,
+                            childState15gm.helperOK ? 1u : 0u,
+                            childState15gm.tir ? 1u : 0u);
+                        // 15gt Stage 9: compare the candidate glass transmission against
+                        // the existing single-path sample, without claiming a physical
+                        // post-glass child throughput. No writes to pathVertex or sampler.
+                        // transport15gl is the glass helper's diagnostic scalar, NOT
+                        // necessarily the full BSDF transport weight including PDFs.
+                        const float parentSampleR15gt = bsdfSample.c[0];
+                        const float candidateTransport15gt = transport15gl;
+                        const float candidatePreGlass15gt = childState15gm.throughput;
+                        const float candidateGlassProduct15gt =
+                            candidatePreGlass15gt * candidateTransport15gt;
+                        const float parentGlassProduct15gt =
+                            candidatePreGlass15gt * parentSampleR15gt;
+                        const float relativeToParent15gt =
+                            (fabsf(parentGlassProduct15gt) > 1e-20f) ?
+                            candidateGlassProduct15gt / parentGlassProduct15gt : 0.f;
+                        const bool finite15gt = std::isfinite(candidateTransport15gt) &&
+                            std::isfinite(candidatePreGlass15gt) &&
+                            std::isfinite(parentSampleR15gt) &&
+                            std::isfinite(candidateGlassProduct15gt) &&
+                            std::isfinite(parentGlassProduct15gt) &&
+                            std::isfinite(relativeToParent15gt) &&
+                            std::isfinite(childState15gm.eventPdf) &&
+                            std::isfinite(childState15gm.wavelengthPdf);
+                        fprintf(file15gl,
+                            "phase15gt GLASS_WEIGHT_AUDIT side=%s ticket=%llu child=%u "
+                            "lane=%u lambda=%.9g helperOK=%u tir=%u "
+                            "preGlass=%.9g helperTransport=%.9g "
+                            "parentSampleR=%.9g candidateProduct=%.9g "
+                            "parentProduct=%.9g ratioToParent=%.9g "
+                            "candidateEventPdf=%.9g wavelengthPdf=%.9g "
+                            "finite=%u postGlassWeightKnown=0 "
+                            "comparisonOnly=1 childMISComputed=0 "
+                            "filmChanged=0 misChanged=0 rrChanged=0 transportApplied=0\n",
+                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                            lane15gl, childState15gm.lambda,
+                            ok15gl ? 1u : 0u, tir15gl ? 1u : 0u,
+                            candidatePreGlass15gt, candidateTransport15gt,
+                            parentSampleR15gt, candidateGlassProduct15gt,
+                            parentGlassProduct15gt, relativeToParent15gt,
+                            childState15gm.eventPdf, childState15gm.wavelengthPdf,
+                            finite15gt ? 1u : 0u);
+                        // 15gz: the glass helper's transport15gl is only the
+                        // Fresnel/eta scalar; value15gl carries material Kt and
+                        // the PARENT event PDF. This alternative uses the lane's
+                        // own event probability ONCE (hypothetical proposal).
+                        // An actual branch must implement sampling, selection
+                        // probability, MIS and wavelength estimator ownership.
+                        const MLHeroGlassWeight15gz glassWeight15gz =
+                            MLHeroAuditGlassWeight15gz(pathVertex->bsdf,
+                                ok15gl, tir15gl, value15gl, bsdfPdfW,
+                                lanePdf15gl, eta15gl, sinT2_15gl, cosFixed15gl);
+                        pairLedger15gz[child15gl].glassValid = glassWeight15gz.valid;
+                        pairLedger15gz[child15gl].lane = lane15gl;
+                        pairLedger15gz[child15gl].lambda = (double)childState15gm.lambda;
+                        pairLedger15gz[child15gl].parentPdf = glassWeight15gz.parentPdf;
+                        pairLedger15gz[child15gl].lanePdf = glassWeight15gz.lanePdf;
+                        pairLedger15gz[child15gl].wavelengthIdentity =
+                            400. * (double)childState15gm.wavelengthPdf *
+                            (double)childState15gm.sampleWeight;
+                        if (glassWeight15gz.valid)
+                            pairLedger15gz[child15gl].afterGlass =
+                                (double)childState15gm.throughput * glassWeight15gz.laneProposalR;
+                        const bool sameDirection15gz = std::isfinite(delta15gl) &&
+                            delta15gl <= 2e-4f;
+                        const double parentDifference15gz = sameDirection15gz &&
+                                glassWeight15gz.valid ?
+                            glassWeight15gz.parentProposalR - (double)bsdfSample.c[0] : 0.;
+                        fprintf(file15gl,
+                            "phase15gz CHILD_GLASS_PDF_AUDIT side=%s ticket=%llu child=%u "
+                            "lane=%u lambda=%.9g valid=%u adjointValid=%u "
+                            "parentEventPdf=%.12g laneEventPdf=%.12g "
+                            "rawMultiplierR=%.12g adjointFactor=%.12g "
+                            "parentProposalMultiplierR=%.12g "
+                            "laneProposalMultiplierRGB=(%.12g,%.12g,%.12g) "
+                            "parentSampleR=%.12g sameDirection=%u parentDifference=%.12g "
+                            "throughputPreGlass=%.12g candidateAfterGlassR=%.12g "
+                            "wavelengthIdentity=%.12g "
+                            "materialKtIncluded=1 parentPdfRemovedOnce=1 "
+                            "laneEventPdfDividedOnce=1 nextPdfDividedAgain=0 "
+                            "wavelengthPdfAppliedAgain=0 proposalCounterfactual=1 "
+                            "estimatorValidated=0 childMISValidated=0 "
+                            "diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0\n",
+                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                            lane15gl, childState15gm.lambda,
+                            glassWeight15gz.valid ? 1u : 0u,
+                            glassWeight15gz.adjointValid ? 1u : 0u,
+                            glassWeight15gz.parentPdf, glassWeight15gz.lanePdf,
+                            glassWeight15gz.rawR, glassWeight15gz.adjoint,
+                            glassWeight15gz.parentProposalR,
+                            glassWeight15gz.laneProposalR, glassWeight15gz.laneProposalG,
+                            glassWeight15gz.laneProposalB, (double)bsdfSample.c[0],
+                            sameDirection15gz ? 1u : 0u, parentDifference15gz,
+                            (double)childState15gm.throughput,
+                            pairLedger15gz[child15gl].afterGlass,
+                            pairLedger15gz[child15gl].wavelengthIdentity);
+                        // 15gn: reconstruct exactly the same LOCAL Snell direction
+                        // as GlassMaterial::EvaluateMLHeroDebugAtWaveLength().
+                        // A Ray object is built but is NEVER traced, queued, or
+                        // used for throughput, MIS, roulette, or film contributions.
+                        bool rayValid15gn = false;
+                        float reconstructedDelta15gn = -1.f;
+                        float rayDirLength15gn = -1.f;
+                        float rayMint15gn = -1.f;
+                        float rayTime15gn = -1.f;
+                        if (ok15gl && !tir15gl &&
+                                std::isfinite(eta15gl) && eta15gl > 0.f &&
+                                std::isfinite(sinT2_15gl) &&
+                                sinT2_15gl >= 0.f && sinT2_15gl < 1.f &&
+                                std::isfinite(cosFixed15gl)) {
+                            const luxrays::Frame &frame15gn = pathVertex->bsdf.GetFrame();
+                            const luxrays::Vector fixedLocal15gn =
+                                frame15gn.ToLocal(pathVertex->bsdf.hitPoint.fixedDir);
+                            const float cost15gn = sqrtf(Max(0.f, 1.f - sinT2_15gl)) *
+                                ((cosFixed15gl > 0.f) ? -1.f : 1.f);
+                            const luxrays::Vector directionLocal15gn(
+                                -eta15gl * fixedLocal15gn.x,
+                                -eta15gl * fixedLocal15gn.y, cost15gn);
+                            const luxrays::Vector directionWorld15gn =
+                                frame15gn.ToWorld(directionLocal15gn);
+                            // 15hc: actual child refraction direction and its
+                            // cosine at the PARENT glass vertex. Only replicate
+                            // LuxCore's specular MIS recurrence as an offline ledger.
+                            const float childGlassAbsCos15hc = fabsf(Dot(
+                                directionWorld15gn, pathVertex->bsdf.hitPoint.shadeN));
+                            glassMIS15hc[child15gl] = MLHeroAuditSpecularMIS15hc(
+                                (double)pathVertex->dVCM, (double)pathVertex->dVC,
+                                (double)pathVertex->dVM,
+                                (double)childGlassAbsCos15hc, (double)lanePdf15gl);
+                            const MLHeroMISRecurrence15hc &glassAudit15hc =
+                                glassMIS15hc[child15gl];
+                            const MLHeroMISRecurrence15hc parentGlassAudit15hc =
+                                MLHeroAuditSpecularMIS15hc(
+                                    (double)pathVertex->dVCM, (double)pathVertex->dVC,
+                                    (double)pathVertex->dVM,
+                                    (double)fabsf(cosSampledDir), (double)bsdfPdfW);
+                            fprintf(file15gl,
+                                "phase15hc GLASS_DELTA_MIS side=%s ticket=%llu child=%u "
+                                "lane=%u parentDVCM=%.12g parentDVC=%.12g parentDVM=%.12g "
+                                "parentCos=%.12g childCos=%.12g "
+                                "parentEventProbability=%.12g childEventProbability=%.12g "
+                                "parentRecurrenceValid=%u childRecurrenceValid=%u "
+                                "candidateDVCM=%.12g candidateDVC=%.12g candidateDVM=%.12g "
+                                "pdfMeasure=DISCRETE_DELTA_EVENT "
+                                "eventProbabilityNotSolidAngleDensity=1 "
+                                "nativeBIDIRSpecularRecurrenceOnly=1 "
+                                "reverseGlassPdfKnown=0 spectralPathMISValidated=0 "
+                                "physicalChildEnabled=0 filmChanged=0 rrChanged=0\n",
+                                side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                lane15gl, (double)pathVertex->dVCM,
+                                (double)pathVertex->dVC, (double)pathVertex->dVM,
+                                (double)fabsf(cosSampledDir), (double)childGlassAbsCos15hc,
+                                (double)bsdfPdfW, (double)lanePdf15gl,
+                                parentGlassAudit15hc.valid ? 1u : 0u,
+                                glassAudit15hc.valid ? 1u : 0u,
+                                glassAudit15hc.dVCM, glassAudit15hc.dVC,
+                                glassAudit15hc.dVM);
+                            // 15hh Stage 23: analytic reverse-interface Fresnel audit.
+                            // Reversing a specular transmission direction exchanges
+                            // incident and transmitted cosines and inverts eta.
+                            // This is an analytic consistency check, NOT a reverse
+                            // sampling probability returned by the production BSDF.
+                            const double cosIn15hh = fabs((double)cosFixed15gl);
+                            const double cosOut15hh = sqrt(Max(0., 1. - (double)sinT2_15gl));
+                            const double etaReverse15hh = 1. / (double)eta15gl;
+                            const double reverseSinSquared15hh =
+                                etaReverse15hh * etaReverse15hh * Max(0., 1. - cosOut15hh * cosOut15hh);
+                            const bool reverseTir15hh = reverseSinSquared15hh >= 1.;
+                            const double reverseCosOut15hh = reverseTir15hh ? 0. :
+                                sqrt(Max(0., 1. - reverseSinSquared15hh));
+                            // Fresnel Rs/Rp using ni/nt=eta, avoiding absolute IOR.
+                            const double rsDen15hh = cosOut15hh + etaReverse15hh * reverseCosOut15hh;
+                            const double rpDen15hh = etaReverse15hh * cosOut15hh + reverseCosOut15hh;
+                            const bool analyticValid15hh = std::isfinite(cosIn15hh) &&
+                                std::isfinite(cosOut15hh) && cosIn15hh >= 0. && cosIn15hh <= 1.0001 &&
+                                cosOut15hh >= 0. && cosOut15hh <= 1.0001 &&
+                                std::isfinite(etaReverse15hh) && etaReverse15hh > 0. &&
+                                std::isfinite(reverseSinSquared15hh) &&
+                                (reverseTir15hh || (rsDen15hh > 0. && rpDen15hh > 0.));
+                            const double rs15hh = analyticValid15hh && !reverseTir15hh ?
+                                (cosOut15hh - etaReverse15hh * reverseCosOut15hh) / rsDen15hh : 0.;
+                            const double rp15hh = analyticValid15hh && !reverseTir15hh ?
+                                (etaReverse15hh * cosOut15hh - reverseCosOut15hh) / rpDen15hh : 0.;
+                            const double reverseFresnel15hh = !analyticValid15hh ? -1. :
+                                (reverseTir15hh ? 1. : .5 * (rs15hh * rs15hh + rp15hh * rp15hh));
+                            const double fresnelDifference15hh = analyticValid15hh ?
+                                fabs(reverseFresnel15hh - (double)fresnel15gl) : -1.;
+                            const double angleReturnError15hh = analyticValid15hh && !reverseTir15hh ?
+                                fabs(reverseCosOut15hh - cosIn15hh) : -1.;
+                            fprintf(file15gl,
+                                "phase15hh REVERSE_FRESNEL_AUDIT side=%s ticket=%llu child=%u "
+                                "lane=%u lambda=%.9g forwardEta=%.12g reverseEta=%.12g "
+                                "forwardCosIn=%.12g forwardCosOut=%.12g "
+                                "reverseCosIn=%.12g reverseCosOut=%.12g "
+                                "forwardFresnelHelper=%.12g reverseFresnelAnalytic=%.12g "
+                                "fresnelDifference=%.12g reverseAngleReturnError=%.12g "
+                                "reverseTIR=%u analyticValid=%u "
+                                "reverseTransmissionMassProxy=%.12g "
+                                "reverseBSDFProbabilityKnown=0 proxyIsNotMISDensity=1 "
+                                "spectralSelectionUnresolved=1 diagnosticOnly=1 "
+                                "physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n",
+                                side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                lane15gl, (double)childState15gm.lambda,
+                                (double)eta15gl, etaReverse15hh, cosIn15hh, cosOut15hh,
+                                cosOut15hh, reverseCosOut15hh, (double)fresnel15gl,
+                                reverseFresnel15hh, fresnelDifference15hh, angleReturnError15hh,
+                                reverseTir15hh ? 1u : 0u, analyticValid15hh ? 1u : 0u,
+                                analyticValid15hh ? 1. - reverseFresnel15hh : -1.);
+                            // 15hi Stage 24: audit the REAL GlassMaterial::Sample()
+                            // event-selection contract, not a Fresnel-only proxy.
+                            // The material samples transmission with a filtered
+                            // Kr*F versus Kt*(1-F)*transport ratio, clamped to
+                            // [0.25, 0.75] when both components are non-black.
+                            // EvaluateMLHeroGlassDebugAtWaveLength() reconstructs
+                            // this at the candidate wavelength; it does NOT
+                            // execute reverse BSDF sampling or expose reverse Kr/Kt.
+                            const bool transmissionEvent15hi = (event & TRANSMIT) != 0;
+                            const double candidateTransmissionMass15hi =
+                                transmissionEvent15hi ? (double)lanePdf15gl :
+                                1. - (double)lanePdf15gl;
+                            const double candidateReflectionMass15hi =
+                                1. - candidateTransmissionMass15hi;
+                            const double plainFresnelTransmission15hi = 1. - (double)fresnel15gl;
+                            const bool eventMassValid15hi = ok15gl &&
+                                std::isfinite((double)lanePdf15gl) &&
+                                std::isfinite((double)bsdfPdfW) &&
+                                candidateTransmissionMass15hi >= 0. &&
+                                candidateTransmissionMass15hi <= 1. &&
+                                bsdfPdfW >= 0.f && bsdfPdfW <= 1.f;
+                            const bool bothLobesCandidate15hi = eventMassValid15hi &&
+                                candidateTransmissionMass15hi > 0. &&
+                                candidateTransmissionMass15hi < 1.;
+                            const double deltaFromFresnel15hi = eventMassValid15hi ?
+                                candidateTransmissionMass15hi - plainFresnelTransmission15hi : 0.;
+                            const double deltaFromParent15hi = eventMassValid15hi ?
+                                (double)lanePdf15gl - (double)bsdfPdfW : 0.;
+                            fprintf(file15gl,
+                                "phase15hi GLASS_SAMPLING_MASS side=%s ticket=%llu child=%u "
+                                "lane=%u lambda=%.9g event=%s "
+                                "candidateEventMass=%.12g parentSampleEventMass=%.12g "
+                                "candidateTransmissionMass=%.12g candidateReflectionMass=%.12g "
+                                "fresnelReflectance=%.12g fresnelOnlyTransmission=%.12g "
+                                "transmissionMinusFresnelProxy=%.12g candidateMinusParent=%.12g "
+                                "bothLobesPresent=%u clampedRangeIfBoth=%.12g "
+                                "eventMassValid=%u "
+                                "source=GlassMaterial_EvaluateMLHeroDebugAtWaveLength "
+                                "productionSelection=KrF_vs_KtTransport_Filter_clamp025_075 "
+                                "candidateIsReconstructedNotSampled=1 "
+                                "reverseMaterialTransportNotEvaluated=1 "
+                                "reverseBSDFMassKnown=0 analyticReverseFresnelIsNotSamplingMass=1 "
+                                "diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n",
+                                side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                lane15gl, (double)childState15gm.lambda,
+                                transmissionEvent15hi ? "TRANSMIT" : "REFLECT",
+                                (double)lanePdf15gl, (double)bsdfPdfW,
+                                candidateTransmissionMass15hi, candidateReflectionMass15hi,
+                                (double)fresnel15gl, plainFresnelTransmission15hi,
+                                deltaFromFresnel15hi, deltaFromParent15hi,
+                                bothLobesCandidate15hi ? 1u : 0u,
+                                bothLobesCandidate15hi ?
+                                    ((candidateTransmissionMass15hi >= .25 &&
+                                      candidateTransmissionMass15hi <= .75) ? 1. : 0.) : -1.,
+                                eventMassValid15hi ? 1u : 0u);
+                            // 15hj Stage 25: audit the directional asymmetry
+                            // of GlassMaterial's actual transmission IMPORTANCE.
+                            // This is NOT a reverse BSDF query: reverse-side
+                            // material textures, film and shading/volume state
+                            // are not independently evaluated here. In addition,
+                            // threshold clamping destroys information about the
+                            // pre-clamp Kr/Kt ratio, so it cannot be inverted.
+                            const bool reverseInputValid15hj = analyticValid15hh &&
+                                !reverseTir15hh && eventMassValid15hi &&
+                                cosIn15hh > 1e-20 && cosOut15hh > 1e-20 &&
+                                std::isfinite((double)transport15gl) &&
+                                std::isfinite((double)eta2_15gl);
+                            const bool currentFromLight15hj = pathVertex->bsdf.hitPoint.fromLight;
+                            const double forwardTransportFromFormula15hj =
+                                !reverseInputValid15hj ? -1. :
+                                (currentFromLight15hj ?
+                                    (1. - reverseFresnel15hh) * cosIn15hh / cosOut15hh :
+                                    (1. - reverseFresnel15hh) * (double)eta2_15gl);
+                            // For an actual reversed path, the reverse traversal
+                            // originates from the other hemisphere and the path
+                            // side is reversed (EYE <-> LIGHT). The formula below
+                            // only audits the known IOR/Fresnel/geometric part.
+                            const double reverseTransportFormula15hj =
+                                !reverseInputValid15hj ? -1. :
+                                (!currentFromLight15hj ?
+                                    (1. - reverseFresnel15hh) * cosOut15hh / cosIn15hh :
+                                    (1. - reverseFresnel15hh) * etaReverse15hh * etaReverse15hh);
+                            const double knownTransportRatio15hj =
+                                reverseInputValid15hj && forwardTransportFromFormula15hj > 0. ?
+                                    reverseTransportFormula15hj / forwardTransportFromFormula15hj : -1.;
+                            const bool candidateAtClamp15hj = bothLobesCandidate15hi &&
+                                (fabs(candidateTransmissionMass15hi - .25) < 1e-6 ||
+                                 fabs(candidateTransmissionMass15hi - .75) < 1e-6);
+                            // This odds transport is a CONDITIONAL proxy only:
+                            // assumes identical Kr/Kt and Fresnel on both sides,
+                            // no thin-film asymmetry, and that the forward raw
+                            // probability was NOT clamped. It is never MIS input.
+                            const bool conditionalOddsValid15hj = reverseInputValid15hj &&
+                                !candidateAtClamp15hj && bothLobesCandidate15hi &&
+                                knownTransportRatio15hj > 0. &&
+                                candidateTransmissionMass15hi > 0. &&
+                                candidateTransmissionMass15hi < 1.;
+                            const double reverseOdds15hj = conditionalOddsValid15hj ?
+                                (candidateTransmissionMass15hi / (1. - candidateTransmissionMass15hi)) *
+                                knownTransportRatio15hj : -1.;
+                            const double reverseMassProxy15hj = conditionalOddsValid15hj ?
+                                Max(.25, Min(.75, reverseOdds15hj / (1. + reverseOdds15hj))) : -1.;
+                            fprintf(file15gl,
+                                "phase15hj REVERSE_GLASS_TRANSPORT side=%s ticket=%llu child=%u "
+                                "lane=%u lambda=%.9g forwardFromLight=%u reverseFromLight=%u "
+                                "cosIncident=%.12g cosRefracted=%.12g etaForward=%.12g etaReverse=%.12g "
+                                "forwardTransmissionFactorReported=%.12g forwardTransmissionFactorFormula=%.12g "
+                                "reverseTransmissionFactorFormula=%.12g reverseOverForwardFactor=%.12g "
+                                "candidateForwardTransmitMass=%.12g forwardAtClamp=%u "
+                                "conditionalReverseMassProxy=%.12g proxyValid=%u "
+                                "assumeSameKrKt=1 thinFilmNotReevaluated=1 "
+                                "reverseTexturesNotQueried=1 reverseBSDFNotSampled=1 "
+                                "reverseEventMassKnown=0 proxyNotMIS=1 inputValid=%u "
+                                "diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n",
+                                side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                lane15gl, (double)childState15gm.lambda,
+                                currentFromLight15hj ? 1u : 0u,
+                                currentFromLight15hj ? 0u : 1u,
+                                cosIn15hh, cosOut15hh, (double)eta15gl, etaReverse15hh,
+                                (double)transport15gl, forwardTransportFromFormula15hj,
+                                reverseTransportFormula15hj, knownTransportRatio15hj,
+                                candidateTransmissionMass15hi, candidateAtClamp15hj ? 1u : 0u,
+                                reverseMassProxy15hj, conditionalOddsValid15hj ? 1u : 0u,
+                                reverseInputValid15hj ? 1u : 0u);
+                            // 15hk Stage 26: reverse-event feasibility interval.
+                            // The forward clamp is NON-INVERTIBLE. Rather than
+                            // pretending to query a reverse BSDF, propagate the
+                            // admissible forward *pre-clamp odds* through the
+                            // independently audited reverse/forward transport
+                            // ratio. This is conditional on SAME reverse Kr/Kt,
+                            // Fresnel/film response, texture context and state.
+                            // No MIS, sampling, or film state is modified.
+                            const double qForward15hk = candidateTransmissionMass15hi;
+                            const double oddsRatio15hk = knownTransportRatio15hj;
+                            const bool valid15hk = reverseInputValid15hj &&
+                                bothLobesCandidate15hi && std::isfinite(oddsRatio15hk) &&
+                                oddsRatio15hk > 0. &&
+                                qForward15hk >= .25 - 1e-6 &&
+                                qForward15hk <= .75 + 1e-6;
+                            const bool atUpper15hk = valid15hk && fabs(qForward15hk - .75) < 1e-6;
+                            const bool atLower15hk = valid15hk && fabs(qForward15hk - .25) < 1e-6;
+                            const bool interior15hk = valid15hk && !atUpper15hk && !atLower15hk;
+                            // For upper clamp p>=0.75 => odds>=3;
+                            // for lower clamp p<=0.25 => odds<=1/3.
+                            const double minForwardOdds15hk = !valid15hk ? -1. :
+                                (atUpper15hk ? 3. : (atLower15hk ? 0. :
+                                    qForward15hk / (1. - qForward15hk)));
+                            const double maxForwardOdds15hk = !valid15hk ? -1. :
+                                (atUpper15hk ? -1. : (atLower15hk ? (1. / 3.) :
+                                    qForward15hk / (1. - qForward15hk)));
+                            const double minReverseOdds15hk = valid15hk ?
+                                minForwardOdds15hk * oddsRatio15hk : -1.;
+                            const double maxReverseOdds15hk = valid15hk && !atUpper15hk ?
+                                maxForwardOdds15hk * oddsRatio15hk : -1.;
+                            const double reverseLower15hk = valid15hk ?
+                                Max(.25, Min(.75, minReverseOdds15hk / (1. + minReverseOdds15hk))) : -1.;
+                            const double reverseUpper15hk = !valid15hk ? -1. :
+                                (atUpper15hk ? .75 :
+                                    Max(.25, Min(.75, maxReverseOdds15hk / (1. + maxReverseOdds15hk))));
+                            const bool forcedByClamp15hk = valid15hk &&
+                                fabs(reverseUpper15hk - reverseLower15hk) < 1e-9;
+                            fprintf(file15gl,
+                                "phase15hk REVERSE_MASS_INTERVAL side=%s ticket=%llu child=%u "
+                                "lane=%u lambda=%.9g forwardMass=%.12g forwardClamp=%s "
+                                "transportRatio=%.12g forwardOddsLower=%.12g forwardOddsUpper=%.12g "
+                                "reverseMassLower=%.12g reverseMassUpper=%.12g "
+                                "reverseIntervalCollapsed=%u candidateValid=%u "
+                                "conditionalOnSameKrKtAndFilmAndTextures=1 "
+                                "reverseBSDFNotEvaluated=1 reverseMassConfirmed=0 "
+                                "notForMIS=1 diagnosticOnly=1 physicalChildEnabled=0 "
+                                "filmChanged=0 misChanged=0 rrChanged=0\n",
+                                side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                lane15gl, (double)childState15gm.lambda, qForward15hk,
+                                atUpper15hk ? "UPPER" : (atLower15hk ? "LOWER" :
+                                    (interior15hk ? "INTERIOR" : "INVALID")),
+                                oddsRatio15hk, minForwardOdds15hk, maxForwardOdds15hk,
+                                reverseLower15hk, reverseUpper15hk,
+                                forcedByClamp15hk ? 1u : 0u, valid15hk ? 1u : 0u);
+                            // 15hl Stage 27: directly query the Glass material's
+                            // wavelength-specific event selection using a LOCAL
+                            // BSDF copy with traversal reversed. This preserves
+                            // original scene/material textures and performs NO
+                            // sampling, film writes or child spawning. It is a
+                            // reverse-HitPoint PROXY, not a fully rebuilt reverse
+                            // path vertex (volume-stack/medium state not rebuilt).
+                            BSDF reverseBsdf15hl = pathVertex->bsdf;
+                            reverseBsdf15hl.hitPoint.fixedDir = directionWorld15gn;
+                            reverseBsdf15hl.hitPoint.fromLight =
+                                !pathVertex->bsdf.hitPoint.fromLight;
+                            float revNc15hl=0.f, revBase15hl=0.f, revNt15hl=0.f;
+                            float revF15hl=0.f, revEta15hl=0.f, revEta2_15hl=0.f;
+                            float revTransport15hl=0.f, revDelta15hl=0.f;
+                            float revPdf15hl=0.f;
+                            bool revTir15hl=false;
+                            Spectrum revValue15hl(0.f);
+                            const bool revOK15hl = reverseBsdf15hl.EvaluateMLHeroGlassDebugAtWaveLength(
+                                pathVertex->bsdf.hitPoint.fixedDir, event, bsdfPdfW,
+                                childState15gm.lambda,
+                                &revNc15hl, &revBase15hl, &revNt15hl, &revF15hl,
+                                &revEta15hl, &revEta2_15hl, &revTransport15hl,
+                                &revDelta15hl, &revValue15hl,
+                                nullptr, nullptr, nullptr, &revTir15hl, &revPdf15hl);
+                            const bool revMassValid15hl = revOK15hl && !revTir15hl &&
+                                std::isfinite((double)revPdf15hl) &&
+                                revPdf15hl >= 0.f && revPdf15hl <= 1.f &&
+                                std::isfinite((double)revDelta15hl);
+                            const bool inInterval15hl = revMassValid15hl && valid15hk &&
+                                (double)revPdf15hl >= reverseLower15hk - 1e-5 &&
+                                (double)revPdf15hl <= reverseUpper15hk + 1e-5;
+                            fprintf(file15gl,
+                                "phase15hl REVERSE_GLASS_DIRECT_COPY side=%s ticket=%llu child=%u "
+                                "lane=%u lambda=%.9g reverseHelperOK=%u reverseTIR=%u "
+                                "reverseEventMass=%.12g reverseDirectionDelta=%.12g "
+                                "reverseIORExterior=%.12g reverseIORInterior=%.12g "
+                                "reverseEta=%.12g reverseFresnel=%.12g "
+                                "reverseTransport=%.12g expectedIntervalLower=%.12g "
+                                "expectedIntervalUpper=%.12g insideConditionalInterval=%u "
+                                "intervalWasConditional=%u reverseMassValid=%u "
+                                "source=GlassMaterial_EvaluateMLHeroDebugAtWaveLength "
+                                "hitPointCopied=1 fixedDirReversed=1 fromLightToggled=1 "
+                                "materialTexturesQueriedOnCopiedHitPoint=1 "
+                                "reverseVolumeStackNotRebuilt=1 reverseMediumIORNotVerified=1 "
+                                "notValidatedFullReverseBSDF=1 notForMIS=1 "
+                                "productionBSDFUntouched=1 diagnosticOnly=1 "
+                                "physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n",
+                                side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                lane15gl, (double)childState15gm.lambda,
+                                revOK15hl ? 1u : 0u, revTir15hl ? 1u : 0u,
+                                (double)revPdf15hl, (double)revDelta15hl,
+                                (double)revNc15hl, (double)revNt15hl,
+                                (double)revEta15hl, (double)revF15hl,
+                                (double)revTransport15hl,
+                                reverseLower15hk, reverseUpper15hk,
+                                inInterval15hl ? 1u : 0u, valid15hk ? 1u : 0u,
+                                revMassValid15hl ? 1u : 0u);
+                            // 15jg: compare native-helper forward and copied-hit-point
+                            // reverse DISCRETE GLASS EVENT masses. This is NOT
+                            // an angular PDF, not a reconstructed reverse BSDF
+                            // and must NEVER be used for BIDIR MIS weights.
+                            const bool forwardValid15jg = ok15gl && !tir15gl &&
+                                std::isfinite((double)lanePdf15gl) &&
+                                lanePdf15gl > 0.f && lanePdf15gl <= 1.f;
+                            const bool reverseValid15jg = revMassValid15hl &&
+                                revPdf15hl > 0.f;
+                            const bool pairedValid15jg = forwardValid15jg && reverseValid15jg;
+                            const double logReverseOverForward15jg = pairedValid15jg ?
+                                log((double)revPdf15hl / (double)lanePdf15gl) : 0.;
+                            const bool ratioFinite15jg = pairedValid15jg &&
+                                std::isfinite(logReverseOverForward15jg);
+                            // Do not infer reciprocity from equality: the forward
+                            // and reverse sampling policies can differ by eta,
+                            // transport mode, Kr/Kt, event clamp and TIR.
+                            fprintf(file15gl,
+                                "phase15jg REVERSE_DELTA_EVENT_AUDIT side=%s ticket=%llu child=%u "
+                                "lane=%u lambda=%.9g event=%u forwardValid=%u reverseValid=%u "
+                                "pairedValid=%u forwardMass=%.12g reverseMass=%.12g "
+                                "logReverseOverForward=%.12g logRatioFinite=%u "
+                                "forwardTIR=%u reverseTIR=%u "
+                                "measure=DISCRETE_DELTA_EVENT "
+                                "forwardSource=GlassMaterial_helper "
+                                "reverseSource=COPIED_HITPOINT_helper "
+                                "reverseBSDFRebuilt=0 reverseMediumStackRebuilt=0 "
+                                "spectralSelectionPdfIncluded=0 fullJointPdfKnown=0 "
+                                "misUsable=0 diagnosticOnly=1 childRays=0 physicsChanged=0\n",
+                                side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                lane15gl, (double)childState15gm.lambda, (unsigned)event,
+                                forwardValid15jg ? 1u : 0u, reverseValid15jg ? 1u : 0u,
+                                pairedValid15jg ? 1u : 0u,
+                                (double)lanePdf15gl, (double)revPdf15hl,
+                                ratioFinite15jg ? logReverseOverForward15jg : 0.,
+                                ratioFinite15jg ? 1u : 0u,
+                                tir15gl ? 1u : 0u, revTir15hl ? 1u : 0u);
+                            rayDirLength15gn = directionWorld15gn.Length();
+                            const luxrays::Vector sampledLocal15gn = frame15gn.ToLocal(sampledDir);
+                            reconstructedDelta15gn = (directionLocal15gn - sampledLocal15gn).Length();
+                            if (std::isfinite(rayDirLength15gn) &&
+                                    fabsf(rayDirLength15gn - 1.f) < 1e-3f &&
+                                    std::isfinite(reconstructedDelta15gn)) {
+                                luxrays::Ray candidateRay15gn(
+                                    pathVertex->bsdf.GetRayOrigin(directionWorld15gn),
+                                    directionWorld15gn);
+                                candidateRay15gn.UpdateMinMaxWithEpsilon();
+                                candidateRay15gn.time = time;
+                                rayMint15gn = candidateRay15gn.mint;
+                                rayTime15gn = candidateRay15gn.time;
+                                rayValid15gn = std::isfinite(rayMint15gn) && rayMint15gn >= 0.f &&
+                                    std::isfinite(rayTime15gn);
+                                // 15go: one diagnostic scene query per candidate.
+                                // All mutable arguments belong to LOCAL COPIES.
+                                // No sampler consumption, child continuation, MIS/RR, or film writes.
+                                // Scene::Intersect returns the first ACCEPTED surface after its
+                                // normal transparency/volume handling, not necessarily the first triangle.
+                                if (rayValid15gn) {
+                                    luxrays::RayHit childHit15go;
+                                    BSDF childBSDF15go;
+                                    Spectrum childConnection15go;
+                                    // 15gw Stage 12: mirror the transmission at the glass
+                                    // interface in a LOCAL copy before tracing the child.
+                                    // The production parent is updated later by the normal path.
+                                    PathVolumeInfo childVolumeBeforeGlass15gw = pathVertex->volInfo;
+                                    PathVolumeInfo childVolumeAfterGlass15gw = childVolumeBeforeGlass15gw;
+                                    const BSDFEvent childGlassEvent15gw = event;
+                                    const bool childGlassIsTransmission15gw =
+                                        (childGlassEvent15gw & TRANSMIT) != 0;
+                                    if (childGlassIsTransmission15gw)
+                                        childVolumeAfterGlass15gw.Update(childGlassEvent15gw, pathVertex->bsdf);
+                                    PathVolumeInfo childVolume15go = childVolumeAfterGlass15gw;
+                                    const bool childHitAccepted15go = engine->renderConfig.GetScene().Intersect(device,
+                                        (side15gl ? LIGHT_RAY : EYE_RAY) | INDIRECT_RAY,
+                                        &childVolume15go, .5f, &candidateRay15gn,
+                                        &childHit15go, &childBSDF15go, &childConnection15go);
+                                    const float hitDistance15go = childHitAccepted15go ? childHit15go.t : -1.f;
+                                    const u_int hitMaterial15go = childHitAccepted15go ?
+                                        childBSDF15go.GetMaterialID() : 0u;
+                                    // 15gp Stage 5: inspect the independent accepted child BSDF.
+                                    // This is read-only diagnostics: no child path continuation.
+                                    if (childHitAccepted15go) {
+                                        const luxrays::Point &childP15gp = childBSDF15go.hitPoint.p;
+                                        const luxrays::Normal &childShadeN15gp = childBSDF15go.hitPoint.shadeN;
+                                        const luxrays::Normal &childGeomN15gp = childBSDF15go.hitPoint.geometryN;
+                                        const luxrays::Vector &childFixed15gp = childBSDF15go.hitPoint.fixedDir;
+                                        const bool finiteGeometry15gp =
+                                            std::isfinite(childP15gp.x) && std::isfinite(childP15gp.y) &&
+                                            std::isfinite(childP15gp.z) &&
+                                            std::isfinite(childShadeN15gp.x) && std::isfinite(childShadeN15gp.y) &&
+                                            std::isfinite(childShadeN15gp.z) &&
+                                            std::isfinite(childGeomN15gp.x) && std::isfinite(childGeomN15gp.y) &&
+                                            std::isfinite(childGeomN15gp.z) &&
+                                            std::isfinite(childFixed15gp.x) && std::isfinite(childFixed15gp.y) &&
+                                            std::isfinite(childFixed15gp.z);
+                                        fprintf(file15gl,
+                                            "phase15gp CHILD_BSDF side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.9g materialID=%u "
+                                            "p=(%.9g,%.9g,%.9g) "
+                                            "shadeN=(%.9g,%.9g,%.9g) "
+                                            "geomN=(%.9g,%.9g,%.9g) "
+                                            "fixedDir=(%.9g,%.9g,%.9g) "
+                                            "delta=%u finiteGeometry=%u "
+                                            "ownBSDF=1 ownVolume=1 "
+                                            "queued=0 childContinued=0 filmChanged=0 "
+                                            "misChanged=0 rrChanged=0 transportApplied=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, childState15gm.lambda, hitMaterial15go,
+                                            childP15gp.x, childP15gp.y, childP15gp.z,
+                                            childShadeN15gp.x, childShadeN15gp.y, childShadeN15gp.z,
+                                            childGeomN15gp.x, childGeomN15gp.y, childGeomN15gp.z,
+                                            childFixed15gp.x, childFixed15gp.y, childFixed15gp.z,
+                                            childBSDF15go.IsDelta() ? 1u : 0u,
+                                            finiteGeometry15gp ? 1u : 0u);
+                                    }
+                                    // 15hb: feed distinct local debug-stream draws into
+                                    // the already-diagnostic 15gq child BSDF Sample().
+                                    // Does NOT consume production Sampler dimensions.
+                                    // No child path is queued or added to the film.
+                                    if (childHitAccepted15go) {
+                                        luxrays::Vector childNextDir15gq;
+                                        float childNextPdf15gq = 0.f;
+                                        float childNextCos15gq = 0.f;
+                                        BSDFEvent childNextEvent15gq;
+                                        // 15jq: the second-boundary counterfactual sample needs
+                                        // the CHILD wavelength, not the previous child TLS lane.
+                                        // Save/restore all modified TLS state; production untouched.
+                                        const u_int savedLane15jq = GetMLHeroActiveLane();
+                                        const float savedWavelength15jq = mlDispersionWaveLength;
+                                        const bool savedDispersionUsed15jq = mlDispersionUsed;
+                                        SetMLHeroActiveLane(lane15gl);
+                                        const float sampleWavelength15jq = mlDispersionWaveLength;
+                                        const Spectrum childNextWeight15gq = childBSDF15go.Sample(
+                                            &childNextDir15gq, draw15hb.u0, draw15hb.u1,
+                                            &childNextPdf15gq, &childNextCos15gq,
+                                            &childNextEvent15gq);
+                                        // Retain the native TIR/lobe snapshots; restore wavelength
+                                        // ownership before any further diagnostic evaluation.
+                                        SetMLHeroActiveLane(savedLane15jq);
+                                        mlDispersionWaveLength = savedWavelength15jq;
+                                        mlDispersionUsed = savedDispersionUsed15jq;
+                                        fprintf(file15gl,
+                                            "phase15jq CHILD_SECOND_SAMPLE_TLS side=%s ticket=%llu child=%u "
+                                            "lane=%u expectedLambda=%.12g beforeLane=%u beforeLambda=%.12g "
+                                            "sampleLambda=%.12g restoredLane=%u restoredLambda=%.12g "
+                                            "sampleMatchesChild=%u restorationMatches=%u "
+                                            "diagnosticOnly=1 productionSamplerUntouched=1 childRays=0 "
+                                            "misChanged=0 rrChanged=0 physicsChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, (double)childState15gm.lambda,
+                                            savedLane15jq, (double)savedWavelength15jq,
+                                            (double)sampleWavelength15jq,
+                                            GetMLHeroActiveLane(), (double)mlDispersionWaveLength,
+                                            fabs((double)sampleWavelength15jq-(double)childState15gm.lambda)<1.e-3 ? 1u : 0u,
+                                            (GetMLHeroActiveLane()==savedLane15jq &&
+                                             mlDispersionWaveLength==savedWavelength15jq &&
+                                             mlDispersionUsed==savedDispersionUsed15jq) ? 1u : 0u);
+                                        // 15jl: capture native GlassMaterial::Sample lobe state NOW,
+                                        // before any later helper / BSDF audit can overwrite TLS.
+                                        unsigned nativeValid15jl=0u, nativeR15jl=0u, nativeT15jl=0u, nativeBlack15jl=0u;
+                                        float nativeRF15jl=0.f, nativeTF15jl=0.f;
+                                        float nativeThreshold15jl=0.f, nativeU15jl=0.f;
+                                        const bool nativeSnapshot15jl=GetMLHeroNativeLobe15ir(
+                                            &nativeValid15jl, &nativeR15jl, &nativeT15jl,
+                                            &nativeBlack15jl, &nativeRF15jl, &nativeTF15jl,
+                                            &nativeThreshold15jl, &nativeU15jl);
+                                        unsigned nativeTIRReason15jl=0u, nativeSelected15jl=0u;
+                                        float nativeWavelength15jl=0.f, nativeNc15jl=0.f;
+                                        float nativeNtBase15jl=0.f, nativeNtLambda15jl=0.f;
+                                        float nativeCos15jl=0.f, nativeEta15jl=0.f;
+                                        float nativeSinT2_15jl=0.f, nativeUnused15jl=0.f;
+                                        unsigned nativeFromLight15jl=0u;
+                                        unsigned long long nativeTotal15jl=0, nativeRejected15jl=0, nativeBlackTotal15jl=0;
+                                        const bool nativeTIRSnapshot15jl=GetMLHeroGlassTIRSample15ii(
+                                            &nativeTIRReason15jl, &nativeSelected15jl,
+                                            &nativeWavelength15jl, &nativeNc15jl,
+                                            &nativeNtBase15jl, &nativeNtLambda15jl,
+                                            &nativeCos15jl, &nativeEta15jl,
+                                            &nativeSinT2_15jl, &nativeUnused15jl,
+                                            &nativeFromLight15jl, &nativeTotal15jl,
+                                            &nativeRejected15jl, &nativeBlackTotal15jl);
+                                        if ((childNextEvent15gq & REFLECT) != 0) {
+                                            const bool nativeStateValid15jl=nativeSnapshot15jl && nativeValid15jl &&
+                                                nativeTIRSnapshot15jl;
+                                            const bool onlyReflect15jl=nativeStateValid15jl &&
+                                                nativeR15jl && !nativeT15jl;
+                                            const bool nativeTIR15jl=nativeTIRReason15jl==1u;
+                                            const bool spectralLaneMatch15jl=std::isfinite((double)nativeWavelength15jl) &&
+                                                fabsf(nativeWavelength15jl-childState15gm.lambda)<1.e-3f;
+                                            const bool pdfMatches15jl=nativeStateValid15jl &&
+                                                fabsf((1.f-nativeThreshold15jl)-childNextPdf15gq)<1.e-5f;
+                                            fprintf(file15gl,
+                                                "phase15jl NATIVE_REFLECTION_DECISION side=%s ticket=%llu child=%u "
+                                                "lane=%u lambda=%.9g snapshotValid=%u tirSnapshotValid=%u "
+                                                "nativeTIR=%u nativeReason=%u nativeSelected=%u "
+                                                "reflectPresent=%u transmitPresent=%u bothBlack=%u onlyReflect=%u "
+                                                "reflectFilter=%.12g transmitFilter=%.12g threshold=%.12g "
+                                                "passThrough=%.12g nativePdf=%.12g expectedReflectPdf=%.12g "
+                                                "pdfMatches=%u selectedByThreshold=%u "
+                                                "nativeWavelength=%.12g laneWavelengthMatch=%u "
+                                                "nativeNc=%.12g nativeNtBase=%.12g nativeNtLambda=%.12g "
+                                                "nativeCos=%.12g nativeEta=%.12g nativeSinT2=%.12g "
+                                                "nativeFromLight=%u sampledEvent=%u "
+                                                "sampleWeightBlack=%u classification=%s "
+                                                "diagnosticOnly=1 childRays=0 physicsChanged=0 misChanged=0 rrChanged=0 notForMIS=1\n",
+                                                side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                                lane15gl, (double)childState15gm.lambda,
+                                                nativeStateValid15jl ? 1u : 0u, nativeTIRSnapshot15jl ? 1u : 0u,
+                                                nativeTIR15jl ? 1u : 0u, nativeTIRReason15jl, nativeSelected15jl,
+                                                nativeR15jl, nativeT15jl, nativeBlack15jl, onlyReflect15jl ? 1u : 0u,
+                                                (double)nativeRF15jl, (double)nativeTF15jl,
+                                                (double)nativeThreshold15jl, (double)nativeU15jl,
+                                                (double)childNextPdf15gq, (double)(1.f-nativeThreshold15jl),
+                                                pdfMatches15jl ? 1u : 0u,
+                                                (nativeU15jl>=nativeThreshold15jl) ? 1u : 0u,
+                                                (double)nativeWavelength15jl, spectralLaneMatch15jl ? 1u : 0u,
+                                                (double)nativeNc15jl, (double)nativeNtBase15jl,
+                                                (double)nativeNtLambda15jl, (double)nativeCos15jl,
+                                                (double)nativeEta15jl, (double)nativeSinT2_15jl,
+                                                nativeFromLight15jl, (unsigned)childNextEvent15gq,
+                                                childNextWeight15gq.Black() ? 1u : 0u,
+                                                !nativeStateValid15jl ? "SNAPSHOT_UNAVAILABLE" :
+                                                nativeTIR15jl ? "TIR" :
+                                                onlyReflect15jl ? "TRANSMISSION_LOBE_ABSENT" :
+                                                (nativeR15jl && nativeT15jl ? "BOTH_LOBES_PRESENT" :
+                                                 "OTHER_SUPPORT"));
+                                        }
+                                        // 15hs Stage 34: read-only spectral probe at the FIRST
+                                        // accepted post-glass hit (the geometric exit of 15hr).
+                                        // We only compare transmission eta if the existing
+                                        // diagnostic second BSDF sample chose TRANSMIT.
+                                        // No extra sampling, transport, stack or MIS changes.
+                                        const slg::Material &secondMaterial15hs =
+                                            engine->renderConfig.GetScene().GetMaterials().GetMaterial(
+                                                childBSDF15go.GetMaterialName());
+                                        const bool secondIdealGlass15hs =
+                                            dynamic_cast<const slg::GlassMaterial *>(&secondMaterial15hs) != nullptr;
+                                        const bool secondExit15hs = !childBSDF15go.hitPoint.intoObject;
+                                        const bool secondTransmit15hs = (childNextEvent15gq & TRANSMIT) != 0;
+                                        // 15jn: probe every ACTUAL stored HERO packet wavelength at
+                                        // the same second ideal-glass hit. Query REFLECT's discrete event
+                                        // mass even if the independently sampled event was TRANSMIT.
+                                        // This evaluates lobe support, not a physical reflected child ray.
+                                        if (secondIdealGlass15hs && secondExit15hs &&
+                                                childNextPdf15gq > 0.f) {
+                                            const u_int packetCount15jn = Min(pathVertex->mlHeroLaneCount, 8u);
+                                            u_int validCount15jn=0u, tirCount15jn=0u;
+                                            u_int transmitCount15jn=0u, invalidCount15jn=0u;
+                                            u_int reflectionOnly15jo=0u, dualSupport15jo=0u, directionValid15jo=0u;
+                                            double maxTransmissionSpread15jo=0., maxReflectTransmitSeparation15jo=0.;
+                                            luxrays::Vector firstTransDir15jo(0.f,0.f,0.f);
+                                            bool firstTransValid15jo=false;
+                                            // 15jp: true all-pairs transmission spread and sampled-lane audit.
+                                            luxrays::Vector allTrans15jp[8];
+                                            float allTransLambda15jp[8]={};
+                                            u_int allTransCount15jp=0u;
+                                            double maxPairSpread15jp=0.;
+                                            double maxPairAngleDeg15jp=0.;
+                                            float maxPairLambdaA15jp=-1.f,maxPairLambdaB15jp=-1.f;
+                                            u_int selectedLaneChecked15jp=0u, selectedLanePass15jp=0u;
+                                            u_int selectedLaneMismatch15jp=0u;
+                                            double massSum15jn=0.;
+                                            double minMass15jn=2., maxMass15jn=-1.;
+                                            double minLambda15jn=1.e9, maxLambda15jn=-1.;
+                                            // The direction argument is NOT used to determine the
+                                            // event mass; reported directionDelta is ignored.
+                                            for (u_int packetLane15jn=0u; packetLane15jn<packetCount15jn; ++packetLane15jn) {
+                                                const float lambda15jn=pathVertex->mlHeroLaneWaveLength[packetLane15jn];
+                                                float nc15jn=0.f, base15jn=0.f, nt15jn=0.f;
+                                                float fresnel15jn=0.f, eta15jn=0.f, eta215jn=0.f;
+                                                float transport15jn=0.f, delta15jn=0.f;
+                                                float cos15jn=0.f, sinI215jn=0.f, sinT215jn=0.f;
+                                                float reflectMass15jn=-1.f;
+                                                bool tir15jn=false;
+                                                Spectrum weight15jn(0.f);
+                                                const bool validLambda15jn=std::isfinite((double)lambda15jn) &&
+                                                    lambda15jn>=380.f && lambda15jn<=780.f;
+                                                const bool ok15jn=validLambda15jn &&
+                                                    childBSDF15go.EvaluateMLHeroGlassDebugAtWaveLength(
+                                                        childNextDir15gq, (BSDFEvent)(SPECULAR | REFLECT),
+                                                        childNextPdf15gq, lambda15jn,
+                                                        &nc15jn, &base15jn, &nt15jn,
+                                                        &fresnel15jn, &eta15jn, &eta215jn,
+                                                        &transport15jn, &delta15jn, &weight15jn,
+                                                        &cos15jn, &sinI215jn, &sinT215jn,
+                                                        &tir15jn, &reflectMass15jn);
+                                                const bool massOK15jn=ok15jn &&
+                                                    std::isfinite((double)reflectMass15jn) &&
+                                                    reflectMass15jn>=0.f && reflectMass15jn<=1.f;
+                                                if (massOK15jn) {
+                                                    ++validCount15jn;
+                                                    if (tir15jn) ++tirCount15jn;
+                                                    else ++transmitCount15jn;
+                                                    massSum15jn+=reflectMass15jn;
+                                                    minMass15jn=std::min(minMass15jn,(double)reflectMass15jn);
+                                                    maxMass15jn=std::max(maxMass15jn,(double)reflectMass15jn);
+                                                    minLambda15jn=std::min(minLambda15jn,(double)lambda15jn);
+                                                    maxLambda15jn=std::max(maxLambda15jn,(double)lambda15jn);
+                                                } else ++invalidCount15jn;
+                                                // 15jo: analytic directions only, never used for tracing or MIS.
+                                                // fixedDir points away from the surface towards the prior vertex.
+                                                const luxrays::Vector incident15jo=childBSDF15go.hitPoint.fixedDir;
+                                                const luxrays::Normal shading15jo=childBSDF15go.hitPoint.shadeN;
+                                                const luxrays::Vector normal15jo(shading15jo.x,shading15jo.y,shading15jo.z);
+                                                const double cosIn15jo=(double)Dot(incident15jo,normal15jo);
+                                                const double incidentLength15jo=(double)incident15jo.Length();
+                                                const double normalLength15jo=(double)normal15jo.Length();
+                                                const bool geometryValid15jo=massOK15jn &&
+                                                    std::isfinite(cosIn15jo) &&
+                                                    fabs(incidentLength15jo-1.)<1.e-3 &&
+                                                    fabs(normalLength15jo-1.)<1.e-3 &&
+                                                    std::isfinite((double)eta15jn) && eta15jn>0.f;
+                                                const luxrays::Vector reflected15jo=-incident15jo+
+                                                    normal15jo*(float)(2.*cosIn15jo);
+                                                const double tangentSq15jo=std::max(0.,1.-cosIn15jo*cosIn15jo);
+                                                const double k15jo=1.-(double)eta15jn*(double)eta15jn*tangentSq15jo;
+                                                const bool transmissionDirectionValid15jo=geometryValid15jo &&
+                                                    !tir15jn && std::isfinite(k15jo) && k15jo>=-1.e-6;
+                                                luxrays::Vector transmitted15jo(0.f,0.f,0.f);
+                                                if(transmissionDirectionValid15jo) {
+                                                    const luxrays::Vector tangent15jo=incident15jo-normal15jo*(float)cosIn15jo;
+                                                    const double outCos15jo=sqrt(std::max(0.,k15jo));
+                                                    transmitted15jo=-tangent15jo*eta15jn-normal15jo*
+                                                        (float)((cosIn15jo>=0.)?outCos15jo:-outCos15jo);
+                                                    if(allTransCount15jp<8u) {
+                                                        // Compare every transmission direction, not just lane zero.
+                                                        for(u_int prev15jp=0u;prev15jp<allTransCount15jp;++prev15jp) {
+                                                            const double vectorDelta15jp=(double)(transmitted15jo-allTrans15jp[prev15jp]).Length();
+                                                            if(vectorDelta15jp>maxPairSpread15jp) {
+                                                                maxPairSpread15jp=vectorDelta15jp;
+                                                                maxPairLambdaA15jp=allTransLambda15jp[prev15jp];
+                                                                maxPairLambdaB15jp=lambda15jn;
+                                                                const double lenA15jp=(double)allTrans15jp[prev15jp].Length();
+                                                                const double lenB15jp=(double)transmitted15jo.Length();
+                                                                const double dot15jp=(double)Dot(allTrans15jp[prev15jp],transmitted15jo);
+                                                                const double cosine15jp=(lenA15jp>0. && lenB15jp>0.) ?
+                                                                    std::max(-1.,std::min(1.,dot15jp/(lenA15jp*lenB15jp))) : 1.;
+                                                                maxPairAngleDeg15jp=acos(cosine15jp)*(180./3.14159265358979323846);
+                                                            }
+                                                        }
+                                                        allTrans15jp[allTransCount15jp]=transmitted15jo;
+                                                        allTransLambda15jp[allTransCount15jp]=lambda15jn;
+                                                        ++allTransCount15jp;
+                                                    }
+                                                    if(!firstTransValid15jo) {
+                                                        firstTransDir15jo=transmitted15jo;
+                                                        firstTransValid15jo=true;
+                                                    } else maxTransmissionSpread15jo=std::max(maxTransmissionSpread15jo,
+                                                        (double)(transmitted15jo-firstTransDir15jo).Length());
+                                                    maxReflectTransmitSeparation15jo=std::max(maxReflectTransmitSeparation15jo,
+                                                        (double)(reflected15jo-transmitted15jo).Length());
+                                                }
+                                                if(geometryValid15jo) {
+                                                    ++directionValid15jo;
+                                                    if(tir15jn) ++reflectionOnly15jo;
+                                                    else ++dualSupport15jo;
+                                                }
+                                                // Real second-boundary GlassMaterial::Sample direction is
+                                                // available only for the selected child wavelength. Never
+                                                // claim all eight analytic lanes were natively sampled here.
+                                                if(massOK15jn && geometryValid15jo &&
+                                                        fabs((double)lambda15jn-(double)childState15gm.lambda)<1.e-3) {
+                                                    const bool nativeReflect15jp=(childNextEvent15gq & REFLECT)!=0;
+                                                    const bool nativeTransmit15jp=(childNextEvent15gq & TRANSMIT)!=0;
+                                                    const luxrays::Vector expected15jp=nativeReflect15jp ?
+                                                        reflected15jo:transmitted15jo;
+                                                    const bool expectedAvailable15jp=nativeReflect15jp ||
+                                                        (nativeTransmit15jp && transmissionDirectionValid15jo);
+                                                    const double vectorResidual15jp=expectedAvailable15jp ?
+                                                        (double)(childNextDir15gq-expected15jp).Length():-1.;
+                                                    const double nativeLen15jp=(double)childNextDir15gq.Length();
+                                                    const double expectedLen15jp=(double)expected15jp.Length();
+                                                    const double cosine15jp=(expectedAvailable15jp && nativeLen15jp>0. && expectedLen15jp>0.) ?
+                                                        std::max(-1.,std::min(1.,(double)Dot(childNextDir15gq,expected15jp)/
+                                                            (nativeLen15jp*expectedLen15jp))):1.;
+                                                    const double angularResidual15jp=expectedAvailable15jp ?
+                                                        acos(cosine15jp)*(180./3.14159265358979323846):-1.;
+                                                    const bool pass15jp=expectedAvailable15jp &&
+                                                        !((nativeTransmit15jp && tir15jn) ||
+                                                          (!nativeReflect15jp && !nativeTransmit15jp)) &&
+                                                        vectorResidual15jp<=2.e-4;
+                                                    ++selectedLaneChecked15jp;
+                                                    if(pass15jp) ++selectedLanePass15jp;
+                                                    else ++selectedLaneMismatch15jp;
+                                                    fprintf(file15gl,
+                                                        "phase15jp NATIVE_SELECTED_DIRECTION side=%s ticket=%llu child=%u "
+                                                        "lane=%u lambda=%.12g event=%u tir=%u "
+                                                        "nativeWavelengthFromChild=1 expectedAvailable=%u "
+                                                        "nativeDir=(%.9g,%.9g,%.9g) analyticDir=(%.9g,%.9g,%.9g) "
+                                                        "vectorResidual=%.12g angularResidualDeg=%.12g "
+                                                        "eta=%.12g nc=%.12g ntLambda=%.12g incidentCos=%.12g "
+                                                        "nativeSample=1 pass=%u toleranceVector=0.0002 "
+                                                        "otherPacketLanesNativeSampled=0 noNewSampling=1 "
+                                                        "physicalChildRays=0 MIS=UNCHANGED RR=UNCHANGED physicsChanged=0\n",
+                                                        side15gl?"LIGHT":"EYE",ticket15gl,child15gl,
+                                                        packetLane15jn,(double)lambda15jn,(u_int)childNextEvent15gq,
+                                                        tir15jn?1u:0u,expectedAvailable15jp?1u:0u,
+                                                        (double)childNextDir15gq.x,(double)childNextDir15gq.y,(double)childNextDir15gq.z,
+                                                        (double)expected15jp.x,(double)expected15jp.y,(double)expected15jp.z,
+                                                        vectorResidual15jp,angularResidual15jp,
+                                                        (double)eta15jn,(double)nc15jn,(double)nt15jn,cosIn15jo,
+                                                        pass15jp?1u:0u);
+                                                }
+                                                fprintf(file15gl,
+                                                    "phase15jo LANE_DIRECTION_GROUP side=%s ticket=%llu child=%u packetLane=%u "
+                                                    "lambda=%.12g group=%s directionValid=%u reflectX=%.9g reflectY=%.9g reflectZ=%.9g "
+                                                    "transmitDirectionValid=%u transmitX=%.9g transmitY=%.9g transmitZ=%.9g "
+                                                    "eta=%.12g k=%.12g incidentCos=%.12g "
+                                                    "directionMethod=ANALYTIC_SAME_HIT notSampled=1 noExtraRays=1 physicsChanged=0 notForMIS=1\n",
+                                                    side15gl?"LIGHT":"EYE",ticket15gl,child15gl,packetLane15jn,(double)lambda15jn,
+                                                    !geometryValid15jo?"INVALID":(tir15jn?"REFLECTION_ONLY_TIR":"REFLECTION_AND_TRANSMISSION"),
+                                                    geometryValid15jo?1u:0u,
+                                                    (double)reflected15jo.x,(double)reflected15jo.y,(double)reflected15jo.z,
+                                                    transmissionDirectionValid15jo?1u:0u,
+                                                    (double)transmitted15jo.x,(double)transmitted15jo.y,(double)transmitted15jo.z,
+                                                    (double)eta15jn,k15jo,cosIn15jo);
+                                                fprintf(file15gl,
+                                                    "phase15jn EIGHT_LANE_SECOND_BOUNDARY side=%s ticket=%llu child=%u "
+                                                    "sourceLane=%u packetLane=%u lambda=%.12g "
+                                                    "valid=%u tir=%u transmissionGeometricallyPossible=%u "
+                                                    "nc=%.12g ntBase=%.12g ntLambda=%.12g eta=%.12g "
+                                                    "cosIncident=%.12g sinI2=%.12g sinT2=%.12g "
+                                                    "fresnel=%.12g reflectEventMass=%.12g transmitEventMass=%.12g "
+                                                    "sampledEvent=%u sampledLambda=%.12g "
+                                                    "sameSecondHit=1 directionUnvalidated=1 massMeasure=DISCRETE_EVENT "
+                                                    "notForMIS=1 noExtraSampling=1 childRays=0 physicsChanged=0\n",
+                                                    side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                                    lane15gl, packetLane15jn, (double)lambda15jn,
+                                                    massOK15jn ? 1u : 0u, (massOK15jn && tir15jn) ? 1u : 0u,
+                                                    (massOK15jn && !tir15jn) ? 1u : 0u,
+                                                    (double)nc15jn, (double)base15jn, (double)nt15jn,
+                                                    (double)eta15jn, (double)cos15jn,
+                                                    (double)sinI215jn, (double)sinT215jn,
+                                                    (double)fresnel15jn,
+                                                    massOK15jn ? (double)reflectMass15jn : -1.,
+                                                    massOK15jn ? 1.-(double)reflectMass15jn : -1.,
+                                                    (u_int)childNextEvent15gq, (double)childState15gm.lambda);
+                                            }
+                                            fprintf(file15gl,
+                                                "phase15jp DIRECTION_PAIR_AUDIT side=%s ticket=%llu child=%u "
+                                                "packetCount=%u candidateTransmissionDirections=%u "
+                                                "maxPairwiseVectorSpread=%.12g maxPairwiseAngleDeg=%.12g "
+                                                "maxPairLambdaA=%.12g maxPairLambdaB=%.12g "
+                                                "previousFirstLaneSpread=%.12g "
+                                                "nativeSelectedChecked=%u nativeSelectedPass=%u nativeSelectedMismatch=%u "
+                                                "reflectionDirectionWavelengthIndependent=1 "
+                                                "otherLanesAnalyticOnly=1 nativeMultiLaneSecondSampleNotRun=1 "
+                                                "jointSpectralMIS=UNAVAILABLE noExtraSampling=1 childRays=0 physicsChanged=0\n",
+                                                side15gl?"LIGHT":"EYE",ticket15gl,child15gl,
+                                                packetCount15jn,allTransCount15jp,
+                                                maxPairSpread15jp,maxPairAngleDeg15jp,
+                                                (double)maxPairLambdaA15jp,(double)maxPairLambdaB15jp,
+                                                maxTransmissionSpread15jo,
+                                                selectedLaneChecked15jp,selectedLanePass15jp,selectedLaneMismatch15jp);
+                                            fprintf(file15gl,
+                                                "phase15jo DIRECTION_GROUP_SUMMARY side=%s ticket=%llu child=%u "
+                                                "packetCount=%u validDirection=%u reflectionOnlyTIR=%u dualSupport=%u "
+                                                "mixedDirectionSupport=%u maxTransmittedVectorSpread=%.12g "
+                                                "maxReflectTransmitVectorSeparation=%.12g "
+                                                "reflectionDirectionShared=1 analyticOnly=1 "
+                                                "physicalChildRays=0 jointSpectralMIS=UNAVAILABLE physicsChanged=0\n",
+                                                side15gl?"LIGHT":"EYE",ticket15gl,child15gl,
+                                                packetCount15jn,directionValid15jo,reflectionOnly15jo,dualSupport15jo,
+                                                (reflectionOnly15jo>0u && dualSupport15jo>0u)?1u:0u,
+                                                maxTransmissionSpread15jo,maxReflectTransmitSeparation15jo);
+                                            fprintf(file15gl,
+                                                "phase15jn EIGHT_LANE_SECOND_BOUNDARY_SUMMARY side=%s ticket=%llu child=%u "
+                                                "packetCount=%u valid=%u invalid=%u tir=%u nonTIR=%u "
+                                                "mixedTIR=%u allTIR=%u allNonTIR=%u "
+                                                "minLambda=%.12g maxLambda=%.12g "
+                                                "minReflectMass=%.12g maxReflectMass=%.12g meanReflectMass=%.12g "
+                                                "sampledEvent=%u sameSecondHit=1 physicalChildren=0 "
+                                                "jointSpectralMIS=UNAVAILABLE diagnosticOnly=1 physicsChanged=0\n",
+                                                side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                                packetCount15jn,validCount15jn,invalidCount15jn,
+                                                tirCount15jn,transmitCount15jn,
+                                                (tirCount15jn>0u && transmitCount15jn>0u) ? 1u : 0u,
+                                                (validCount15jn==packetCount15jn && tirCount15jn==packetCount15jn) ? 1u : 0u,
+                                                (validCount15jn==packetCount15jn && transmitCount15jn==packetCount15jn) ? 1u : 0u,
+                                                validCount15jn ? minLambda15jn : -1.,
+                                                validCount15jn ? maxLambda15jn : -1.,
+                                                validCount15jn ? minMass15jn : -1.,
+                                                validCount15jn ? maxMass15jn : -1.,
+                                                validCount15jn ? massSum15jn/validCount15jn : -1.,
+                                                (u_int)childNextEvent15gq);
+                                        }
+                                        float secondNc15hs=0.f, secondBase15hs=0.f, secondNt15hs=0.f;
+                                        float secondF15hs=0.f, secondEta15hs=0.f, secondEta2_15hs=0.f;
+                                        float secondTransport15hs=0.f, secondDelta15hs=0.f;
+                                        float secondPdf15hs=0.f;
+                                        bool secondTir15hs=false;
+                                        Spectrum secondValue15hs(0.f);
+                                        const bool secondProbe15hs = secondIdealGlass15hs && secondExit15hs &&
+                                            secondTransmit15hs && childNextPdf15gq > 0.f &&
+                                            childBSDF15go.EvaluateMLHeroGlassDebugAtWaveLength(
+                                                childNextDir15gq, childNextEvent15gq, childNextPdf15gq,
+                                                childState15gm.lambda,
+                                                &secondNc15hs, &secondBase15hs, &secondNt15hs,
+                                                &secondF15hs, &secondEta15hs, &secondEta2_15hs,
+                                                &secondTransport15hs, &secondDelta15hs,
+                                                &secondValue15hs, nullptr, nullptr, nullptr,
+                                                &secondTir15hs, &secondPdf15hs);
+                                        const bool firstEtaValid15hs = ok15gl && !tir15gl &&
+                                            std::isfinite((double)eta15gl) && eta15gl > 0.f;
+                                        const bool secondEtaValid15hs = secondProbe15hs && !secondTir15hs &&
+                                            std::isfinite((double)secondEta15hs) && secondEta15hs > 0.f;
+                                        const double etaProduct15hs = firstEtaValid15hs && secondEtaValid15hs ?
+                                            (double)eta15gl * (double)secondEta15hs : -1.;
+                                        // The two surfaces can be different materials / media.
+                                        // A reciprocal eta is expected only for a matching pair.
+                                        const bool matchedMediumCandidates15hs = secondEtaValid15hs &&
+                                            fabs((double)nt15gl - (double)secondNt15hs) < 1e-4 &&
+                                            fabs((double)nc15gl - (double)secondNc15hs) < 1e-4;
+                                        fprintf(file15gl,
+                                            "phase15hs EXIT_SPECTRAL_IOR side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.9g secondHit=1 secondExit=%u secondIdealGlass=%u "
+                                            "sampledTransmit=%u sampledEvent=%u sampledPdf=%.9g "
+                                            "firstValid=%u firstNc=%.9g firstBase=%.9g firstNt=%.9g firstEta=%.9g "
+                                            "secondProbe=%u secondTIR=%u secondValid=%u "
+                                            "secondNc=%.9g secondBase=%.9g secondNt=%.9g secondEta=%.9g "
+                                            "secondFresnel=%.9g secondEventPdf=%.9g "
+                                            "etaProduct=%.12g mediumCandidatesMatch=%u "
+                                            "reciprocalComparisonEligible=%u "
+                                            "fullMediumReconstructionNotProven=1 reverseMISNotEvaluated=1 "
+                                            "diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, (double)childState15gm.lambda,
+                                            secondExit15hs ? 1u : 0u, secondIdealGlass15hs ? 1u : 0u,
+                                            secondTransmit15hs ? 1u : 0u, (u_int)childNextEvent15gq,
+                                            (double)childNextPdf15gq,
+                                            firstEtaValid15hs ? 1u : 0u, (double)nc15gl,
+                                            (double)base15gl, (double)nt15gl, (double)eta15gl,
+                                            secondProbe15hs ? 1u : 0u, secondTir15hs ? 1u : 0u,
+                                            secondEtaValid15hs ? 1u : 0u, (double)secondNc15hs,
+                                            (double)secondBase15hs, (double)secondNt15hs,
+                                            (double)secondEta15hs, (double)secondF15hs,
+                                            (double)secondPdf15hs, etaProduct15hs,
+                                            matchedMediumCandidates15hs ? 1u : 0u,
+                                            (firstEtaValid15hs && secondEtaValid15hs &&
+                                             matchedMediumCandidates15hs) ? 1u : 0u);
+                                        // 15ji: distinguish a genuine failure of the two-transmission
+                                        // reconstruction from a perfectly legitimate second-surface
+                                        // reflection. A reflected ray never crosses this boundary;
+                                        // consequently it cannot satisfy the 15ib/15jh reverse
+                                        // post-transmission-stack precondition. Do not infer a
+                                        // reverse event mass from the forward native sample PDF.
+                                        const bool secondReflect15ji =
+                                            (childNextEvent15gq & REFLECT) != 0;
+                                        const bool secondNativeMassValid15ji =
+                                            std::isfinite((double)childNextPdf15gq) &&
+                                            childNextPdf15gq > 0.f && childNextPdf15gq <= 1.f;
+                                        const bool secondGlassReflection15ji =
+                                            secondIdealGlass15hs && secondExit15hs &&
+                                            secondReflect15ji && !secondTransmit15hs &&
+                                            secondNativeMassValid15ji;
+                                        const char *secondClass15ji =
+                                            !secondIdealGlass15hs ? "OTHER_MATERIAL" :
+                                            !secondExit15hs ? "GLASS_NON_EXIT" :
+                                            secondGlassReflection15ji ? "GLASS_EXIT_REFLECT_EXPECTED" :
+                                            secondTransmit15hs && secondNativeMassValid15ji ?
+                                                "GLASS_EXIT_TRANSMIT_REBUILD_CANDIDATE" :
+                                            "GLASS_EXIT_OTHER_OR_INVALID_SAMPLE";
+                                        fprintf(file15gl,
+                                            "phase15ji SECOND_BOUNDARY_CLASSIFICATION side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.9g classification=%s secondHit=1 "
+                                            "idealGlass=%u exit=%u sampledReflect=%u sampledTransmit=%u "
+                                            "sampledEvent=%u nativeForwardEventMass=%.12g nativeMassValid=%u "
+                                            "twoTransmissionReconstructionEligible=%u "
+                                            "expectedReflectionNotReconstructionFailure=%u "
+                                            "reverseReflectionEventMass=UNAVAILABLE reverseReflectionBSDFRebuilt=0 "
+                                            "mediumTransitionAppliedForReflection=0 "
+                                            "measure=DISCRETE_DELTA_EVENT notForMIS=1 "
+                                            "diagnosticOnly=1 childRays=0 physicsChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, (double)childState15gm.lambda, secondClass15ji,
+                                            secondIdealGlass15hs ? 1u : 0u, secondExit15hs ? 1u : 0u,
+                                            secondReflect15ji ? 1u : 0u, secondTransmit15hs ? 1u : 0u,
+                                            (u_int)childNextEvent15gq, (double)childNextPdf15gq,
+                                            secondNativeMassValid15ji ? 1u : 0u,
+                                            secondProbe15hs ? 1u : 0u,
+                                            secondGlassReflection15ji ? 1u : 0u);
+                                        // The next sampled event also requires a local
+                                        // volume transition before the second child ray.
+                                        PathVolumeInfo childVolumeAfterNext15gw = childVolume15go;
+                                        const bool childNextIsTransmission15gw =
+                                            (childNextEvent15gq & TRANSMIT) != 0;
+                                        if (childNextIsTransmission15gw)
+                                            childVolumeAfterNext15gw.Update(childNextEvent15gq, childBSDF15go);
+                                        // 15gx: snapshots of active medium at both boundaries.
+                                        // Pointer equality is identity only, NOT proof of a correct stack.
+                                        const bool mediumAccessor15gx =
+                                            MLHeroHasMediumAccessor15gx(childVolumeBeforeGlass15gw, 0);
+                                        const void *beforeMedium15gx =
+                                            MLHeroCurrentMedium15gx(childVolumeBeforeGlass15gw, 0);
+                                        const void *afterGlassMedium15gx =
+                                            MLHeroCurrentMedium15gx(childVolumeAfterGlass15gw, 0);
+                                        const void *afterFirstMedium15gx =
+                                            MLHeroCurrentMedium15gx(childVolume15go, 0);
+                                        const void *afterNextMedium15gx =
+                                            MLHeroCurrentMedium15gx(childVolumeAfterNext15gw, 0);
+                                        const void *parentMedium15gx =
+                                            MLHeroCurrentMedium15gx(pathVertex->volInfo, 0);
+                                        fprintf(file15gl,
+                                            "phase15gx CHILD_MEDIUM_IDENTITY side=%s ticket=%llu child=%u "
+                                            "lane=%u accessor=%u glassTransmit=%u nextTransmit=%u "
+                                            "before=%p afterGlass=%p afterFirstIntersect=%p "
+                                            "afterNext=%p parent=%p parentIdentityPreserved=%u "
+                                            "glassIdentityChanged=%u nextIdentityChanged=%u "
+                                            "mediumIdentityObserved=%u mediumIdentityVerified=0 "
+                                            "stackVerified=0 diagnosticOnly=1 filmChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl, lane15gl,
+                                            mediumAccessor15gx ? 1u : 0u,
+                                            childGlassIsTransmission15gw ? 1u : 0u,
+                                            childNextIsTransmission15gw ? 1u : 0u,
+                                            beforeMedium15gx, afterGlassMedium15gx,
+                                            afterFirstMedium15gx, afterNextMedium15gx, parentMedium15gx,
+                                            mediumAccessor15gx && parentMedium15gx == beforeMedium15gx ? 1u : 0u,
+                                            mediumAccessor15gx && beforeMedium15gx != afterGlassMedium15gx ? 1u : 0u,
+                                            mediumAccessor15gx && afterFirstMedium15gx != afterNextMedium15gx ? 1u : 0u,
+                                            mediumAccessor15gx ? 1u : 0u);
+                                        // 15gy: verify the actual list entries, selected active
+                                        // volume and both surface transitions. Record a full parent
+                                        // stack copy rather than assuming pointer identity proves it.
+                                        const MLHeroStackSnapshot15gy beforeStack15gy =
+                                            MLHeroCaptureStack15gy(childVolumeBeforeGlass15gw);
+                                        const MLHeroStackSnapshot15gy afterGlassStack15gy =
+                                            MLHeroCaptureStack15gy(childVolumeAfterGlass15gw);
+                                        const MLHeroStackSnapshot15gy afterFirstStack15gy =
+                                            MLHeroCaptureStack15gy(childVolume15go);
+                                        const MLHeroStackSnapshot15gy afterNextStack15gy =
+                                            MLHeroCaptureStack15gy(childVolumeAfterNext15gw);
+                                        const MLHeroStackSnapshot15gy parentStack15gy =
+                                            MLHeroCaptureStack15gy(pathVertex->volInfo);
+                                        MLHeroStackSnapshot15gy expectedGlassStack15gy;
+                                        const bool glassCheckable15gy =
+                                            MLHeroExpectedTransition15gy(beforeStack15gy,
+                                                childGlassEvent15gw, pathVertex->bsdf,
+                                                &expectedGlassStack15gy);
+                                        MLHeroStackSnapshot15gy expectedNextStack15gy;
+                                        const bool nextCheckable15gy =
+                                            MLHeroExpectedTransition15gy(afterFirstStack15gy,
+                                                childNextEvent15gq, childBSDF15go,
+                                                &expectedNextStack15gy);
+                                        const bool glassTransitionOK15gy = glassCheckable15gy &&
+                                            MLHeroStacksEqual15gy(expectedGlassStack15gy, afterGlassStack15gy);
+                                        const bool nextTransitionOK15gy = nextCheckable15gy &&
+                                            MLHeroStacksEqual15gy(expectedNextStack15gy, afterNextStack15gy);
+                                        const bool beforeConsistent15gy =
+                                            MLHeroStackConsistent15gy(beforeStack15gy);
+                                        const bool glassConsistent15gy =
+                                            MLHeroStackConsistent15gy(afterGlassStack15gy);
+                                        const bool firstConsistent15gy =
+                                            MLHeroStackConsistent15gy(afterFirstStack15gy);
+                                        const bool nextConsistent15gy =
+                                            MLHeroStackConsistent15gy(afterNextStack15gy);
+                                        const bool parentPreserved15gy =
+                                            MLHeroStacksEqual15gy(beforeStack15gy, parentStack15gy);
+                                        const bool childStackValidated15gy =
+                                            beforeConsistent15gy && glassConsistent15gy &&
+                                            firstConsistent15gy && nextConsistent15gy &&
+                                            glassTransitionOK15gy && nextTransitionOK15gy &&
+                                            parentPreserved15gy;
+                                        fprintf(file15gl,
+                                            "phase15gy CHILD_STACK_AUDIT side=%s ticket=%llu child=%u "
+                                            "lane=%u beforeCount=%u afterGlassCount=%u "
+                                            "afterFirstCount=%u afterNextCount=%u parentCount=%u "
+                                            "glassIntoObject=%u glassInterior=%p "
+                                            "nextIntoObject=%u nextInterior=%p "
+                                            "glassCheckable=%u nextCheckable=%u "
+                                            "glassTransitionOK=%u nextTransitionOK=%u "
+                                            "beforeConsistent=%u afterGlassConsistent=%u "
+                                            "afterFirstConsistent=%u afterNextConsistent=%u "
+                                            "parentStackPreserved=%u childStackValidated=%u "
+                                            "diagnosticOnly=1 physicalChildEnabled=0 "
+                                            "filmChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, beforeStack15gy.count,
+                                            afterGlassStack15gy.count, afterFirstStack15gy.count,
+                                            afterNextStack15gy.count, parentStack15gy.count,
+                                            pathVertex->bsdf.hitPoint.intoObject ? 1u : 0u,
+                                            (const void *)pathVertex->bsdf.GetMaterialInteriorVolume(),
+                                            childBSDF15go.hitPoint.intoObject ? 1u : 0u,
+                                            (const void *)childBSDF15go.GetMaterialInteriorVolume(),
+                                            glassCheckable15gy ? 1u : 0u,
+                                            nextCheckable15gy ? 1u : 0u,
+                                            glassTransitionOK15gy ? 1u : 0u,
+                                            nextTransitionOK15gy ? 1u : 0u,
+                                            beforeConsistent15gy ? 1u : 0u,
+                                            glassConsistent15gy ? 1u : 0u,
+                                            firstConsistent15gy ? 1u : 0u,
+                                            nextConsistent15gy ? 1u : 0u,
+                                            parentPreserved15gy ? 1u : 0u,
+                                            childStackValidated15gy ? 1u : 0u);
+                                        // 15ht Stage 35: reconstruct the two boundary stack
+                                        // transitions in reverse, using independent snapshot
+                                        // arithmetic. Start from the state AFTER the second
+                                        // sampled event, undo the second boundary, then undo
+                                        // the first. No PathVolumeInfo::Update, sampling,
+                                        // transport, MIS, or film operations are performed.
+                                        // This checks topology/priority/identity but does NOT
+                                        // construct a reverse-ray BSDF or prove spectral MIS.
+                                        const bool reverseEligible15ht =
+                                            childGlassIsTransmission15gw &&
+                                            childNextIsTransmission15gw &&
+                                            secondIdealGlass15hs && secondExit15hs &&
+                                            firstEtaValid15hs && secondEtaValid15hs &&
+                                            beforeStack15gy.sizeValid &&
+                                            afterGlassStack15gy.sizeValid &&
+                                            afterFirstStack15gy.sizeValid &&
+                                            afterNextStack15gy.sizeValid;
+                                        bool undoSecondCheckable15ht = false;
+                                        bool undoFirstCheckable15ht = false;
+                                        bool recoveredBeforeSecond15ht = false;
+                                        bool recoveredBeforeFirst15ht = false;
+                                        bool reverseConsistent15ht = false;
+                                        bool reverseEtaReciprocal15ht = false;
+                                        MLHeroStackSnapshot15gy reverseAfterSecond15ht;
+                                        MLHeroStackSnapshot15gy reverseAfterFirst15ht;
+                                        if (reverseEligible15ht) {
+                                            BSDF reverseSecondBSDF15ht = childBSDF15go;
+                                            reverseSecondBSDF15ht.hitPoint.intoObject =
+                                                !childBSDF15go.hitPoint.intoObject;
+                                            reverseSecondBSDF15ht.hitPoint.fromLight =
+                                                !childBSDF15go.hitPoint.fromLight;
+                                            undoSecondCheckable15ht = MLHeroExpectedTransition15gy(
+                                                afterNextStack15gy, childNextEvent15gq,
+                                                reverseSecondBSDF15ht, &reverseAfterSecond15ht);
+                                            recoveredBeforeSecond15ht = undoSecondCheckable15ht &&
+                                                MLHeroStacksEqual15gy(reverseAfterSecond15ht, afterFirstStack15gy);
+                                            if (undoSecondCheckable15ht) {
+                                                BSDF reverseFirstBSDF15ht = pathVertex->bsdf;
+                                                reverseFirstBSDF15ht.hitPoint.intoObject =
+                                                    !pathVertex->bsdf.hitPoint.intoObject;
+                                                reverseFirstBSDF15ht.hitPoint.fromLight =
+                                                    !pathVertex->bsdf.hitPoint.fromLight;
+                                                undoFirstCheckable15ht = MLHeroExpectedTransition15gy(
+                                                    reverseAfterSecond15ht, childGlassEvent15gw,
+                                                    reverseFirstBSDF15ht, &reverseAfterFirst15ht);
+                                                recoveredBeforeFirst15ht = undoFirstCheckable15ht &&
+                                                    MLHeroStacksEqual15gy(reverseAfterFirst15ht, beforeStack15gy);
+                                            }
+                                            reverseConsistent15ht = undoSecondCheckable15ht &&
+                                                MLHeroStackConsistent15gy(reverseAfterSecond15ht) &&
+                                                undoFirstCheckable15ht &&
+                                                MLHeroStackConsistent15gy(reverseAfterFirst15ht);
+                                            reverseEtaReciprocal15ht = matchedMediumCandidates15hs &&
+                                                std::isfinite(etaProduct15hs) &&
+                                                fabs(etaProduct15hs - 1.) < 1e-4;
+                                        }
+                                        const bool completeReverseStack15ht = reverseEligible15ht &&
+                                            recoveredBeforeSecond15ht && recoveredBeforeFirst15ht &&
+                                            reverseConsistent15ht && reverseEtaReciprocal15ht;
+                                        fprintf(file15gl,
+                                            "phase15ht REVERSE_TWO_BOUNDARIES side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.9g eligible=%u firstTransmit=%u "
+                                            "secondTransmit=%u secondExit=%u "
+                                            "forwardBeforeCount=%u forwardInteriorCount=%u "
+                                            "forwardAfterSecondCount=%u "
+                                            "reverseAfterSecondCount=%u reverseAfterFirstCount=%u "
+                                            "undoSecondCheckable=%u undoFirstCheckable=%u "
+                                            "recoveredBeforeSecond=%u recoveredBeforeFirst=%u "
+                                            "reverseStackConsistent=%u reverseEtaReciprocal=%u "
+                                            "forwardStackValidated=%u completeReverseStack=%u "
+                                            "forwardInitialActive=%p forwardInteriorActive=%p "
+                                            "forwardFinalActive=%p recoveredInteriorActive=%p "
+                                            "recoveredInitialActive=%p "
+                                            "stackEqualityIncludesOrderedEntriesAndScattered=1 "
+                                            "reverseOperation=independent_snapshot_inverse "
+                                            "reverseBSDFHitPointNotRebuilt=1 nestedMediaNotExhaustivelyTested=1 "
+                                            "reverseSpectralBSDFNotSampled=1 reverseMISNotValidated=1 "
+                                            "diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, (double)childState15gm.lambda,
+                                            reverseEligible15ht ? 1u : 0u,
+                                            childGlassIsTransmission15gw ? 1u : 0u,
+                                            childNextIsTransmission15gw ? 1u : 0u,
+                                            secondExit15hs ? 1u : 0u,
+                                            beforeStack15gy.count, afterFirstStack15gy.count,
+                                            afterNextStack15gy.count,
+                                            reverseAfterSecond15ht.count, reverseAfterFirst15ht.count,
+                                            undoSecondCheckable15ht ? 1u : 0u,
+                                            undoFirstCheckable15ht ? 1u : 0u,
+                                            recoveredBeforeSecond15ht ? 1u : 0u,
+                                            recoveredBeforeFirst15ht ? 1u : 0u,
+                                            reverseConsistent15ht ? 1u : 0u,
+                                            reverseEtaReciprocal15ht ? 1u : 0u,
+                                            childStackValidated15gy ? 1u : 0u,
+                                            completeReverseStack15ht ? 1u : 0u,
+                                            (const void *)beforeStack15gy.active,
+                                            (const void *)afterFirstStack15gy.active,
+                                            (const void *)afterNextStack15gy.active,
+                                            (const void *)reverseAfterSecond15ht.active,
+                                            (const void *)reverseAfterFirst15ht.active);
+                                        // 15hu Stage 36: material-provided reverse event mass at
+                                        // the SECOND (geometric exit) ideal-glass boundary.
+                                        // Read-only BSDF copy. The reverse HitPoint and its
+                                        // medium stack are NOT independently rebuilt, so this
+                                        // is not yet a validated BIDIR reverse PDF.
+                                        BSDF reverseSecondBSDF15hu = childBSDF15go;
+                                        reverseSecondBSDF15hu.hitPoint.fixedDir = childNextDir15gq;
+                                        reverseSecondBSDF15hu.hitPoint.fromLight =
+                                            !childBSDF15go.hitPoint.fromLight;
+                                        float reverseNc15hu=0.f, reverseBase15hu=0.f, reverseNt15hu=0.f;
+                                        float reverseF15hu=0.f, reverseEta15hu=0.f, reverseEta2_15hu=0.f;
+                                        float reverseTransport15hu=0.f, reverseDelta15hu=0.f;
+                                        float reverseMass15hu=0.f;
+                                        bool reverseTir15hu=false;
+                                        Spectrum reverseValue15hu(0.f);
+                                        const bool reverseQueried15hu = secondProbe15hs && secondEtaValid15hs;
+                                        const bool reverseOK15hu = reverseQueried15hu &&
+                                            reverseSecondBSDF15hu.EvaluateMLHeroGlassDebugAtWaveLength(
+                                                childBSDF15go.hitPoint.fixedDir,
+                                                childNextEvent15gq, childNextPdf15gq,
+                                                childState15gm.lambda,
+                                                &reverseNc15hu, &reverseBase15hu, &reverseNt15hu,
+                                                &reverseF15hu, &reverseEta15hu, &reverseEta2_15hu,
+                                                &reverseTransport15hu, &reverseDelta15hu,
+                                                &reverseValue15hu, nullptr, nullptr, nullptr,
+                                                &reverseTir15hu, &reverseMass15hu);
+                                        const bool reverseMassValid15hu = reverseOK15hu &&
+                                            !reverseTir15hu && std::isfinite((double)reverseMass15hu) &&
+                                            reverseMass15hu >= 0.f && reverseMass15hu <= 1.f;
+                                        const bool forwardMassValid15hu = secondProbe15hs &&
+                                            std::isfinite((double)secondPdf15hs) &&
+                                            secondPdf15hs >= 0.f && secondPdf15hs <= 1.f;
+                                        const double reverseEtaProduct15hu = reverseOK15hu &&
+                                            secondEtaValid15hs ?
+                                            (double)reverseEta15hu * (double)secondEta15hs : -1.;
+                                        const double fresnelDifference15hu = reverseOK15hu ?
+                                            fabs((double)reverseF15hu - (double)secondF15hs) : -1.;
+                                        const double reverseMassDelta15hu = reverseMassValid15hu &&
+                                            forwardMassValid15hu ?
+                                            (double)reverseMass15hu - (double)secondPdf15hs : -1.;
+                                        fprintf(file15gl,
+                                            "phase15hu EXIT_REVERSE_EVENT_MASS side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.9g secondIdealGlass=%u secondExit=%u "
+                                            "forwardTransmission=%u forwardValid=%u reverseQueried=%u "
+                                            "reverseHelperOK=%u reverseTIR=%u "
+                                            "forwardEta=%.12g reverseEta=%.12g etaProduct=%.12g "
+                                            "forwardFresnel=%.12g reverseFresnel=%.12g fresnelDifference=%.12g "
+                                            "forwardEventMass=%.12g reverseEventMass=%.12g "
+                                            "reverseMinusForwardMass=%.12g forwardMassValid=%u reverseMassValid=%u "
+                                            "reverseDirectionDelta=%.12g forwardTransport=%.12g reverseTransport=%.12g "
+                                            "forwardNc=%.12g forwardNt=%.12g reverseNc=%.12g reverseNt=%.12g "
+                                            "reverseStackSnapshotPassed=%u reverseHitPointIndependent=0 "
+                                            "copiedHitPointTextures=1 reverseMassIsDiscrete=1 "
+                                            "reverseDensityForMISValidated=0 noExtraSampling=1 "
+                                            "diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, (double)childState15gm.lambda,
+                                            secondIdealGlass15hs ? 1u : 0u, secondExit15hs ? 1u : 0u,
+                                            secondTransmit15hs ? 1u : 0u, secondProbe15hs ? 1u : 0u,
+                                            reverseQueried15hu ? 1u : 0u, reverseOK15hu ? 1u : 0u,
+                                            reverseTir15hu ? 1u : 0u,
+                                            (double)secondEta15hs, (double)reverseEta15hu,
+                                            reverseEtaProduct15hu, (double)secondF15hs,
+                                            (double)reverseF15hu, fresnelDifference15hu,
+                                            (double)secondPdf15hs, (double)reverseMass15hu,
+                                            reverseMassDelta15hu, forwardMassValid15hu ? 1u : 0u,
+                                            reverseMassValid15hu ? 1u : 0u,
+                                            (double)reverseDelta15hu,
+                                            (double)secondTransport15hs, (double)reverseTransport15hu,
+                                            (double)secondNc15hs, (double)secondNt15hs,
+                                            (double)reverseNc15hu, (double)reverseNt15hu,
+                                            completeReverseStack15ht ? 1u : 0u);
+                                        // 15hv Stage 37: audit the actual vector convention at
+                                        // the SECOND glass boundary, separately for every
+                                        // wavelength child. This is pure arithmetic on already
+                                        // available vectors; NO added sampling or BSDF calls.
+                                        // Both directions are in LuxCore's BSDF convention:
+                                        // fixedDir points toward the previous vertex, whereas
+                                        // sampledDir is the outward direction after the event.
+                                        // Swapping them should reverse the traversal without
+                                        // negating either of them. A geometric/IOR comparison
+                                        // still does NOT validate a reverse path PDF.
+                                        const luxrays::Vector &forwardFixed15hv =
+                                            childBSDF15go.hitPoint.fixedDir;
+                                        const luxrays::Vector &forwardSampled15hv = childNextDir15gq;
+                                        // 15jj: independent reverse REFLECTION event-mass audit.
+                                        // Reflections do not cross the second interface: the
+                                        // medium state is unchanged (childVolumeAfterNext15gw).
+                                        // Synthetic reverse ray reinitializes the BSDF at exactly
+                                        // the same triangle / barycentrics; diagnostic only.
+                                        if (secondGlassReflection15ji) {
+                                            const luxrays::Vector &reverseIncoming15jj = childNextDir15gq;
+                                            const bool directionValid15jj =
+                                                std::isfinite((double)reverseIncoming15jj.Length()) &&
+                                                reverseIncoming15jj.Length() > 0.999f &&
+                                                reverseIncoming15jj.Length() < 1.001f;
+                                            bool reverseInit15jj = false;
+                                            bool materialMatch15jj = false;
+                                            bool reverseEvaluated15jj = false;
+                                            bool sameSide15jj = false;
+                                            float reverseMass15jj = 0.f;
+                                            float reverseNc15jj = 0.f, reverseBase15jj = 0.f;
+                                            float reverseNt15jj = 0.f, reverseF15jj = 0.f;
+                                            float reverseEta15jj = 0.f, reverseEta2_15jj = 0.f;
+                                            float reverseTransport15jj = 0.f, reverseDelta15jj = 0.f;
+                                            bool reverseTIR15jj = false;
+                                            float reverseFixedCos15jk=0.f, reverseFixedSinI2_15jk=0.f;
+                                            bool reverseInto15jk=false, reverseFromLight15jk=false;
+                                            Spectrum reverseWeight15jj(0.f);
+                                            if (directionValid15jj) {
+                                                luxrays::Ray reverseRay15jj(
+                                                    childBSDF15go.hitPoint.p + reverseIncoming15jj,
+                                                    -reverseIncoming15jj);
+                                                reverseRay15jj.time = candidateRay15gn.time;
+                                                luxrays::RayHit reverseHit15jj = childHit15go;
+                                                reverseHit15jj.t = 1.f;
+                                                BSDF rebuiltReverse15jj;
+                                                rebuiltReverse15jj.Init(
+                                                    !childBSDF15go.hitPoint.fromLight,
+                                                    childBSDF15go.hitPoint.throughShadowTransparency,
+                                                    engine->renderConfig.GetScene(), reverseRay15jj,
+                                                    reverseHit15jj,
+                                                    childBSDF15go.hitPoint.passThroughEvent,
+                                                    &childVolumeAfterNext15gw);
+                                                reverseInit15jj = true;
+                                                reverseFixedCos15jk = luxrays::Dot(rebuiltReverse15jj.hitPoint.shadeN, rebuiltReverse15jj.hitPoint.fixedDir);
+                                                reverseFixedSinI2_15jk = (1.f - reverseFixedCos15jk * reverseFixedCos15jk);
+                                                reverseInto15jk = rebuiltReverse15jj.hitPoint.intoObject;
+                                                reverseFromLight15jk = rebuiltReverse15jj.hitPoint.fromLight;
+                                                materialMatch15jj = rebuiltReverse15jj.GetMaterialID() ==
+                                                    childBSDF15go.GetMaterialID();
+                                                sameSide15jj = rebuiltReverse15jj.hitPoint.intoObject ==
+                                                    childBSDF15go.hitPoint.intoObject;
+                                                if (materialMatch15jj && sameSide15jj)
+                                                    reverseEvaluated15jj = rebuiltReverse15jj.EvaluateMLHeroGlassDebugAtWaveLength(
+                                                        forwardFixed15hv, childNextEvent15gq,
+                                                        childNextPdf15gq, childState15gm.lambda,
+                                                        &reverseNc15jj, &reverseBase15jj, &reverseNt15jj,
+                                                        &reverseF15jj, &reverseEta15jj, &reverseEta2_15jj,
+                                                        &reverseTransport15jj, &reverseDelta15jj,
+                                                        &reverseWeight15jj, nullptr, nullptr, nullptr,
+                                                        &reverseTIR15jj, &reverseMass15jj);
+                                            }
+                                            // 15jk: read-only forward/reverse TIR and IOR diagnosis at
+                                            // identical material hit. The sampled reflection is NOT changed.
+                                            float forwardNc15jk=0.f, forwardBase15jk=0.f, forwardNt15jk=0.f;
+                                            float forwardF15jk=0.f, forwardEta15jk=0.f, forwardEta2_15jk=0.f;
+                                            float forwardTransport15jk=0.f, forwardDelta15jk=0.f;
+                                            float forwardCos15jk=0.f, forwardSinI2_15jk=0.f, forwardSinT2_15jk=0.f;
+                                            float forwardLaneMass15jk=0.f;
+                                            bool forwardTIR15jk=false;
+                                            Spectrum forwardWeight15jk(0.f);
+                                            const bool forwardOK15jk = childBSDF15go.EvaluateMLHeroGlassDebugAtWaveLength(
+                                                childNextDir15gq, childNextEvent15gq, childNextPdf15gq,
+                                                childState15gm.lambda,
+                                                &forwardNc15jk, &forwardBase15jk, &forwardNt15jk,
+                                                &forwardF15jk, &forwardEta15jk, &forwardEta2_15jk,
+                                                &forwardTransport15jk, &forwardDelta15jk,
+                                                &forwardWeight15jk, &forwardCos15jk,
+                                                &forwardSinI2_15jk, &forwardSinT2_15jk,
+                                                &forwardTIR15jk, &forwardLaneMass15jk);
+                                            // 15jm: compare native Sample and glass helper at the SAME
+                                            // captured native wavelength. The selected child wavelength
+                                            // is intentionally audited separately. No additional Sample().
+                                            float jmNc=0.f, jmBase=0.f, jmNt=0.f, jmF=0.f;
+                                            float jmEta=0.f, jmEta2=0.f, jmTransport=0.f, jmDelta=0.f;
+                                            float jmCos=0.f, jmSinI2=0.f, jmSinT2=0.f, jmMass=0.f;
+                                            bool jmTIR=false;
+                                            Spectrum jmWeight(0.f);
+                                            const bool jmSameWavelengthValid = nativeSnapshot15jl &&
+                                                nativeTIRSnapshot15jl && nativeValid15jl &&
+                                                std::isfinite((double)nativeWavelength15jl) &&
+                                                nativeWavelength15jl >= 380.f && nativeWavelength15jl <= 780.f;
+                                            const bool jmHelperOK = jmSameWavelengthValid &&
+                                                childBSDF15go.EvaluateMLHeroGlassDebugAtWaveLength(
+                                                    childNextDir15gq, childNextEvent15gq,
+                                                    childNextPdf15gq, nativeWavelength15jl,
+                                                    &jmNc, &jmBase, &jmNt, &jmF,
+                                                    &jmEta, &jmEta2, &jmTransport, &jmDelta,
+                                                    &jmWeight, &jmCos, &jmSinI2, &jmSinT2,
+                                                    &jmTIR, &jmMass);
+                                            const bool jmNativeTIR = nativeTIRReason15jl == 1u;
+                                            const bool jmTIRMatch = jmHelperOK && (jmNativeTIR == jmTIR);
+                                            const bool jmMassMatch = jmHelperOK &&
+                                                fabsf(jmMass - childNextPdf15gq) < 1.e-5f;
+                                            fprintf(file15gl,
+                                                "phase15jm SAME_WAVELENGTH_REFLECTION side=%s ticket=%llu child=%u lane=%u "
+                                                "nativeLambda=%.12g childLambda=%.12g lambdaDelta=%.12g "
+                                                "nativeSnapshotValid=%u helperValid=%u "
+                                                "nativeTIR=%u helperTIR=%u tirMatch=%u "
+                                                "nativeSinT2=%.12g helperSinT2=%.12g "
+                                                "nativeEta=%.12g helperEta=%.12g "
+                                                "nativeNtLambda=%.12g helperNtLambda=%.12g "
+                                                "nativeReflectPresent=%u nativeTransmitPresent=%u "
+                                                "nativeThreshold=%.12g nativePdf=%.12g helperMass=%.12g "
+                                                "massMatch=%u event=REFLECT "
+                                                "sameHit=1 sameSampledDirection=1 nativeVsChildLambdaSeparated=1 "
+                                                "diagnosticOnly=1 physicalChildEnabled=0 misChanged=0 rrChanged=0 physicsChanged=0 notForMIS=1\n",
+                                                side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl, lane15gl,
+                                                (double)nativeWavelength15jl, (double)childState15gm.lambda,
+                                                (double)(nativeWavelength15jl-childState15gm.lambda),
+                                                jmSameWavelengthValid ? 1u : 0u, jmHelperOK ? 1u : 0u,
+                                                jmNativeTIR ? 1u : 0u, jmTIR ? 1u : 0u, jmTIRMatch ? 1u : 0u,
+                                                (double)nativeSinT2_15jl, (double)jmSinT2,
+                                                (double)nativeEta15jl, (double)jmEta,
+                                                (double)nativeNtLambda15jl, (double)jmNt,
+                                                nativeR15jl, nativeT15jl,
+                                                (double)nativeThreshold15jl, (double)childNextPdf15gq,
+                                                (double)jmMass, jmMassMatch ? 1u : 0u);
+                                            const float reverseCos15jk = reverseFixedCos15jk;
+                                            const float reverseSinI2_15jk = reverseFixedSinI2_15jk;
+                                            const float reverseSinT2_15jk = reverseEta2_15jj * reverseSinI2_15jk;
+                                            const bool nativeForwardVsLane15jk = forwardOK15jk &&
+                                                fabsf(forwardLaneMass15jk - childNextPdf15gq) < 1e-5f;
+                                            fprintf(file15gl,
+                                                "phase15jk REFLECTION_TIR_IOR side=%s ticket=%llu child=%u lane=%u "
+                                                "lambda=%.9g forwardHelperOK=%u reverseHelperOK=%u "
+                                                "forwardTIR=%u reverseTIR=%u "
+                                                "forwardCos=%.12g reverseCos=%.12g "
+                                                "forwardSinI2=%.12g reverseSinI2=%.12g "
+                                                "forwardSinT2=%.12g reverseSinT2=%.12g "
+                                                "forwardNc=%.12g forwardNtBase=%.12g forwardNtLambda=%.12g "
+                                                "reverseNc=%.12g reverseNtBase=%.12g reverseNtLambda=%.12g "
+                                                "forwardEta=%.12g reverseEta=%.12g "
+                                                "forwardFresnel=%.12g reverseFresnel=%.12g "
+                                                "nativeForwardMass=%.12g forwardHelperLaneMass=%.12g "
+                                                "reverseHelperLaneMass=%.12g nativeForwardMatchesLane=%u "
+                                                "forwardIntoObject=%u reverseIntoObject=%u "
+                                                "forwardFromLight=%u reverseFromLight=%u "
+                                                "forwardReverseIORProduct=%.12g "
+                                                "unchangedReflectionStack=1 diagnosticOnly=1 "
+                                                "childRays=0 physicsChanged=0 misChanged=0 rrChanged=0 notForMIS=1\n",
+                                                side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                                lane15gl, (double)childState15gm.lambda,
+                                                forwardOK15jk ? 1u : 0u, reverseEvaluated15jj ? 1u : 0u,
+                                                forwardTIR15jk ? 1u : 0u, reverseTIR15jj ? 1u : 0u,
+                                                (double)forwardCos15jk, (double)reverseCos15jk,
+                                                (double)forwardSinI2_15jk, (double)reverseSinI2_15jk,
+                                                (double)forwardSinT2_15jk, (double)reverseSinT2_15jk,
+                                                (double)forwardNc15jk, (double)forwardBase15jk,
+                                                (double)forwardNt15jk, (double)reverseNc15jj,
+                                                (double)reverseBase15jj, (double)reverseNt15jj,
+                                                (double)forwardEta15jk, (double)reverseEta15jj,
+                                                (double)forwardF15jk, (double)reverseF15jj,
+                                                (double)childNextPdf15gq, (double)forwardLaneMass15jk,
+                                                (double)reverseMass15jj, nativeForwardVsLane15jk ? 1u : 0u,
+                                                childBSDF15go.hitPoint.intoObject ? 1u : 0u,
+                                                reverseInto15jk ? 1u : 0u,
+                                                childBSDF15go.hitPoint.fromLight ? 1u : 0u,
+                                                reverseFromLight15jk ? 1u : 0u,
+                                                (double)forwardEta15jk * (double)reverseEta15jj);
+                                            const bool reverseValid15jj = reverseEvaluated15jj &&
+                                                std::isfinite((double)reverseMass15jj) &&
+                                                reverseMass15jj > 0.f && reverseMass15jj <= 1.f;
+                                            const double difference15jj = reverseValid15jj ?
+                                                fabs((double)reverseMass15jj - (double)childNextPdf15gq) : -1.;
+                                            fprintf(file15gl,
+                                                "phase15jj REBUILT_REVERSE_REFLECTION side=%s ticket=%llu child=%u "
+                                                "lane=%u lambda=%.9g eligible=1 directionValid=%u "
+                                                "reverseInitialized=%u materialMatch=%u sameSide=%u "
+                                                "reverseEvaluated=%u reverseValid=%u forwardMass=%.12g "
+                                                "reverseMass=%.12g massAbsDifference=%.12g "
+                                                "reverseTIR=%u forwardEvent=%u "
+                                                "reverseMediumState=UNCHANGED_REFLECTION "
+                                                "reverseBSDF=REBUILT_SAME_TRIANGLE "
+                                                "mediumPriorityNotIndependentlyVerified=1 "
+                                                "spectralJointPdf=UNAVAILABLE notForMIS=1 "
+                                                "diagnosticOnly=1 childRays=0 physicsChanged=0\n",
+                                                side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                                lane15gl, (double)childState15gm.lambda,
+                                                directionValid15jj ? 1u : 0u,
+                                                reverseInit15jj ? 1u : 0u,
+                                                materialMatch15jj ? 1u : 0u,
+                                                sameSide15jj ? 1u : 0u,
+                                                reverseEvaluated15jj ? 1u : 0u,
+                                                reverseValid15jj ? 1u : 0u,
+                                                (double)childNextPdf15gq, (double)reverseMass15jj,
+                                                difference15jj, reverseTIR15jj ? 1u : 0u,
+                                                (u_int)childNextEvent15gq);
+                                        }
+                                        const luxrays::Vector &reverseFixed15hv =
+                                            reverseSecondBSDF15hu.hitPoint.fixedDir;
+                                        const luxrays::Vector reverseTarget15hv = forwardFixed15hv;
+                                        const luxrays::Normal &geomNormal15hv =
+                                            childBSDF15go.hitPoint.geometryN;
+                                        const luxrays::Normal &shadeNormal15hv =
+                                            childBSDF15go.hitPoint.shadeN;
+                                        const double forwardFixedLength15hv = forwardFixed15hv.Length();
+                                        const double forwardSampledLength15hv = forwardSampled15hv.Length();
+                                        const double reverseFixedLength15hv = reverseFixed15hv.Length();
+                                        const double forwardBackwardSwapError15hv =
+                                            (reverseFixed15hv - forwardSampled15hv).Length();
+                                        const double incidentGeomCos15hv = Dot(forwardFixed15hv, geomNormal15hv);
+                                        const double outgoingGeomCos15hv = Dot(forwardSampled15hv, geomNormal15hv);
+                                        const double incidentShadeCos15hv = Dot(forwardFixed15hv, shadeNormal15hv);
+                                        const double outgoingShadeCos15hv = Dot(forwardSampled15hv, shadeNormal15hv);
+                                        const double incidentOutgoingDot15hv = Dot(forwardFixed15hv, forwardSampled15hv);
+                                        const double incidentOutgoingNegativeDot15hv =
+                                            Dot(forwardFixed15hv, -forwardSampled15hv);
+                                        const double etaSnellResidual15hv = secondEtaValid15hs ?
+                                            fabs(1. - (double)secondEta15hs * (double)secondEta15hs *
+                                                (1. - incidentShadeCos15hv * incidentShadeCos15hv) -
+                                                outgoingShadeCos15hv * outgoingShadeCos15hv) : -1.;
+                                        fprintf(file15gl,
+                                            "phase15hv EXIT_DIRECTION_AUDIT side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.9g valid=%u sampledTransmission=%u "
+                                            "forwardFixed=(%.9g,%.9g,%.9g) "
+                                            "forwardSampled=(%.9g,%.9g,%.9g) "
+                                            "reverseFixed=(%.9g,%.9g,%.9g) "
+                                            "reverseTarget=(%.9g,%.9g,%.9g) "
+                                            "geomN=(%.9g,%.9g,%.9g) shadeN=(%.9g,%.9g,%.9g) "
+                                            "forwardFixedLength=%.12g forwardSampledLength=%.12g "
+                                            "reverseFixedLength=%.12g reverseSwapError=%.12g "
+                                            "incidentGeomCos=%.12g outgoingGeomCos=%.12g "
+                                            "incidentShadeCos=%.12g outgoingShadeCos=%.12g "
+                                            "fixedSampledDot=%.12g fixedNegativeSampledDot=%.12g "
+                                            "eta=%.12g snellSquaredResidual=%.12g "
+                                            "forwardFresnel=%.12g reverseFresnel=%.12g "
+                                            "fresnelDifference=%.12g reverseDirectionDelta=%.12g "
+                                            "noExtraMaterialCalls=1 forwardAndReverseCopyOnly=1 "
+                                            "directionConvention=fixed_toward_previous_sampled_toward_next "
+                                            "reverseHitPointIndependent=0 notForMIS=1 "
+                                            "physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, (double)childState15gm.lambda,
+                                            secondEtaValid15hs ? 1u : 0u,
+                                            secondTransmit15hs ? 1u : 0u,
+                                            (double)forwardFixed15hv.x, (double)forwardFixed15hv.y,
+                                            (double)forwardFixed15hv.z,
+                                            (double)forwardSampled15hv.x, (double)forwardSampled15hv.y,
+                                            (double)forwardSampled15hv.z,
+                                            (double)reverseFixed15hv.x, (double)reverseFixed15hv.y,
+                                            (double)reverseFixed15hv.z,
+                                            (double)reverseTarget15hv.x, (double)reverseTarget15hv.y,
+                                            (double)reverseTarget15hv.z,
+                                            (double)geomNormal15hv.x, (double)geomNormal15hv.y,
+                                            (double)geomNormal15hv.z,
+                                            (double)shadeNormal15hv.x, (double)shadeNormal15hv.y,
+                                            (double)shadeNormal15hv.z,
+                                            forwardFixedLength15hv, forwardSampledLength15hv,
+                                            reverseFixedLength15hv, forwardBackwardSwapError15hv,
+                                            incidentGeomCos15hv, outgoingGeomCos15hv,
+                                            incidentShadeCos15hv, outgoingShadeCos15hv,
+                                            incidentOutgoingDot15hv, incidentOutgoingNegativeDot15hv,
+                                            (double)secondEta15hs, etaSnellResidual15hv,
+                                            (double)secondF15hs, (double)reverseF15hu,
+                                            fresnelDifference15hu, (double)reverseDelta15hu);
+                                        // 15hw Stage 38: reconstruct the SECOND refraction
+                                        // direction from the CHILD wavelength's eta, independently
+                                        // of the parent-wavelength BSDF sample. Local arithmetic and
+                                        // a read-only reverse BSDF copy only. No production changes.
+                                        const double cosIn15hw = incidentShadeCos15hv;
+                                        const double eta15hw = (double)secondEta15hs;
+                                        const double tan2In15hw = std::max(0.,
+                                            forwardFixedLength15hv * forwardFixedLength15hv -
+                                            cosIn15hw * cosIn15hw);
+                                        const double discriminant15hw = 1. - eta15hw * eta15hw * tan2In15hw;
+                                        const bool reconstruct15hw = secondEtaValid15hs &&
+                                            secondTransmit15hs && std::isfinite(discriminant15hw) &&
+                                            discriminant15hw >= 0. &&
+                                            fabs(forwardFixedLength15hv - 1.) < 1.e-3;
+                                        luxrays::Vector childRefracted15hw(0.f, 0.f, 0.f);
+                                        if (reconstruct15hw) {
+                                            const luxrays::Vector tangential15hw = forwardFixed15hv -
+                                                luxrays::Vector(shadeNormal15hv.x, shadeNormal15hv.y, shadeNormal15hv.z) * (float)cosIn15hw;
+                                            const double cosOut15hw = sqrt(std::max(0., discriminant15hw));
+                                            childRefracted15hw = -tangential15hw * (float)eta15hw -
+                                                luxrays::Vector(shadeNormal15hv.x, shadeNormal15hv.y, shadeNormal15hv.z) *
+                                                (float)((cosIn15hw >= 0.) ? cosOut15hw : -cosOut15hw);
+                                        }
+                                        const double newSnellResidual15hw = reconstruct15hw ?
+                                            fabs(1. - eta15hw * eta15hw * tan2In15hw -
+                                                pow((double)Dot(childRefracted15hw, shadeNormal15hv), 2.)) : -1.;
+                                        const double parentVsChildDirection15hw = reconstruct15hw ?
+                                            (childRefracted15hw - forwardSampled15hv).Length() : -1.;
+                                        BSDF reverseChild15hw = childBSDF15go;
+                                        if (reconstruct15hw) {
+                                            reverseChild15hw.hitPoint.fixedDir = childRefracted15hw;
+                                            reverseChild15hw.hitPoint.fromLight = !childBSDF15go.hitPoint.fromLight;
+                                        }
+                                        float reverseNc15hw=0.f, reverseBase15hw=0.f, reverseNt15hw=0.f;
+                                        float reverseF15hw=0.f, reverseEta15hw=0.f, reverseEta2_15hw=0.f;
+                                        float reverseTransport15hw=0.f, reverseDelta15hw=0.f;
+                                        float reverseEventMass15hw=0.f;
+                                        bool reverseTir15hw=false;
+                                        Spectrum reverseValue15hw(0.f);
+                                        const bool reverseOK15hw = reconstruct15hw &&
+                                            reverseChild15hw.EvaluateMLHeroGlassDebugAtWaveLength(
+                                                forwardFixed15hv, childNextEvent15gq, childNextPdf15gq,
+                                                childState15gm.lambda,
+                                                &reverseNc15hw, &reverseBase15hw, &reverseNt15hw,
+                                                &reverseF15hw, &reverseEta15hw, &reverseEta2_15hw,
+                                                &reverseTransport15hw, &reverseDelta15hw,
+                                                &reverseValue15hw, nullptr, nullptr, nullptr,
+                                                &reverseTir15hw, &reverseEventMass15hw);
+                                        const double correctedFresnelDiff15hw = reverseOK15hw ?
+                                            fabs((double)reverseF15hw - (double)secondF15hs) : -1.;
+                                        const double correctedEtaProduct15hw = reverseOK15hw ?
+                                            eta15hw * (double)reverseEta15hw : -1.;
+                                        const double reverseTargetDelta15hw = reverseOK15hw ?
+                                            (double)reverseDelta15hw : -1.;
+                                        fprintf(file15gl,
+                                            "phase15hw CHILD_SNELL_RECONSTRUCTION side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.9g eligible=%u reconstructed=%u "
+                                            "reverseOK=%u reverseTIR=%u eta=%.12g discriminant=%.12g "
+                                            "parentVsChildDirection=%.12g oldSnellResidual=%.12g "
+                                            "newSnellResidual=%.12g oldFresnelDifference=%.12g "
+                                            "newFresnelDifference=%.12g newEtaProduct=%.12g "
+                                            "forwardEventMass=%.12g oldReverseEventMass=%.12g "
+                                            "newReverseEventMass=%.12g reverseTargetDelta=%.12g "
+                                            "computedDir=(%.9g,%.9g,%.9g) "
+                                            "sampledDir=(%.9g,%.9g,%.9g) "
+                                            "copyOnly=1 reverseHitPointIndependent=0 "
+                                            "notForMIS=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, (double)childState15gm.lambda,
+                                            secondEtaValid15hs && secondTransmit15hs ? 1u : 0u,
+                                            reconstruct15hw ? 1u : 0u,
+                                            reverseOK15hw ? 1u : 0u, reverseTir15hw ? 1u : 0u,
+                                            eta15hw, discriminant15hw, parentVsChildDirection15hw,
+                                            etaSnellResidual15hv, newSnellResidual15hw,
+                                            fresnelDifference15hu, correctedFresnelDiff15hw,
+                                            correctedEtaProduct15hw, (double)secondPdf15hs,
+                                            (double)reverseMass15hu, (double)reverseEventMass15hw,
+                                            reverseTargetDelta15hw,
+                                            (double)childRefracted15hw.x, (double)childRefracted15hw.y,
+                                            (double)childRefracted15hw.z,
+                                            (double)forwardSampled15hv.x, (double)forwardSampled15hv.y,
+                                            (double)forwardSampled15hv.z);
+                                        // 15hz Stage 41: independent PBRT-v4-inspired
+                                        // unpolarized Fresnel equations (no LuxCore Fresnel calls).
+                                        // eta is sourced from the Glass helper, so this is an
+                                        // INDEPENDENT EQUATION cross-check, not independent IOR proof.
+                                        const auto pbrtFresnel15hz = [](const double cosIncident,
+                                                const double etaIncidentOverTransmit) -> double {
+                                            if (!std::isfinite(cosIncident) ||
+                                                    !std::isfinite(etaIncidentOverTransmit) ||
+                                                    etaIncidentOverTransmit <= 0.)
+                                                return -1.;
+                                            const double ci = std::min(1., std::max(0., fabs(cosIncident)));
+                                            const double sin2t = etaIncidentOverTransmit * etaIncidentOverTransmit *
+                                                std::max(0., 1. - ci * ci);
+                                            if (sin2t >= 1.)
+                                                return 1.;
+                                            const double ct = sqrt(std::max(0., 1. - sin2t));
+                                            const double n1 = etaIncidentOverTransmit;
+                                            const double n2 = 1.;
+                                            const double rsDen = n1 * ci + n2 * ct;
+                                            const double rpDen = n2 * ci + n1 * ct;
+                                            if (rsDen <= 0. || rpDen <= 0.)
+                                                return -1.;
+                                            const double rs = (n1 * ci - n2 * ct) / rsDen;
+                                            const double rp = (n2 * ci - n1 * ct) / rpDen;
+                                            return .5 * (rs * rs + rp * rp);
+                                        };
+                                        const double independentForwardF15hz = pbrtFresnel15hz(
+                                            incidentShadeCos15hv, eta15hw);
+                                        const double independentReverseF15hz = reconstruct15hw ?
+                                            pbrtFresnel15hz((double)Dot(childRefracted15hw,
+                                                shadeNormal15hv), (double)reverseEta15hw) : -1.;
+                                        const double independentFError15hz = independentForwardF15hz >= 0. ?
+                                            fabs(independentForwardF15hz - (double)secondF15hs) : -1.;
+                                        const double independentReverseError15hz = reverseOK15hw &&
+                                            independentReverseF15hz >= 0. ?
+                                            fabs(independentReverseF15hz - (double)reverseF15hw) : -1.;
+                                        const double independentSnellSinError15hz = reconstruct15hw ?
+                                            fabs(sqrt(std::max(0., 1. - pow(incidentShadeCos15hv, 2.))) *
+                                                eta15hw -
+                                                sqrt(std::max(0., 1. - pow((double)Dot(childRefracted15hw,
+                                                    shadeNormal15hv), 2.)))) : -1.;
+                                        fprintf(file15gl,
+                                            "phase15hz PBRT_DIELECTRIC_REFERENCE side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.9g reconstructed=%u reverseOK=%u "
+                                            "etaForward=%.12g etaReverse=%.12g "
+                                            "cosForward=%.12g pbrtFresnelForward=%.12g "
+                                            "luxcoreFresnelForward=%.12g forwardFresnelAbsError=%.12g "
+                                            "pbrtFresnelReverse=%.12g luxcoreFresnelReverse=%.12g "
+                                            "reverseFresnelAbsError=%.12g snellSinAbsError=%.12g "
+                                            "independentFresnelEquation=1 etaProvidedByLuxCore=1 "
+                                            "reverseBSDFCopied=1 transportAndPdfNotYetValidated=1 "
+                                            "notForMIS=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, (double)childState15gm.lambda,
+                                            reconstruct15hw ? 1u : 0u, reverseOK15hw ? 1u : 0u,
+                                            eta15hw, (double)reverseEta15hw, incidentShadeCos15hv,
+                                            independentForwardF15hz, (double)secondF15hs,
+                                            independentFError15hz, independentReverseF15hz,
+                                            (double)reverseF15hw, independentReverseError15hz,
+                                            independentSnellSinError15hz);
+                                        // 15ia Stage 42: cross-check independent reverse geometry
+                                        // against the independently reconstructed TWO-BOUNDARY
+                                        // medium topology. This is read-only. Do not claim a real
+                                        // reverse HitPoint or an independent reverse BSDF.
+                                        const double reverseCosIncident15ia = reconstruct15hw ?
+                                            fabs((double)Dot(childRefracted15hw, shadeNormal15hv)) : -1.;
+                                        const double reverseCosOutgoing15ia =
+                                            fabs((double)Dot(forwardFixed15hv, shadeNormal15hv));
+                                        const double predictedReverseCos15ia = reconstruct15hw &&
+                                            eta15hw > 0. ? sqrt(std::max(0.,
+                                            1. - (1. / (eta15hw * eta15hw)) *
+                                            std::max(0., 1. - reverseCosIncident15ia * reverseCosIncident15ia))) : -1.;
+                                        const double reverseCosError15ia = predictedReverseCos15ia >= 0. ?
+                                            fabs(predictedReverseCos15ia - reverseCosOutgoing15ia) : -1.;
+                                        const double etaProductError15ia = reverseOK15hw ?
+                                            fabs(eta15hw * (double)reverseEta15hw - 1.) : -1.;
+                                        const bool reverseGeom15ia = reverseOK15hw &&
+                                            independentForwardF15hz >= 0. &&
+                                            independentReverseF15hz >= 0. &&
+                                            reverseCosError15ia >= 0. && reverseCosError15ia < 1.e-4 &&
+                                            etaProductError15ia >= 0. && etaProductError15ia < 1.e-4 &&
+                                            independentFError15hz < 1.e-4 && independentReverseError15hz < 1.e-4;
+                                        // Existing 15ht state reversal is independently derived
+                                        // from volume snapshots. We require BOTH boundaries to
+                                        // be reversible before calling this diagnostic coherent.
+                                        const bool reverseStack15ia = reverseEligible15ht &&
+                                            completeReverseStack15ht && childStackValidated15gy;
+                                        const bool combined15ia = reverseGeom15ia && reverseStack15ia;
+                                        fprintf(file15gl,
+                                            "phase15ia REVERSE_GEOMETRY_STACK side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.9g eligible=%u "
+                                            "reverseGeometryOK=%u reverseStackOK=%u combinedOK=%u "
+                                            "forwardEta=%.12g reverseHelperEta=%.12g "
+                                            "etaProductAbsError=%.12g reverseIncidentCos=%.12g "
+                                            "reverseOutgoingCos=%.12g reversePredictedOutgoingCos=%.12g "
+                                            "reverseCosAbsError=%.12g forwardFresnelAbsError=%.12g "
+                                            "reverseFresnelAbsError=%.12g "
+                                            "beforeStackCount=%u afterFirstStackCount=%u afterNextStackCount=%u "
+                                            "reverseSecondRecovered=%u reverseFirstRecovered=%u "
+                                            "reverseHitPointIndependent=0 physicalIORFromStackQueried=0 "
+                                            "nestedMediaIORNotVerified=1 pdfAndMISNotValidated=1 "
+                                            "diagnosticOnly=1 physicalChildEnabled=0 "
+                                            "filmChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, (double)childState15gm.lambda,
+                                            reconstruct15hw && reverseEligible15ht ? 1u : 0u,
+                                            reverseGeom15ia ? 1u : 0u,
+                                            reverseStack15ia ? 1u : 0u,
+                                            combined15ia ? 1u : 0u,
+                                            eta15hw, (double)reverseEta15hw,
+                                            etaProductError15ia, reverseCosIncident15ia,
+                                            reverseCosOutgoing15ia, predictedReverseCos15ia,
+                                            reverseCosError15ia, independentFError15hz,
+                                            independentReverseError15hz,
+                                            beforeStack15gy.count, afterFirstStack15gy.count,
+                                            afterNextStack15gy.count,
+                                            recoveredBeforeSecond15ht ? 1u : 0u,
+                                            recoveredBeforeFirst15ht ? 1u : 0u);
+                                        // 15ib Stage 43: reconstruct a genuine second-boundary BSDF
+                                        // using LuxCore's normal ray-hit initialization, but with
+                                        // the reverse incoming direction and POST-transmission
+                                        // volume state. No trace, sample, RR, MIS or film change.
+                                        // A synthetic unit-distance ray reproduces the SAME point
+                                        // and barycentrics, avoiding a stochastic re-intersection.
+                                        // Independent of the forward HitPoint initialization,
+                                        // but not independent of the scene geometry/material APIs.
+                                        const bool reverseInitEligible15ib = reconstruct15hw &&
+                                            reverseEligible15ht && completeReverseStack15ht &&
+                                            childHitAccepted15go && secondIdealGlass15hs &&
+                                            secondTransmit15hs && childNextIsTransmission15gw &&
+                                            childRefracted15hw.Length() > 0.999f &&
+                                            childRefracted15hw.Length() < 1.001f;
+                                        bool reverseInitOK15ib = false;
+                                        bool reverseEvalOK15ib = false;
+                                        bool reverseInsideFlipped15ib = false;
+                                        bool reverseVolumesAssigned15ib = false;
+                                        bool reverseMaterialMatch15ib = false;
+                                        float rebuiltNc15ib = 0.f, rebuiltBase15ib = 0.f;
+                                        float rebuiltNt15ib = 0.f, rebuiltF15ib = 0.f;
+                                        float rebuiltEta15ib = 0.f, rebuiltEta2_15ib = 0.f;
+                                        float rebuiltTransport15ib = 0.f, rebuiltDelta15ib = 0.f;
+                                        float rebuiltMass15ib = 0.f;
+                                        bool rebuiltTIR15ib = false;
+                                        Spectrum rebuiltValue15ib(0.f);
+                                        if (reverseInitEligible15ib) {
+                                            const luxrays::Vector reverseFixed15ib = childRefracted15hw;
+                                            const luxrays::Point reverseOrigin15ib =
+                                                childBSDF15go.hitPoint.p + reverseFixed15ib;
+                                            luxrays::Ray reverseRay15ib(reverseOrigin15ib, -reverseFixed15ib);
+                                            reverseRay15ib.time = candidateRay15gn.time;
+                                            luxrays::RayHit reverseHit15ib = childHit15go;
+                                            reverseHit15ib.t = 1.f;
+                                            BSDF rebuiltReverse15ib;
+                                            rebuiltReverse15ib.Init(!childBSDF15go.hitPoint.fromLight,
+                                                childBSDF15go.hitPoint.throughShadowTransparency,
+                                                engine->renderConfig.GetScene(), reverseRay15ib,
+                                                reverseHit15ib,
+                                                childBSDF15go.hitPoint.passThroughEvent,
+                                                &childVolumeAfterNext15gw);
+                                            reverseInitOK15ib = true;
+                                            reverseInsideFlipped15ib =
+                                                rebuiltReverse15ib.hitPoint.intoObject !=
+                                                childBSDF15go.hitPoint.intoObject;
+                                            reverseVolumesAssigned15ib =
+                                                rebuiltReverse15ib.hitPoint.interiorVolume != nullptr ||
+                                                rebuiltReverse15ib.hitPoint.exteriorVolume != nullptr;
+                                            reverseMaterialMatch15ib = rebuiltReverse15ib.GetMaterialID() ==
+                                                childBSDF15go.GetMaterialID();
+                                            reverseEvalOK15ib = rebuiltReverse15ib.EvaluateMLHeroGlassDebugAtWaveLength(
+                                                forwardFixed15hv, childNextEvent15gq, childNextPdf15gq,
+                                                childState15gm.lambda,
+                                                &rebuiltNc15ib, &rebuiltBase15ib, &rebuiltNt15ib,
+                                                &rebuiltF15ib, &rebuiltEta15ib, &rebuiltEta2_15ib,
+                                                &rebuiltTransport15ib, &rebuiltDelta15ib,
+                                                &rebuiltValue15ib, nullptr, nullptr, nullptr,
+                                                &rebuiltTIR15ib, &rebuiltMass15ib);
+                                            // 15ic Stage 44: independent input-source audit of
+                                            // the *rebuilt* reverse HitPoint. This deliberately
+                                            // reads the physical IOR texture/volume inputs on the
+                                            // new HitPoint rather than reusing forward values.
+                                            // It does NOT assert correctness of nested-media
+                                            // priority, and does not generate transport rays.
+                                            const slg::GlassMaterial *reverseGlass15ic =
+                                                dynamic_cast<const slg::GlassMaterial *>(&secondMaterial15hs);
+                                            if (reverseGlass15ic) {
+                                                const slg::Texture *exteriorTex15ic = reverseGlass15ic->GetExteriorIOR();
+                                                const slg::Texture *interiorTex15ic = reverseGlass15ic->GetInteriorIOR();
+                                                const slg::HitPoint &reverseHP15ic = rebuiltReverse15ib.hitPoint;
+                                                const slg::HitPoint &forwardHP15ic = childBSDF15go.hitPoint;
+                                                const slg::Volume *reverseExterior15ic = reverseHP15ic.exteriorVolume;
+                                                const slg::Volume *reverseInterior15ic = reverseHP15ic.interiorVolume;
+                                                const double extTexture15ic = exteriorTex15ic ?
+                                                    exteriorTex15ic->GetFloatValue(reverseHP15ic) : -1.;
+                                                const double intTexture15ic = interiorTex15ic ?
+                                                    interiorTex15ic->GetFloatValue(reverseHP15ic) : -1.;
+                                                const double extVolume15ic = reverseExterior15ic ?
+                                                    reverseExterior15ic->GetIOR(reverseHP15ic) : -1.;
+                                                const double intVolume15ic = reverseInterior15ic ?
+                                                    reverseInterior15ic->GetIOR(reverseHP15ic) : -1.;
+                                                const double selectedExt15ic = exteriorTex15ic ? extTexture15ic :
+                                                    (reverseExterior15ic ? extVolume15ic : 1.);
+                                                const double selectedInt15ic = interiorTex15ic ? intTexture15ic :
+                                                    (reverseInterior15ic ? intVolume15ic : 1.);
+                                                const bool sourceFinite15ic = std::isfinite(selectedExt15ic) &&
+                                                    std::isfinite(selectedInt15ic) &&
+                                                    selectedExt15ic > 0. && selectedInt15ic > 0.;
+                                                const double extError15ic = reverseEvalOK15ib ?
+                                                    fabs(selectedExt15ic - rebuiltNc15ib) : -1.;
+                                                const double intError15ic = reverseEvalOK15ib ?
+                                                    fabs(selectedInt15ic - rebuiltBase15ib) : -1.;
+                                                const bool sourceMatch15ic = sourceFinite15ic && reverseEvalOK15ib &&
+                                                    extError15ic <= 1.e-5 * std::max(1., fabs(selectedExt15ic)) &&
+                                                    intError15ic <= 1.e-5 * std::max(1., fabs(selectedInt15ic));
+                                                // 15id: compare the actual medium priorities and IORs
+                                                // across all four captured states at the rebuilt reverse HitPoint.
+                                                MLHeroPriorityIOR15id(file15gl, side15gl ? "LIGHT" : "EYE",
+                                                    ticket15gl, child15gl, lane15gl, "BEFORE_GLASS",
+                                                    beforeStack15gy, reverseHP15ic);
+                                                MLHeroPriorityIOR15id(file15gl, side15gl ? "LIGHT" : "EYE",
+                                                    ticket15gl, child15gl, lane15gl, "AFTER_GLASS",
+                                                    afterGlassStack15gy, reverseHP15ic);
+                                                MLHeroPriorityIOR15id(file15gl, side15gl ? "LIGHT" : "EYE",
+                                                    ticket15gl, child15gl, lane15gl, "BEFORE_SECOND",
+                                                    afterFirstStack15gy, reverseHP15ic);
+                                                MLHeroPriorityIOR15id(file15gl, side15gl ? "LIGHT" : "EYE",
+                                                    ticket15gl, child15gl, lane15gl, "AFTER_SECOND",
+                                                    afterNextStack15gy, reverseHP15ic);
+                                                // 15ie Stage 46: actual nested-medium pair on the SECOND
+                                                // boundary. The path's pre/post stacks, rather than a
+                                                // material IOR assumption, define the observed base-media
+                                                // values. These are NOT dispersion-adjusted wavelength IORs.
+                                                // No modified BSDF, samples, rays, MIS or RR.
+                                                const slg::Volume *preSecondVolume15ie = afterFirstStack15gy.active;
+                                                const slg::Volume *postSecondVolume15ie = afterNextStack15gy.active;
+                                                const double preSecondIOR15ie = preSecondVolume15ie ?
+                                                    (double)preSecondVolume15ie->GetIOR(forwardHP15ic) : 1.;
+                                                const double postSecondIOR15ie = postSecondVolume15ie ?
+                                                    (double)postSecondVolume15ie->GetIOR(forwardHP15ic) : 1.;
+                                                const bool mediumPairValid15ie = afterFirstStack15gy.sizeValid &&
+                                                    afterNextStack15gy.sizeValid &&
+                                                    std::isfinite(preSecondIOR15ie) && preSecondIOR15ie > 0. &&
+                                                    std::isfinite(postSecondIOR15ie) && postSecondIOR15ie > 0.;
+                                                const double mediumEta15ie = mediumPairValid15ie ?
+                                                    preSecondIOR15ie / postSecondIOR15ie : -1.;
+                                                const double reverseMediumEta15ie = mediumPairValid15ie ?
+                                                    postSecondIOR15ie / preSecondIOR15ie : -1.;
+                                                // For a matched pair the base ratios must be reciprocal,
+                                                // independently of how the BSDF treats spectral dispersion.
+                                                const double mediumReciprocityError15ie = mediumPairValid15ie ?
+                                                    fabs(mediumEta15ie * reverseMediumEta15ie - 1.) : -1.;
+                                                // Keep material-helper eta separate: orientation, incident
+                                                // convention, spectral IOR and actual per-boundary media
+                                                // must all be reconciled before a physical claim.
+                                                // 15if Stage 47: independent double-precision Snell/Fresnel
+                                                // equations evaluated with TWO distinct inputs:
+                                                // (a) active medium-stack base IOR, (b) the actual
+                                                // spectral material-helper eta. The latter is NOT an
+                                                // independent spectral-IOR reconstruction. No new ray.
+                                                const double cosIncident15if = std::min(1., std::max(0.,
+                                                    fabs((double)Dot(forwardFixed15hv, shadeNormal15hv))));
+                                                const double sin2Incident15if = std::max(0.,
+                                                    1. - cosIncident15if * cosIncident15if);
+                                                const double cosActual15if = std::min(1., std::max(0.,
+                                                    fabs((double)Dot(childRefracted15hw, shadeNormal15hv))));
+                                                const bool helperEtaValid15if = std::isfinite(eta15hw) && eta15hw > 0.;
+                                                const double baseEta15if = mediumEta15ie;
+                                                auto dielectricReference15if = [&](const double eta,
+                                                        double &cosT, double &fresnel, bool &tir) -> bool {
+                                                    cosT = -1.; fresnel = -1.; tir = false;
+                                                    if (!std::isfinite(eta) || eta <= 0.) return false;
+                                                    const double sin2T = eta * eta * sin2Incident15if;
+                                                    if (sin2T >= 1.) { tir = true; fresnel = 1.; return true; }
+                                                    cosT = sqrt(std::max(0., 1. - sin2T));
+                                                    const double rsDen = eta * cosIncident15if + cosT;
+                                                    const double rpDen = cosIncident15if + eta * cosT;
+                                                    if (rsDen <= 0. || rpDen <= 0.) return false;
+                                                    const double rs = (eta * cosIncident15if - cosT) / rsDen;
+                                                    const double rp = (cosIncident15if - eta * cosT) / rpDen;
+                                                    fresnel = .5 * (rs * rs + rp * rp);
+                                                    return std::isfinite(fresnel);
+                                                };
+                                                double baseCosT15if, baseF15if, spectralCosT15if, spectralF15if;
+                                                bool baseTIR15if, spectralTIR15if;
+                                                const bool baseOK15if = mediumPairValid15ie &&
+                                                    dielectricReference15if(baseEta15if,
+                                                        baseCosT15if, baseF15if, baseTIR15if);
+                                                const bool spectralOK15if = helperEtaValid15if &&
+                                                    dielectricReference15if(eta15hw,
+                                                        spectralCosT15if, spectralF15if, spectralTIR15if);
+                                                const double baseSnellResidual15if = baseOK15if &&
+                                                    !baseTIR15if && reconstruct15hw ?
+                                                    fabs(baseEta15if * sqrt(sin2Incident15if) -
+                                                        sqrt(std::max(0., 1. - cosActual15if * cosActual15if))) : -1.;
+                                                const double spectralSnellResidual15if = spectralOK15if &&
+                                                    !spectralTIR15if && reconstruct15hw ?
+                                                    fabs(eta15hw * sqrt(sin2Incident15if) -
+                                                        sqrt(std::max(0., 1. - cosActual15if * cosActual15if))) : -1.;
+                                                const double spectralFError15if = spectralOK15if &&
+                                                    std::isfinite((double)secondF15hs) ?
+                                                    fabs(spectralF15if - (double)secondF15hs) : -1.;
+                                                const double reverseEtaError15if = helperEtaValid15if &&
+                                                    reverseEvalOK15ib && std::isfinite((double)rebuiltEta15ib) ?
+                                                    fabs(eta15hw * (double)rebuiltEta15ib - 1.) : -1.;
+                                                fprintf(file15gl,
+                                                    "phase15if NESTED_SNELL_FRESNEL side=%s ticket=%llu child=%u "
+                                                    "lane=%u lambda=%.9g stackBefore=%u stackAfter=%u "
+                                                    "beforeBaseIOR=%.12g afterBaseIOR=%.12g "
+                                                    "baseEta=%.12g spectralHelperEta=%.12g "
+                                                    "cosIncident=%.12g observedCosTransmitted=%.12g "
+                                                    "baseReferenceValid=%u baseTIR=%u baseCosTransmitted=%.12g baseFresnel=%.12g "
+                                                    "baseSnellResidual=%.12g "
+                                                    "spectralReferenceValid=%u spectralTIR=%u spectralCosTransmitted=%.12g "
+                                                    "spectralFresnel=%.12g helperFresnel=%.12g spectralFresnelError=%.12g "
+                                                    "spectralSnellResidual=%.12g spectralEtaReverseProductError=%.12g "
+                                                    "deltaEtaBaseVsSpectral=%.12g "
+                                                    "spectralIORIndependent=0 equationsIndependent=1 "
+                                                    "surfaceNormal=SHADING geometryReintersection=0 "
+                                                    "nestedPriorityFromStacks=1 fullPathReverseUnverified=1 "
+                                                    "physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n",
+                                                    side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                                    lane15gl, (double)childState15gm.lambda,
+                                                    afterFirstStack15gy.count, afterNextStack15gy.count,
+                                                    preSecondIOR15ie, postSecondIOR15ie,
+                                                    baseEta15if, eta15hw,
+                                                    cosIncident15if, cosActual15if,
+                                                    baseOK15if ? 1u : 0u, baseTIR15if ? 1u : 0u,
+                                                    baseCosT15if, baseF15if, baseSnellResidual15if,
+                                                    spectralOK15if ? 1u : 0u, spectralTIR15if ? 1u : 0u,
+                                                    spectralCosT15if, spectralF15if, (double)secondF15hs,
+                                                    spectralFError15if, spectralSnellResidual15if,
+                                                    reverseEtaError15if, helperEtaValid15if && mediumPairValid15ie ?
+                                                        fabs(baseEta15if - eta15hw) : -1.);
+                                                // 15ig Stage 48: forward boundary IOR provenance and
+                                                // spectral TIR audit. Probe actual HitPoint material precedence,
+                                                // not only active volume stacks. This does NOT assume that
+                                                // a stack medium equals the boundary material's IOR source.
+                                                const slg::Texture *fwdExtTex15ig = reverseGlass15ic->GetExteriorIOR();
+                                                const slg::Texture *fwdIntTex15ig = reverseGlass15ic->GetInteriorIOR();
+                                                const slg::Volume *fwdExtVol15ig = forwardHP15ic.exteriorVolume;
+                                                const slg::Volume *fwdIntVol15ig = forwardHP15ic.interiorVolume;
+                                                const double fwdExtIOR15ig = fwdExtTex15ig ?
+                                                    (double)fwdExtTex15ig->GetFloatValue(forwardHP15ic) :
+                                                    (fwdExtVol15ig ? (double)fwdExtVol15ig->GetIOR(forwardHP15ic) : 1.);
+                                                const double fwdIntIOR15ig = fwdIntTex15ig ?
+                                                    (double)fwdIntTex15ig->GetFloatValue(forwardHP15ic) :
+                                                    (fwdIntVol15ig ? (double)fwdIntVol15ig->GetIOR(forwardHP15ic) : 1.);
+                                                const bool forwardIORFinite15ig = std::isfinite(fwdExtIOR15ig) &&
+                                                    std::isfinite(fwdIntIOR15ig) && fwdExtIOR15ig > 0. && fwdIntIOR15ig > 0.;
+                                                const double extIORAbsError15ig = forwardIORFinite15ig ?
+                                                    fabs(fwdExtIOR15ig - (double)secondNc15hs) : -1.;
+                                                const double intIORAbsError15ig = forwardIORFinite15ig ?
+                                                    fabs(fwdIntIOR15ig - (double)secondBase15hs) : -1.;
+                                                const bool forwardInputsMatch15ig = forwardIORFinite15ig &&
+                                                    extIORAbsError15ig < 1.e-5 * std::max(1., fabs(fwdExtIOR15ig)) &&
+                                                    intIORAbsError15ig < 1.e-5 * std::max(1., fabs(fwdIntIOR15ig));
+                                                // The second-boundary probe is a sampled TRANSMISSION:
+                                                // do not interpret a TIR counterfactual as the branch
+                                                // actually taken by the renderer.
+                                                const bool observedTransmit15ig = secondTransmit15hs && secondProbe15hs;
+                                                const bool observedTIR15ig = secondTir15hs;
+                                                const bool tirConflict15ig = spectralOK15if &&
+                                                    (spectralTIR15if != observedTIR15ig);
+                                                const bool stackEmpty15ig = afterFirstStack15gy.count == 0 &&
+                                                    afterNextStack15gy.count == 0;
+                                                const bool emptyStackMaterialFallback15ig = stackEmpty15ig &&
+                                                    ((fwdExtTex15ig != nullptr) || (fwdIntTex15ig != nullptr) ||
+                                                    (fwdExtVol15ig != nullptr) || (fwdIntVol15ig != nullptr));
+                                                const double criticalCos15ig = helperEtaValid15if && eta15hw > 1. ?
+                                                    sqrt(std::max(0., 1. - 1. / (eta15hw * eta15hw))) : -1.;
+                                                const double tirMargin15ig = helperEtaValid15if ?
+                                                    eta15hw * eta15hw * sin2Incident15if - 1. : -2.;
+                                                fprintf(file15gl,
+                                                    "phase15ig BOUNDARY_IOR_TIR_SOURCE side=%s ticket=%llu child=%u "
+                                                    "lane=%u lambda=%.9g beforeStack=%u afterStack=%u "
+                                                    "forwardInside=%u fromLight=%u "
+                                                    "exteriorSource=%s interiorSource=%s "
+                                                    "forwardExteriorBaseIOR=%.12g forwardInteriorBaseIOR=%.12g "
+                                                    "helperExteriorBaseIOR=%.12g helperInteriorBaseIOR=%.12g "
+                                                    "helperInteriorSpectralIOR=%.12g "
+                                                    "exteriorBaseAbsError=%.12g interiorBaseAbsError=%.12g "
+                                                    "forwardIORInputsMatch=%u "
+                                                    "activeBeforeBaseIOR=%.12g activeAfterBaseIOR=%.12g "
+                                                    "stackEmptyBoth=%u emptyStackBoundaryHasExplicitSource=%u "
+                                                    "sampledTransmit=%u sampledHelperTIR=%u spectralReferenceTIR=%u "
+                                                    "spectralTIRConflict=%u spectralEta=%.12g incidentCos=%.12g "
+                                                    "spectralCriticalCos=%.12g spectralTIRMargin=%.12g "
+                                                    "baseReferenceTIR=%u baseVsSpectralTIRDiffer=%u "
+                                                    "independentSpectralIORFromVolume=0 helperSpectralEtaInput=1 "
+                                                    "stackMayDifferFromBoundarySource=1 "
+                                                    "noNewIntersection=1 diagnosticOnly=1 physicalChildEnabled=0 "
+                                                    "filmChanged=0 misChanged=0 rrChanged=0\n",
+                                                    side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                                    lane15gl, (double)childState15gm.lambda,
+                                                    afterFirstStack15gy.count, afterNextStack15gy.count,
+                                                    forwardHP15ic.intoObject ? 1u : 0u,
+                                                    forwardHP15ic.fromLight ? 1u : 0u,
+                                                    fwdExtTex15ig ? "TEXTURE" : (fwdExtVol15ig ? "VOLUME" : "AIR_1"),
+                                                    fwdIntTex15ig ? "TEXTURE" : (fwdIntVol15ig ? "VOLUME" : "AIR_1"),
+                                                    fwdExtIOR15ig, fwdIntIOR15ig,
+                                                    (double)secondNc15hs, (double)secondBase15hs,
+                                                    (double)secondNt15hs,
+                                                    extIORAbsError15ig, intIORAbsError15ig,
+                                                    forwardInputsMatch15ig ? 1u : 0u,
+                                                    preSecondIOR15ie, postSecondIOR15ie,
+                                                    stackEmpty15ig ? 1u : 0u,
+                                                    emptyStackMaterialFallback15ig ? 1u : 0u,
+                                                    observedTransmit15ig ? 1u : 0u,
+                                                    observedTIR15ig ? 1u : 0u,
+                                                    spectralTIR15if ? 1u : 0u,
+                                                    tirConflict15ig ? 1u : 0u,
+                                                    eta15hw, cosIncident15if,
+                                                    criticalCos15ig, tirMargin15ig,
+                                                    baseTIR15if ? 1u : 0u,
+                                                    baseOK15if && spectralOK15if &&
+                                                        baseTIR15if != spectralTIR15if ? 1u : 0u);
+                                                fprintf(file15gl,
+                                                    "phase15ie NESTED_REVERSE_MEDIUM_PAIR side=%s ticket=%llu child=%u "
+                                                    "lane=%u lambda=%.9g beforeSecondCount=%u afterSecondCount=%u "
+                                                    "beforeSecondActive=%p beforeSecondPriority=%d beforeSecondBaseIOR=%.12g "
+                                                    "afterSecondActive=%p afterSecondPriority=%d afterSecondBaseIOR=%.12g "
+                                                    "nestedBefore=%u nestedAfter=%u "
+                                                    "mediumPairValid=%u baseForwardEta=%.12g baseReverseEta=%.12g "
+                                                    "baseReciprocityAbsError=%.12g forwardSpectralHelperEta=%.12g "
+                                                    "rebuiltReverseSpectralHelperEta=%.12g "
+                                                    "reverseInitialized=%u reverseEvaluated=%u "
+                                                    "baseVsSpectralEtaNotEquated=1 prioritySelectionOnly=1 "
+                                                    "forwardReverseWavelengthIORIndependent=0 fullNestedTransportUnverified=1 "
+                                                    "noNewIntersection=1 diagnosticOnly=1 physicalChildEnabled=0 "
+                                                    "filmChanged=0 misChanged=0 rrChanged=0\n",
+                                                    side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                                    lane15gl, (double)childState15gm.lambda,
+                                                    afterFirstStack15gy.count, afterNextStack15gy.count,
+                                                    (const void *)preSecondVolume15ie,
+                                                    preSecondVolume15ie ? (int)preSecondVolume15ie->GetPriority() : -1,
+                                                    preSecondIOR15ie, (const void *)postSecondVolume15ie,
+                                                    postSecondVolume15ie ? (int)postSecondVolume15ie->GetPriority() : -1,
+                                                    postSecondIOR15ie,
+                                                    afterFirstStack15gy.count >= 3 ? 1u : 0u,
+                                                    afterNextStack15gy.count >= 3 ? 1u : 0u,
+                                                    mediumPairValid15ie ? 1u : 0u,
+                                                    mediumEta15ie, reverseMediumEta15ie,
+                                                    mediumReciprocityError15ie,
+                                                    eta15hw, (double)rebuiltEta15ib,
+                                                    reverseInitOK15ib ? 1u : 0u,
+                                                    reverseEvalOK15ib ? 1u : 0u);
+                                                fprintf(file15gl,
+                                                    "phase15ic REVERSE_IOR_SOURCE side=%s ticket=%llu child=%u "
+                                                    "lane=%u lambda=%.9g eligible=1 reverseInitialized=%u reverseEvaluated=%u "
+                                                    "intoObjectForward=%u intoObjectReverse=%u fromLightForward=%u fromLightReverse=%u "
+                                                    "exteriorSource=%s interiorSource=%s "
+                                                    "exteriorTextureValue=%.12g interiorTextureValue=%.12g "
+                                                    "exteriorVolumeValue=%.12g interiorVolumeValue=%.12g "
+                                                    "selectedExterior=%.12g selectedInteriorBase=%.12g "
+                                                    "helperExterior=%.12g helperInteriorBase=%.12g helperInteriorLambda=%.12g "
+                                                    "exteriorAbsError=%.12g interiorAbsError=%.12g "
+                                                    "sourcesFinite=%u helperInputsMatch=%u "
+                                                    "forwardExteriorVolumeSame=%u forwardInteriorVolumeSame=%u "
+                                                    "postSecondStackCount=%u physicalVolumePriorityNotIndependentlyVerified=1 "
+                                                    "nestedMediaNotYetProven=1 wavelengthInteriorCanDifferFromBase=1 "
+                                                    "noNewIntersection=1 diagnosticOnly=1 physicalChildEnabled=0 "
+                                                    "filmChanged=0 misChanged=0 rrChanged=0\n",
+                                                    side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                                    lane15gl, (double)childState15gm.lambda,
+                                                    reverseInitOK15ib ? 1u : 0u, reverseEvalOK15ib ? 1u : 0u,
+                                                    forwardHP15ic.intoObject ? 1u : 0u,
+                                                    reverseHP15ic.intoObject ? 1u : 0u,
+                                                    forwardHP15ic.fromLight ? 1u : 0u,
+                                                    reverseHP15ic.fromLight ? 1u : 0u,
+                                                    exteriorTex15ic ? "TEXTURE" : (reverseExterior15ic ? "VOLUME" : "AIR_1"),
+                                                    interiorTex15ic ? "TEXTURE" : (reverseInterior15ic ? "VOLUME" : "AIR_1"),
+                                                    extTexture15ic, intTexture15ic, extVolume15ic, intVolume15ic,
+                                                    selectedExt15ic, selectedInt15ic,
+                                                    (double)rebuiltNc15ib, (double)rebuiltBase15ib, (double)rebuiltNt15ib,
+                                                    extError15ic, intError15ic,
+                                                    sourceFinite15ic ? 1u : 0u, sourceMatch15ic ? 1u : 0u,
+                                                    reverseExterior15ic == forwardHP15ic.exteriorVolume ? 1u : 0u,
+                                                    reverseInterior15ic == forwardHP15ic.interiorVolume ? 1u : 0u,
+                                                    afterNextStack15gy.count);
+                                            }
+
+                                        }
+                                        const double etaProductError15ib = reverseEvalOK15ib ?
+                                            fabs(eta15hw * (double)rebuiltEta15ib - 1.) : -1.;
+                                        const double fresnelError15ib = reverseEvalOK15ib &&
+                                            independentReverseF15hz >= 0. ?
+                                            fabs((double)rebuiltF15ib - independentReverseF15hz) : -1.;
+                                        const double copiedVsRebuiltMass15ib = reverseEvalOK15ib && reverseOK15hw ?
+                                            fabs((double)rebuiltMass15ib - (double)reverseEventMass15hw) : -1.;
+                                        fprintf(file15gl,
+                                            "phase15ib REBUILT_REVERSE_HITPOINT side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.9g eligible=%u initialized=%u "
+                                            "insideFlipped=%u volumesAssigned=%u materialMatch=%u "
+                                            "evaluated=%u reverseTIR=%u "
+                                            "etaForward=%.12g etaRebuilt=%.12g etaProductAbsError=%.12g "
+                                            "fresnelRebuilt=%.12g fresnelReference=%.12g fresnelAbsError=%.12g "
+                                            "rebuiltMass=%.12g copiedMass=%.12g copiedVsRebuiltMassAbsError=%.12g "
+                                            "postSecondStackCount=%u reverseMediumStackSource=postSecondTransition "
+                                            "actualBSDFInit=1 syntheticRaySameTriangle=1 "
+                                            "reversePhysicalIORIndependent=0 nestedMediaNotYetProven=1 "
+                                            "notForMIS=1 diagnosticOnly=1 physicalChildEnabled=0 "
+                                            "filmChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, (double)childState15gm.lambda,
+                                            reverseInitEligible15ib ? 1u : 0u,
+                                            reverseInitOK15ib ? 1u : 0u,
+                                            reverseInsideFlipped15ib ? 1u : 0u,
+                                            reverseVolumesAssigned15ib ? 1u : 0u,
+                                            reverseMaterialMatch15ib ? 1u : 0u,
+                                            reverseEvalOK15ib ? 1u : 0u, rebuiltTIR15ib ? 1u : 0u,
+                                            eta15hw, (double)rebuiltEta15ib, etaProductError15ib,
+                                            (double)rebuiltF15ib, independentReverseF15hz, fresnelError15ib,
+                                            (double)rebuiltMass15ib, (double)reverseEventMass15hw,
+                                            copiedVsRebuiltMass15ib, afterNextStack15gy.count);
+                                        // 15jh: validate the rebuilt SECOND-boundary reverse
+                                        // discrete event mass against the old copied-BSDF probe.
+                                        // Not a solid-angle density or a full spectral MIS PDF.
+                                        const bool forwardValid15jh = secondProbe15hs &&
+                                            std::isfinite((double)secondPdf15hs) &&
+                                            secondPdf15hs > 0.f && secondPdf15hs <= 1.f;
+                                        const bool copiedValid15jh = reverseMassValid15hu &&
+                                            reverseMass15hu > 0.f;
+                                        const bool rebuiltValid15jh = reverseInitOK15ib &&
+                                            reverseMaterialMatch15ib && reverseEvalOK15ib &&
+                                            !rebuiltTIR15ib && std::isfinite((double)rebuiltMass15ib) &&
+                                            rebuiltMass15ib > 0.f && rebuiltMass15ib <= 1.f;
+                                        const bool pairedValid15jh = forwardValid15jh && rebuiltValid15jh;
+                                        const bool copyAgreement15jh = copiedValid15jh && rebuiltValid15jh &&
+                                            fabs((double)rebuiltMass15ib - (double)reverseMass15hu) <= 1.e-5;
+                                        const double logRatio15jh = pairedValid15jh ?
+                                            log((double)rebuiltMass15ib / (double)secondPdf15hs) : 0.;
+                                        const bool finiteRatio15jh = pairedValid15jh && std::isfinite(logRatio15jh);
+                                        fprintf(file15gl,
+                                            "phase15jh REBUILT_REVERSE_EVENT_AUDIT side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.9g eligible=%u reverseInitialized=%u "
+                                            "reverseMaterialMatch=%u forwardValid=%u copiedValid=%u "
+                                            "rebuiltValid=%u pairedValid=%u forwardMass=%.12g "
+                                            "copiedReverseMass=%.12g rebuiltReverseMass=%.12g "
+                                            "copyAgreement=%u logRebuiltOverForward=%.12g logRatioFinite=%u "
+                                            "reverseTIR=%u measure=DISCRETE_DELTA_EVENT "
+                                            "reverseSource=REBUILT_SECOND_BOUNDARY_BSDF "
+                                            "reverseStackSource=POST_SECOND_TRANSITION "
+                                            "reversePhysicalIORIndependent=0 nestedMediumPriorityUnverified=1 "
+                                            "spectralSelectionPdfIncluded=0 fullJointPdfKnown=0 "
+                                            "misUsable=0 diagnosticOnly=1 childRays=0 physicsChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, (double)childState15gm.lambda,
+                                            reverseInitEligible15ib ? 1u : 0u,
+                                            reverseInitOK15ib ? 1u : 0u,
+                                            reverseMaterialMatch15ib ? 1u : 0u,
+                                            forwardValid15jh ? 1u : 0u,
+                                            copiedValid15jh ? 1u : 0u,
+                                            rebuiltValid15jh ? 1u : 0u,
+                                            pairedValid15jh ? 1u : 0u,
+                                            (double)secondPdf15hs, (double)reverseMass15hu,
+                                            (double)rebuiltMass15ib, copyAgreement15jh ? 1u : 0u,
+                                            finiteRatio15jh ? logRatio15jh : 0.,
+                                            finiteRatio15jh ? 1u : 0u,
+                                            rebuiltTIR15ib ? 1u : 0u);
+                                        // 15hx Stage 39: decompose the remaining forward/reverse
+                                        // DISCRETE event-mass differences. The neutral Kr=Kt=1
+                                        // Fresnel/transport weights below are a COUNTERFACTUAL
+                                        // proxy, not authoritative material texture reads. Compare
+                                        // it with both existing GlassMaterial helper outputs.
+                                        // A mismatch is evidence that other weights/rules matter;
+                                        // never substitute this for MIS densities.
+                                        const bool massEligible15hx = secondTransmit15hs &&
+                                            reverseOK15hw && !reverseTir15hw &&
+                                            std::isfinite((double)secondPdf15hs) &&
+                                            std::isfinite((double)reverseEventMass15hw);
+                                        const double forwardF15hx = (double)secondF15hs;
+                                        const double reverseF15hx = (double)reverseF15hw;
+                                        const double forwardT15hx = (double)secondTransport15hs;
+                                        const double reverseT15hx = (double)reverseTransport15hw;
+                                        const double forwardRWeight15hx = forwardF15hx;
+                                        const double reverseRWeight15hx = reverseF15hx;
+                                        const double forwardTWeight15hx = (1. - forwardF15hx) * forwardT15hx;
+                                        const double reverseTWeight15hx = (1. - reverseF15hx) * reverseT15hx;
+                                        const double forwardDenom15hx = forwardRWeight15hx + forwardTWeight15hx;
+                                        const double reverseDenom15hx = reverseRWeight15hx + reverseTWeight15hx;
+                                        const bool proxyValid15hx = massEligible15hx &&
+                                            std::isfinite(forwardDenom15hx) && std::isfinite(reverseDenom15hx) &&
+                                            forwardDenom15hx > 0. && reverseDenom15hx > 0. &&
+                                            forwardRWeight15hx >= 0. && reverseRWeight15hx >= 0. &&
+                                            forwardTWeight15hx >= 0. && reverseTWeight15hx >= 0.;
+                                        const double forwardRaw15hx = proxyValid15hx ?
+                                            forwardTWeight15hx / forwardDenom15hx : -1.;
+                                        const double reverseRaw15hx = proxyValid15hx ?
+                                            reverseTWeight15hx / reverseDenom15hx : -1.;
+                                        const double forwardClamped15hx = proxyValid15hx ?
+                                            std::min(.75, std::max(.25, forwardRaw15hx)) : -1.;
+                                        const double reverseClamped15hx = proxyValid15hx ?
+                                            std::min(.75, std::max(.25, reverseRaw15hx)) : -1.;
+                                        const double observedDelta15hx = massEligible15hx ?
+                                            (double)reverseEventMass15hw - (double)secondPdf15hs : -1.;
+                                        const double proxyDelta15hx = proxyValid15hx ?
+                                            reverseClamped15hx - forwardClamped15hx : -1.;
+                                        const double forwardProxyError15hx = proxyValid15hx ?
+                                            fabs(forwardClamped15hx - (double)secondPdf15hs) : -1.;
+                                        const double reverseProxyError15hx = proxyValid15hx ?
+                                            fabs(reverseClamped15hx - (double)reverseEventMass15hw) : -1.;
+                                        const double deltaProxyError15hx = proxyValid15hx ?
+                                            fabs(proxyDelta15hx - observedDelta15hx) : -1.;
+                                        const bool observedDiff15hx = massEligible15hx && fabs(observedDelta15hx) > 1.e-4;
+                                        const bool proxyExplains15hx = proxyValid15hx &&
+                                            forwardProxyError15hx <= 1.e-4 &&
+                                            reverseProxyError15hx <= 1.e-4 &&
+                                            deltaProxyError15hx <= 1.e-4;
+                                        fprintf(file15gl,
+                                            "phase15hx EVENT_MASS_DECOMPOSITION side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.9g eligible=%u proxyValid=%u observedDiff=%u "
+                                            "forwardF=%.12g reverseF=%.12g forwardTransport=%.12g reverseTransport=%.12g "
+                                            "forwardReflectWeightProxy=%.12g forwardTransmitWeightProxy=%.12g "
+                                            "reverseReflectWeightProxy=%.12g reverseTransmitWeightProxy=%.12g "
+                                            "forwardRawProxy=%.12g reverseRawProxy=%.12g "
+                                            "forwardClampedProxy=%.12g reverseClampedProxy=%.12g "
+                                            "forwardClampLow=%u forwardClampHigh=%u reverseClampLow=%u reverseClampHigh=%u "
+                                            "forwardHelperMass=%.12g reverseHelperMass=%.12g "
+                                            "observedReverseMinusForward=%.12g proxyReverseMinusForward=%.12g "
+                                            "forwardProxyError=%.12g reverseProxyError=%.12g deltaProxyError=%.12g "
+                                            "neutralKrKtProxyExplains=%u actualKrKtNotQueried=1 "
+                                            "reverseHitPointIndependent=0 discreteMassNotSolidAnglePdf=1 "
+                                            "notForMIS=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, (double)childState15gm.lambda,
+                                            massEligible15hx ? 1u : 0u, proxyValid15hx ? 1u : 0u,
+                                            observedDiff15hx ? 1u : 0u,
+                                            forwardF15hx, reverseF15hx, forwardT15hx, reverseT15hx,
+                                            forwardRWeight15hx, forwardTWeight15hx,
+                                            reverseRWeight15hx, reverseTWeight15hx,
+                                            forwardRaw15hx, reverseRaw15hx,
+                                            forwardClamped15hx, reverseClamped15hx,
+                                            proxyValid15hx && forwardRaw15hx < .25 ? 1u : 0u,
+                                            proxyValid15hx && forwardRaw15hx > .75 ? 1u : 0u,
+                                            proxyValid15hx && reverseRaw15hx < .25 ? 1u : 0u,
+                                            proxyValid15hx && reverseRaw15hx > .75 ? 1u : 0u,
+                                            (double)secondPdf15hs, (double)reverseEventMass15hw,
+                                            observedDelta15hx, proxyDelta15hx,
+                                            forwardProxyError15hx, reverseProxyError15hx,
+                                            deltaProxyError15hx, proxyExplains15hx ? 1u : 0u);
+                                        // 15hy Stage 40: read the REAL GlassMaterial Kr/Kt
+                                        // texture spectra at forward and copied reverse HitPoints.
+                                        // In particular, helper transportFactor ALREADY contains (1-F).
+                                        // Replicate the branch-mass rule using spectrum Filter(),
+                                        // not scalar Kr=Kt=1. Thin-film cases are explicitly
+                                        // UNSUPPORTED here (rather than silently assumed correct).
+                                        const slg::GlassMaterial *glass15hy =
+                                            dynamic_cast<const slg::GlassMaterial *>(&secondMaterial15hs);
+                                        const bool weightsEligible15hy = massEligible15hx && glass15hy;
+                                        Spectrum fKr15hy(0.f), fKt15hy(0.f);
+                                        Spectrum rKr15hy(0.f), rKt15hy(0.f);
+                                        float filmThickness15hy = 0.f;
+                                        bool filmFree15hy = false;
+                                        if (weightsEligible15hy) {
+                                            fKr15hy = glass15hy->GetKr()->GetSpectrumValue(childBSDF15go.hitPoint).Clamp(0.f, 1.f);
+                                            fKt15hy = glass15hy->GetKt()->GetSpectrumValue(childBSDF15go.hitPoint).Clamp(0.f, 1.f);
+                                            rKr15hy = glass15hy->GetKr()->GetSpectrumValue(reverseChild15hw.hitPoint).Clamp(0.f, 1.f);
+                                            rKt15hy = glass15hy->GetKt()->GetSpectrumValue(reverseChild15hw.hitPoint).Clamp(0.f, 1.f);
+                                            filmThickness15hy = glass15hy->GetFilmThickness() ?
+                                                glass15hy->GetFilmThickness()->GetFloatValue(childBSDF15go.hitPoint) : 0.f;
+                                            filmFree15hy = !(filmThickness15hy > 0.f);
+                                        }
+                                        const Spectrum fRefl15hy = fKr15hy * (float)forwardF15hx;
+                                        const Spectrum fTrans15hy = fKt15hy * (float)forwardT15hx;
+                                        const Spectrum rRefl15hy = rKr15hy * (float)reverseF15hx;
+                                        const Spectrum rTrans15hy = rKt15hy * (float)reverseT15hx;
+                                        const bool fR15hy = weightsEligible15hy && !fRefl15hy.Black();
+                                        const bool fT15hy = weightsEligible15hy && !fTrans15hy.Black();
+                                        const bool rR15hy = weightsEligible15hy && !rRefl15hy.Black();
+                                        const bool rT15hy = weightsEligible15hy && !rTrans15hy.Black();
+                                        const float fRF15hy = fRefl15hy.Filter(), fTF15hy = fTrans15hy.Filter();
+                                        const float rRF15hy = rRefl15hy.Filter(), rTF15hy = rTrans15hy.Filter();
+                                        const double fRaw15hy = (fR15hy && fT15hy && fRF15hy + fTF15hy > 0.f) ?
+                                            (double)fTF15hy / ((double)fRF15hy + (double)fTF15hy) : -1.;
+                                        const double rRaw15hy = (rR15hy && rT15hy && rRF15hy + rTF15hy > 0.f) ?
+                                            (double)rTF15hy / ((double)rRF15hy + (double)rTF15hy) : -1.;
+                                        const double fMass15hy = !weightsEligible15hy ? -1. :
+                                            !fR15hy ? (fT15hy ? 1. : 0.) : !fT15hy ? 0. :
+                                            (fRaw15hy >= 0. ? std::min(.75, std::max(.25, fRaw15hy)) : -1.);
+                                        const double rMass15hy = !weightsEligible15hy ? -1. :
+                                            !rR15hy ? (rT15hy ? 1. : 0.) : !rT15hy ? 0. :
+                                            (rRaw15hy >= 0. ? std::min(.75, std::max(.25, rRaw15hy)) : -1.);
+                                        const bool modelValid15hy = weightsEligible15hy && filmFree15hy &&
+                                            fMass15hy >= 0. && rMass15hy >= 0.;
+                                        const double fError15hy = modelValid15hy ?
+                                            fabs(fMass15hy - (double)secondPdf15hs) : -1.;
+                                        const double rError15hy = modelValid15hy ?
+                                            fabs(rMass15hy - (double)reverseEventMass15hw) : -1.;
+                                        fprintf(file15gl,
+                                            "phase15hy ACTUAL_KR_KT_EVENT_MASS side=%s ticket=%llu child=%u "
+                                            "lambda=%.9g eligible=%u modelValid=%u filmThickness=%.9g filmUnsupported=%u "
+                                            "forwardKr=(%.9g,%.9g,%.9g) forwardKt=(%.9g,%.9g,%.9g) "
+                                            "reverseKr=(%.9g,%.9g,%.9g) reverseKt=(%.9g,%.9g,%.9g) "
+                                            "forwardReflectFilter=%.12g forwardTransmitFilter=%.12g "
+                                            "reverseReflectFilter=%.12g reverseTransmitFilter=%.12g "
+                                            "forwardRaw=%.12g reverseRaw=%.12g forwardModelMass=%.12g reverseModelMass=%.12g "
+                                            "forwardHelperMass=%.12g reverseHelperMass=%.12g "
+                                            "forwardError=%.12g reverseError=%.12g bothMatch=%u "
+                                            "forwardReflectPresent=%u forwardTransmitPresent=%u "
+                                            "reverseReflectPresent=%u reverseTransmitPresent=%u "
+                                            "copiedReverseHitPoint=1 independentReverseHitPoint=0 "
+                                            "notForMIS=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            (double)childState15gm.lambda, weightsEligible15hy ? 1u : 0u,
+                                            modelValid15hy ? 1u : 0u, (double)filmThickness15hy,
+                                            weightsEligible15hy && !filmFree15hy ? 1u : 0u,
+                                            (double)fKr15hy.c[0], (double)fKr15hy.c[1], (double)fKr15hy.c[2],
+                                            (double)fKt15hy.c[0], (double)fKt15hy.c[1], (double)fKt15hy.c[2],
+                                            (double)rKr15hy.c[0], (double)rKr15hy.c[1], (double)rKr15hy.c[2],
+                                            (double)rKt15hy.c[0], (double)rKt15hy.c[1], (double)rKt15hy.c[2],
+                                            (double)fRF15hy, (double)fTF15hy,
+                                            (double)rRF15hy, (double)rTF15hy,
+                                            fRaw15hy, rRaw15hy, fMass15hy, rMass15hy,
+                                            (double)secondPdf15hs, (double)reverseEventMass15hw,
+                                            fError15hy, rError15hy,
+                                            modelValid15hy && fError15hy <= 1.e-4 && rError15hy <= 1.e-4 ? 1u : 0u,
+                                            fR15hy ? 1u : 0u, fT15hy ? 1u : 0u,
+                                            rR15hy ? 1u : 0u, rT15hy ? 1u : 0u);
+                                        // 15hm Stage 28: couple the reverse GlassMaterial
+                                        // copy-probe to the ACTUAL locally simulated medium
+                                        // transition. A pointer identity audit is not an IOR
+                                        // lookup. We compare numerical eta independently,
+                                        // and explicitly label reconstructed states as unproven.
+                                        const bool mediumChanged15hm =
+                                            beforeStack15gy.active != afterGlassStack15gy.active;
+                                        const bool reverseSideConsistent15hm =
+                                            reverseBsdf15hl.hitPoint.fromLight !=
+                                                pathVertex->bsdf.hitPoint.fromLight;
+                                        const double expectedReverseEta15hm =
+                                            (std::isfinite((double)eta15gl) && eta15gl > 0.f) ?
+                                                1. / (double)eta15gl : -1.;
+                                        const double reverseEtaError15hm =
+                                            expectedReverseEta15hm > 0. && revMassValid15hl ?
+                                                fabs((double)revEta15hl - expectedReverseEta15hm) : -1.;
+                                        const bool reverseEtaAgreement15hm =
+                                            reverseEtaError15hm >= 0. &&
+                                            reverseEtaError15hm <= 1e-4 *
+                                                Max(1., expectedReverseEta15hm);
+                                        const bool reverseStateProxyOK15hm =
+                                            childStackValidated15gy &&
+                                            childGlassIsTransmission15gw &&
+                                            reverseSideConsistent15hm &&
+                                            reverseEtaAgreement15hm &&
+                                            revMassValid15hl;
+                                        fprintf(file15gl,
+                                            "phase15hm REVERSE_MEDIUM_CROSSCHECK side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.9g parentActiveMedium=%p "
+                                            "postGlassActiveMedium=%p postFirstActiveMedium=%p "
+                                            "glassMaterialInterior=%p mediumChanged=%u "
+                                            "stackValidated=%u reverseSideToggled=%u "
+                                            "forwardEta=%.12g expectedInverseEta=%.12g "
+                                            "directReverseEta=%.12g reverseEtaAbsError=%.12g "
+                                            "reverseEtaAgreement=%u directReverseMass=%.12g "
+                                            "directReverseMassValid=%u proxyCrosscheckOK=%u "
+                                            "directReverseBSDFUsesCopiedHitPoint=1 "
+                                            "reverseVolumeStateReconstructed=0 "
+                                            "volumePointersAreNotIOR=1 physicalIORFromStackQueried=0 "
+                                            "nestedMediaFullReverseUnverified=1 notForMIS=1 "
+                                            "diagnosticOnly=1 physicalChildEnabled=0 "
+                                            "filmChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl,
+                                            child15gl, lane15gl, (double)childState15gm.lambda,
+                                            (const void *)beforeStack15gy.active,
+                                            (const void *)afterGlassStack15gy.active,
+                                            (const void *)afterFirstStack15gy.active,
+                                            (const void *)pathVertex->bsdf.GetMaterialInteriorVolume(),
+                                            mediumChanged15hm ? 1u : 0u,
+                                            childStackValidated15gy ? 1u : 0u,
+                                            reverseSideConsistent15hm ? 1u : 0u,
+                                            (double)eta15gl, expectedReverseEta15hm,
+                                            (double)revEta15hl, reverseEtaError15hm,
+                                            reverseEtaAgreement15hm ? 1u : 0u,
+                                            (double)revPdf15hl, revMassValid15hl ? 1u : 0u,
+                                            reverseStateProxyOK15hm ? 1u : 0u);
+                                        // 15hn: read the physical IOR texture from each observed
+                                        // active Volume, when the Volume API exposes it. This
+                                        // remains a scene-state audit, NOT a reconstructed BSDF.
+                                        const slg::Texture *beforeIORTexture15hn =
+                                            MLHeroVolumeIORTexture15hn(beforeStack15gy.active, 0);
+                                        const slg::Texture *afterIORTexture15hn =
+                                            MLHeroVolumeIORTexture15hn(afterGlassStack15gy.active, 0);
+                                        const bool beforeIORAvailable15hn = beforeIORTexture15hn != nullptr;
+                                        const bool afterIORAvailable15hn = afterIORTexture15hn != nullptr;
+                                        const double beforeIOR15hn = beforeIORAvailable15hn ?
+                                            (double)beforeIORTexture15hn->GetFloatValue(pathVertex->bsdf.hitPoint) : -1.;
+                                        const double afterIOR15hn = afterIORAvailable15hn ?
+                                            (double)afterIORTexture15hn->GetFloatValue(pathVertex->bsdf.hitPoint) : -1.;
+                                        const bool validIORPair15hn =
+                                            beforeIORAvailable15hn && afterIORAvailable15hn &&
+                                            std::isfinite(beforeIOR15hn) && std::isfinite(afterIOR15hn) &&
+                                            beforeIOR15hn > 0. && afterIOR15hn > 0.;
+                                        const double beforeOverAfter15hn = validIORPair15hn ?
+                                            beforeIOR15hn / afterIOR15hn : -1.;
+                                        const double afterOverBefore15hn = validIORPair15hn ?
+                                            afterIOR15hn / beforeIOR15hn : -1.;
+                                        const double errorBeforeOverAfter15hn = validIORPair15hn ?
+                                            fabs(beforeOverAfter15hn - (double)eta15gl) : -1.;
+                                        const double errorAfterOverBefore15hn = validIORPair15hn ?
+                                            fabs(afterOverBefore15hn - (double)eta15gl) : -1.;
+                                        fprintf(file15gl,
+                                            "phase15hn PHYSICAL_VOLUME_IOR side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.9g beforeVolume=%p afterVolume=%p "
+                                            "beforeStackCount=%u afterStackCount=%u mediumChanged=%u "
+                                            "beforeIORAvailable=%u afterIORAvailable=%u beforeIOR=%.12g afterIOR=%.12g "
+                                            "validIORPair=%u beforeOverAfter=%.12g afterOverBefore=%.12g "
+                                            "forwardEta=%.12g errorBeforeOverAfter=%.12g errorAfterOverBefore=%.12g "
+                                            "iorTextureSampleAtCopiedForwardHitPoint=1 "
+                                            "iorTextureWavelengthDependenceUnverified=1 "
+                                            "vacuumFallbackNotAssumed=1 reverseHitPointNotRebuilt=1 "
+                                            "actualReverseMediumNotReconstructed=1 notForMIS=1 "
+                                            "diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl, lane15gl,
+                                            (double)childState15gm.lambda, (const void *)beforeStack15gy.active,
+                                            (const void *)afterGlassStack15gy.active, beforeStack15gy.count,
+                                            afterGlassStack15gy.count, mediumChanged15hm ? 1u : 0u,
+                                            beforeIORAvailable15hn ? 1u : 0u, afterIORAvailable15hn ? 1u : 0u,
+                                            beforeIOR15hn, afterIOR15hn, validIORPair15hn ? 1u : 0u,
+                                            beforeOverAfter15hn, afterOverBefore15hn, (double)eta15gl,
+                                            errorBeforeOverAfter15hn, errorAfterOverBefore15hn);
+                                        // 15ho (restored from previous diagnosis intent):
+                                        // compare material IOR arithmetic against observed
+                                        // volume base IOR, without asserting side mapping.
+                                        const bool materialValid15ho = ok15gl &&
+                                            std::isfinite((double)nc15gl) && nc15gl > 0.f &&
+                                            std::isfinite((double)base15gl) && base15gl > 0.f &&
+                                            std::isfinite((double)nt15gl) && nt15gl > 0.f &&
+                                            std::isfinite((double)eta15gl) && eta15gl > 0.f;
+                                        const double materialEtaCalc15ho = materialValid15ho ?
+                                            (double)nc15gl / (double)nt15gl : -1.;
+                                        const double materialEtaError15ho = materialValid15ho ?
+                                            fabs(materialEtaCalc15ho - (double)eta15gl) : -1.;
+                                        const bool reverseValid15ho = materialValid15ho &&
+                                            revMassValid15hl && std::isfinite((double)revEta15hl) && revEta15hl > 0.f;
+                                        const double etaReciprocityError15ho = reverseValid15ho ?
+                                            fabs((double)eta15gl * (double)revEta15hl - 1.) : -1.;
+                                        fprintf(file15gl,
+                                            "phase15ho SPECTRAL_IOR_CROSSCHECK side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.9g materialValid=%u glassNc=%.12g "
+                                            "glassBase=%.12g glassNt=%.12g glassEta=%.12g "
+                                            "calculatedNcOverNt=%.12g etaArithmeticError=%.12g "
+                                            "reverseEtaValid=%u reverseEta=%.12g etaReciprocityError=%.12g "
+                                            "beforeVolumeIORAvailable=%u beforeVolumeIOR=%.12g "
+                                            "afterVolumeIORAvailable=%u afterVolumeIOR=%.12g "
+                                            "materialIORSideMappingNotAssumed=1 diagnosticOnly=1 "
+                                            "physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, (double)childState15gm.lambda,
+                                            materialValid15ho ? 1u : 0u,
+                                            (double)nc15gl, (double)base15gl, (double)nt15gl,
+                                            (double)eta15gl, materialEtaCalc15ho, materialEtaError15ho,
+                                            reverseValid15ho ? 1u : 0u, (double)revEta15hl,
+                                            etaReciprocityError15ho,
+                                            beforeIORAvailable15hn ? 1u : 0u, beforeIOR15hn,
+                                            afterIORAvailable15hn ? 1u : 0u, afterIOR15hn);
+                                        // 15hp Stage 31: explicitly query the material-assigned
+                                        // interior volume. Blender grays out the Glass IOR when
+                                        // that volume supplies the base IOR, but we still must
+                                        // not infer ownership merely from a numerical match.
+                                        const slg::Volume *materialInterior15hp =
+                                            pathVertex->bsdf.GetMaterialInteriorVolume();
+                                        const slg::Texture *interiorTexture15hp =
+                                            MLHeroVolumeIORTexture15hn(materialInterior15hp, 0);
+                                        const bool interiorTextureAvailable15hp = interiorTexture15hp != nullptr;
+                                        const double interiorIOR15hp = interiorTextureAvailable15hp ?
+                                            (double)interiorTexture15hp->GetFloatValue(pathVertex->bsdf.hitPoint) : -1.;
+                                        const bool interiorIORValid15hp = interiorTextureAvailable15hp &&
+                                            std::isfinite(interiorIOR15hp) && interiorIOR15hp > 0.;
+                                        const bool baseValid15hp = materialValid15ho;
+                                        const double baseInteriorError15hp = baseValid15hp && interiorIORValid15hp ?
+                                            fabs((double)base15gl - interiorIOR15hp) : -1.;
+                                        const bool baseInteriorMatch15hp = baseInteriorError15hp >= 0. &&
+                                            baseInteriorError15hp <= 1e-5 * Max(1., fabs(interiorIOR15hp));
+                                        const bool interiorIsBefore15hp = materialInterior15hp &&
+                                            materialInterior15hp == beforeStack15gy.active;
+                                        const bool interiorIsAfter15hp = materialInterior15hp &&
+                                            materialInterior15hp == afterGlassStack15gy.active;
+                                        const double materialSpectralOffset15hp = materialValid15ho ?
+                                            (double)nt15gl - (double)base15gl : -999.;
+                                        const bool materialDispersionObserved15hp = materialValid15ho &&
+                                            fabs(materialSpectralOffset15hp) > 1e-6;
+                                        fprintf(file15gl,
+                                            "phase15hp INTERIOR_IOR_PROVENANCE side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.9g fromLight=%u intoObject=%u "
+                                            "materialInteriorVolume=%p beforeActiveVolume=%p afterActiveVolume=%p "
+                                            "materialInteriorIsBeforeActive=%u materialInteriorIsAfterActive=%u "
+                                            "interiorIORTextureAvailable=%u interiorIORValid=%u interiorIOR=%.12g "
+                                            "materialBaseValid=%u materialBase=%.12g "
+                                            "baseMinusInteriorAbsError=%.12g baseMatchesInterior=%u "
+                                            "materialNc=%.12g materialNt=%.12g materialEta=%.12g "
+                                            "spectralNtMinusBase=%.12g dispersionObserved=%u "
+                                            "hasAssignedInterior=%u sourceInferredFromNumericAgreementOnly=1 "
+                                            "actualMaterialSourceNotInstrumented=1 "
+                                            "hitPointIsForward=1 wavelengthAwareVolumeIORUnverified=1 "
+                                            "reverseMediumNotRebuilt=1 nestedMediaUnverified=1 notForMIS=1 "
+                                            "diagnosticOnly=1 physicalChildEnabled=0 "
+                                            "filmChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, (double)childState15gm.lambda,
+                                            pathVertex->bsdf.hitPoint.fromLight ? 1u : 0u,
+                                            pathVertex->bsdf.hitPoint.intoObject ? 1u : 0u,
+                                            (const void *)materialInterior15hp,
+                                            (const void *)beforeStack15gy.active,
+                                            (const void *)afterGlassStack15gy.active,
+                                            interiorIsBefore15hp ? 1u : 0u,
+                                            interiorIsAfter15hp ? 1u : 0u,
+                                            interiorTextureAvailable15hp ? 1u : 0u,
+                                            interiorIORValid15hp ? 1u : 0u, interiorIOR15hp,
+                                            baseValid15hp ? 1u : 0u, (double)base15gl,
+                                            baseInteriorError15hp, baseInteriorMatch15hp ? 1u : 0u,
+                                            (double)nc15gl, (double)nt15gl, (double)eta15gl,
+                                            materialSpectralOffset15hp,
+                                            materialDispersionObserved15hp ? 1u : 0u,
+                                            materialInterior15hp ? 1u : 0u);
+                                        // 15hq Stage 32: inspect the actual HitPoint sides used
+                                        // by ExtractExteriorIors / ExtractInteriorIors in material.cpp.
+                                        // Actual precedence: explicit Material IOR texture, otherwise
+                                        // HitPoint volume GetIOR(), otherwise default IOR=1. This
+                                        // diagnostic does not read private Material IOR texture slots.
+                                        const slg::Volume *hpInterior15hq =
+                                            pathVertex->bsdf.hitPoint.interiorVolume;
+                                        const slg::Volume *hpExterior15hq =
+                                            pathVertex->bsdf.hitPoint.exteriorVolume;
+                                        const double hpInteriorIOR15hq = hpInterior15hq ?
+                                            (double)hpInterior15hq->GetIOR(pathVertex->bsdf.hitPoint) : -1.;
+                                        const double hpExteriorIOR15hq = hpExterior15hq ?
+                                            (double)hpExterior15hq->GetIOR(pathVertex->bsdf.hitPoint) : -1.;
+                                        const bool hpInteriorValid15hq = hpInterior15hq &&
+                                            std::isfinite(hpInteriorIOR15hq) && hpInteriorIOR15hq > 0.;
+                                        const bool hpExteriorValid15hq = hpExterior15hq &&
+                                            std::isfinite(hpExteriorIOR15hq) && hpExteriorIOR15hq > 0.;
+                                        // These are candidate values ONLY when no explicit IOR
+                                        // texture is assigned at the Material level.
+                                        const double candidateInterior15hq = hpInteriorValid15hq ? hpInteriorIOR15hq : 1.;
+                                        const double candidateExterior15hq = hpExteriorValid15hq ? hpExteriorIOR15hq : 1.;
+                                        const bool candidateInteriorMatches15hq = materialValid15ho &&
+                                            fabs(candidateInterior15hq - (double)base15gl) <=
+                                                1e-5 * Max(1., fabs(candidateInterior15hq));
+                                        const bool candidateExteriorMatches15hq = materialValid15ho &&
+                                            fabs(candidateExterior15hq - (double)nc15gl) <=
+                                                1e-5 * Max(1., fabs(candidateExterior15hq));
+                                        fprintf(file15gl,
+                                            "phase15hq HITPOINT_IOR_SOURCE side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.9g fromLight=%u intoObject=%u "
+                                            "hitPointInterior=%p hitPointExterior=%p "
+                                            "assignedInterior=%p activeBefore=%p activeAfter=%p "
+                                            "hpInteriorIsAssigned=%u hpInteriorIsBefore=%u hpInteriorIsAfter=%u "
+                                            "hpExteriorIsBefore=%u hpExteriorIsAfter=%u "
+                                            "hpInteriorValid=%u hpInteriorIOR=%.12g "
+                                            "hpExteriorValid=%u hpExteriorIOR=%.12g "
+                                            "candidateInteriorNoMaterialOverride=%.12g "
+                                            "candidateExteriorNoMaterialOverride=%.12g "
+                                            "glassBase=%.12g glassNc=%.12g glassNt=%.12g glassEta=%.12g "
+                                            "candidateInteriorMatchesBase=%u candidateExteriorMatchesNc=%u "
+                                            "iorPrecedence=materialTexture_then_hitPointVolume_then_one "
+                                            "materialIORTexturePresenceUnverified=1 "
+                                            "candidateMatchNotCallsiteProof=1 "
+                                            "reverseHitPointNotRebuilt=1 nestedMediaUnverified=1 "
+                                            "diagnosticOnly=1 physicalChildEnabled=0 "
+                                            "filmChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, (double)childState15gm.lambda,
+                                            pathVertex->bsdf.hitPoint.fromLight ? 1u : 0u,
+                                            pathVertex->bsdf.hitPoint.intoObject ? 1u : 0u,
+                                            (const void *)hpInterior15hq, (const void *)hpExterior15hq,
+                                            (const void *)materialInterior15hp,
+                                            (const void *)beforeStack15gy.active,
+                                            (const void *)afterGlassStack15gy.active,
+                                            hpInterior15hq && hpInterior15hq == materialInterior15hp ? 1u : 0u,
+                                            hpInterior15hq && hpInterior15hq == beforeStack15gy.active ? 1u : 0u,
+                                            hpInterior15hq && hpInterior15hq == afterGlassStack15gy.active ? 1u : 0u,
+                                            hpExterior15hq && hpExterior15hq == beforeStack15gy.active ? 1u : 0u,
+                                            hpExterior15hq && hpExterior15hq == afterGlassStack15gy.active ? 1u : 0u,
+                                            hpInteriorValid15hq ? 1u : 0u, hpInteriorIOR15hq,
+                                            hpExteriorValid15hq ? 1u : 0u, hpExteriorIOR15hq,
+                                            candidateInterior15hq, candidateExterior15hq,
+                                            (double)base15gl, (double)nc15gl,
+                                            (double)nt15gl, (double)eta15gl,
+                                            candidateInteriorMatches15hq ? 1u : 0u,
+                                            candidateExteriorMatches15hq ? 1u : 0u);
+                                        // 15hr Stage 33: actual material texture slots and
+                                        // the FIRST accepted post-glass surface side. The
+                                        // second surface is only an observed hit: no sampled
+                                        // transmission or reverse medium state is claimed here.
+                                        const slg::Material &sourceMaterial15hr =
+                                            engine->renderConfig.GetScene().GetMaterials().GetMaterial(
+                                                pathVertex->bsdf.GetMaterialName());
+                                        const slg::GlassMaterial *glassMaterial15hr =
+                                            dynamic_cast<const slg::GlassMaterial *>(&sourceMaterial15hr);
+                                        const slg::Texture *explicitInterior15hr = glassMaterial15hr ?
+                                            glassMaterial15hr->GetInteriorIOR() : nullptr;
+                                        const slg::Texture *explicitExterior15hr = glassMaterial15hr ?
+                                            glassMaterial15hr->GetExteriorIOR() : nullptr;
+                                        const bool explicitInteriorValid15hr = explicitInterior15hr != nullptr;
+                                        const bool explicitExteriorValid15hr = explicitExterior15hr != nullptr;
+                                        const double explicitInteriorIOR15hr = explicitInteriorValid15hr ?
+                                            (double)explicitInterior15hr->GetFloatValue(pathVertex->bsdf.hitPoint) : -1.;
+                                        const double explicitExteriorIOR15hr = explicitExteriorValid15hr ?
+                                            (double)explicitExterior15hr->GetFloatValue(pathVertex->bsdf.hitPoint) : -1.;
+                                        const double selectedInterior15hr = explicitInteriorValid15hr ?
+                                            explicitInteriorIOR15hr : candidateInterior15hq;
+                                        const double selectedExterior15hr = explicitExteriorValid15hr ?
+                                            explicitExteriorIOR15hr : candidateExterior15hq;
+                                        const bool selectedInteriorMatches15hr = materialValid15ho &&
+                                            std::isfinite(selectedInterior15hr) &&
+                                            fabs(selectedInterior15hr - (double)base15gl) <=
+                                                1e-5 * Max(1., fabs(selectedInterior15hr));
+                                        const bool selectedExteriorMatches15hr = materialValid15ho &&
+                                            std::isfinite(selectedExterior15hr) &&
+                                            fabs(selectedExterior15hr - (double)nc15gl) <=
+                                                1e-5 * Max(1., fabs(selectedExterior15hr));
+                                        const bool secondIsExit15hr = childHitAccepted15go &&
+                                            !childBSDF15go.hitPoint.intoObject;
+                                        const slg::Volume *secondInterior15hr = childHitAccepted15go ?
+                                            childBSDF15go.hitPoint.interiorVolume : nullptr;
+                                        const slg::Volume *secondExterior15hr = childHitAccepted15go ?
+                                            childBSDF15go.hitPoint.exteriorVolume : nullptr;
+                                        fprintf(file15gl,
+                                            "phase15hr MATERIAL_IOR_AND_SECOND_SIDE side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.9g materialName=%s glassMaterial=%u "
+                                            "explicitInteriorTexture=%u explicitExteriorTexture=%u "
+                                            "explicitInteriorIOR=%.12g explicitExteriorIOR=%.12g "
+                                            "selectedInteriorSource=%s selectedExteriorSource=%s "
+                                            "selectedInteriorIOR=%.12g selectedExteriorIOR=%.12g "
+                                            "glassBase=%.12g glassNc=%.12g selectedInteriorMatchesBase=%u "
+                                            "selectedExteriorMatchesNc=%u firstIntoObject=%u "
+                                            "secondHit=%u secondMaterialID=%u secondMaterialType=%u "
+                                            "secondIntoObject=%u secondIsExit=%u "
+                                            "secondInterior=%p secondExterior=%p "
+                                            "secondInteriorEqualsFirstInterior=%u "
+                                            "secondBeforeActive=%p secondBeforeEqualsFirstAfter=%u "
+                                            "secondIORNotEvaluatedAtGlass=1 secondBSDFNotSampledAsGlass=1 "
+                                            "materialSelectionValuesComparedNotTracedInsideExtract=1 "
+                                            "reverseHitPointNotRebuilt=1 nestedMediaUnverified=1 notForMIS=1 "
+                                            "diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, (double)childState15gm.lambda,
+                                            pathVertex->bsdf.GetMaterialName().c_str(), glassMaterial15hr ? 1u : 0u,
+                                            explicitInteriorValid15hr ? 1u : 0u,
+                                            explicitExteriorValid15hr ? 1u : 0u,
+                                            explicitInteriorIOR15hr, explicitExteriorIOR15hr,
+                                            explicitInteriorValid15hr ? "MATERIAL" : (hpInteriorValid15hq ? "HITPOINT_VOLUME" : "DEFAULT_ONE"),
+                                            explicitExteriorValid15hr ? "MATERIAL" : (hpExteriorValid15hq ? "HITPOINT_VOLUME" : "DEFAULT_ONE"),
+                                            selectedInterior15hr, selectedExterior15hr,
+                                            (double)base15gl, (double)nc15gl,
+                                            selectedInteriorMatches15hr ? 1u : 0u,
+                                            selectedExteriorMatches15hr ? 1u : 0u,
+                                            pathVertex->bsdf.hitPoint.intoObject ? 1u : 0u,
+                                            childHitAccepted15go ? 1u : 0u, hitMaterial15go,
+                                            childHitAccepted15go ? (u_int)childBSDF15go.GetMaterialType() : 0u,
+                                            childHitAccepted15go && childBSDF15go.hitPoint.intoObject ? 1u : 0u,
+                                            secondIsExit15hr ? 1u : 0u,
+                                            (const void *)secondInterior15hr, (const void *)secondExterior15hr,
+                                            secondInterior15hr && secondInterior15hr == hpInterior15hq ? 1u : 0u,
+                                            (const void *)afterFirstStack15gy.active,
+                                            afterFirstStack15gy.active == afterGlassStack15gy.active ? 1u : 0u);
+                                        MLHeroPrintStack15gy(file15gl, side15gl ? "LIGHT" : "EYE",
+                                            ticket15gl, child15gl, "beforeGlass", beforeStack15gy);
+                                        MLHeroPrintStack15gy(file15gl, side15gl ? "LIGHT" : "EYE",
+                                            ticket15gl, child15gl, "afterGlass", afterGlassStack15gy);
+                                        MLHeroPrintStack15gy(file15gl, side15gl ? "LIGHT" : "EYE",
+                                            ticket15gl, child15gl, "afterFirstIntersect", afterFirstStack15gy);
+                                        MLHeroPrintStack15gy(file15gl, side15gl ? "LIGHT" : "EYE",
+                                            ticket15gl, child15gl, "afterNext", afterNextStack15gy);
+                                        MLHeroPrintStack15gy(file15gl, side15gl ? "LIGHT" : "EYE",
+                                            ticket15gl, child15gl, "parent", parentStack15gy);
+                                        fprintf(file15gl,
+                                            "phase15gw CHILD_VOLUME_AUDIT side=%s ticket=%llu child=%u "
+                                            "lane=%u glassEvent=%u glassTransmit=%u "
+                                            "glassLocalUpdate=%u firstIntersectUsesUpdatedVolume=1 "
+                                            "firstHit=%u nextEvent=%u nextTransmit=%u "
+                                            "nextLocalUpdate=%u secondIntersectUsesUpdatedVolume=1 "
+                                            "mediumIdentityVerified=0 stackVerified=0 "
+                                            "parentVolumeUnchanged=1 diagnosticOnly=1 filmChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, (u_int)childGlassEvent15gw,
+                                            childGlassIsTransmission15gw ? 1u : 0u,
+                                            childGlassIsTransmission15gw ? 1u : 0u,
+                                            childHitAccepted15go ? 1u : 0u,
+                                            (u_int)childNextEvent15gq,
+                                            childNextIsTransmission15gw ? 1u : 0u,
+                                            childNextIsTransmission15gw ? 1u : 0u);
+                                        const float childNextDirLength15gq = childNextDir15gq.Length();
+                                        const bool childNextFinite15gq =
+                                            std::isfinite(childNextPdf15gq) &&
+                                            std::isfinite(childNextCos15gq) &&
+                                            std::isfinite(childNextDirLength15gq) &&
+                                            std::isfinite(childNextDir15gq.x) &&
+                                            std::isfinite(childNextDir15gq.y) &&
+                                            std::isfinite(childNextDir15gq.z) &&
+                                            !childNextWeight15gq.IsNaN() &&
+                                            !childNextWeight15gq.IsInf();
+                                        const bool childNextUsable15gq = childNextFinite15gq &&
+                                            !childNextWeight15gq.Black() &&
+                                            childNextPdf15gq > 0.f &&
+                                            fabsf(childNextDirLength15gq - 1.f) < 1e-3f;
+                                        // 15hc: this next BSDF sample may be a
+                                        // delta event or a solid-angle density.
+                                        // Sample() does not expose a guaranteed
+                                        // reverse directional PDF here. For a
+                                        // non-delta event the full BIDIR recurrence
+                                        // CANNOT be computed from the forward PDF.
+                                        nextEventIsDelta15hc[child15gl] =
+                                            (childNextEvent15gq & SPECULAR) != 0;
+                                        nextPdfObserved15hc[child15gl] =
+                                            std::isfinite(childNextPdf15gq) &&
+                                            childNextPdf15gq > 0.f;
+                                        if (nextEventIsDelta15hc[child15gl] &&
+                                                glassMIS15hc[child15gl].valid &&
+                                                childNextUsable15gq) {
+                                            const MLHeroMISRecurrence15hc &glass15hc =
+                                                glassMIS15hc[child15gl];
+                                            nextMIS15hc[child15gl] = MLHeroAuditSpecularMIS15hc(
+                                                glass15hc.dVCM, glass15hc.dVC,
+                                                glass15hc.dVM,
+                                                (double)fabsf(childNextCos15gq),
+                                                (double)childNextPdf15gq);
+                                        }
+                                        // 15hd: retrieve forward/reverse directional PDFs
+                                        // from the ACTUAL hit child BSDF, exactly as
+                                        // production SampleBSDF() does for non-delta.
+                                        // For a specular event, material.Pdf() is NOT
+                                        // a solid-angle density; leave it NOT_APPLICABLE.
+                                        nextNonDeltaEvent15hd[child15gl] =
+                                            childNextUsable15gq && !nextEventIsDelta15hc[child15gl];
+                                        float childPdfDirect15hd = -1.f;
+                                        float childPdfReverse15hd = -1.f;
+                                        if (nextNonDeltaEvent15hd[child15gl])
+                                            childBSDF15go.Pdf(childNextDir15gq,
+                                                &childPdfDirect15hd, &childPdfReverse15hd);
+                                        const bool reversePdfValid15hd =
+                                            nextNonDeltaEvent15hd[child15gl] &&
+                                            std::isfinite(childPdfReverse15hd) &&
+                                            childPdfReverse15hd >= 0.f;
+                                        nextReversePdfObserved15hd[child15gl] = reversePdfValid15hd;
+                                        const bool directPdfValid15hd =
+                                            nextNonDeltaEvent15hd[child15gl] &&
+                                            std::isfinite(childPdfDirect15hd) &&
+                                            childPdfDirect15hd > 0.f;
+                                        const double pdfMismatch15hd = directPdfValid15hd ?
+                                            fabs((double)childPdfDirect15hd - (double)childNextPdf15gq) : -1.;
+                                        // Direct PDF re-evaluation is diagnostic
+                                        // only. A mismatch may occur with mixed
+                                        // lobes and must be investigated, not silently
+                                        // corrected in the production estimator.
+                                        const bool forwardAgreement15hd = directPdfValid15hd &&
+                                            pdfMismatch15hd <= 1e-4 *
+                                                std::max(1., (double)childNextPdf15gq);
+                                        nextForwardPdfConsistent15hd[child15gl] = forwardAgreement15hd;
+                                        if (nextNonDeltaEvent15hd[child15gl] &&
+                                                reversePdfValid15hd &&
+                                                glassMIS15hc[child15gl].valid) {
+                                            const MLHeroMISRecurrence15hc &glass15hc =
+                                                glassMIS15hc[child15gl];
+                                            // Forward density from Sample(), reverse
+                                            // density from BSDF::Pdf(), exactly the
+                                            // native BIDIRCPU non-specular ingredients.
+                                            // Still without child RR, normalizer or
+                                            // full spectral path/connection ownership.
+                                            nextNonDeltaMIS15hd[child15gl] =
+                                                MLHeroAuditNonDeltaMIS15hd(
+                                                    glass15hc.dVCM, glass15hc.dVC,
+                                                    glass15hc.dVM,
+                                                    (double)fabsf(childNextCos15gq),
+                                                    (double)childNextPdf15gq,
+                                                    (double)childPdfReverse15hd,
+                                                    (double)misVmWeightFactor,
+                                                    (double)misVcWeightFactor);
+                                        }
+                                        fprintf(file15gl,
+                                            "phase15hd NONDELTA_PDF_AUDIT side=%s ticket=%llu child=%u "
+                                            "lane=%u nextEvent=%u isDelta=%u nonDeltaUsable=%u "
+                                            "sampleForwardPdf=%.12g queriedForwardPdf=%.12g "
+                                            "queriedReversePdf=%.12g reversePdfObserved=%u "
+                                            "forwardPdfDifference=%.12g forwardPdfAgreement=%u "
+                                            "pdfMeasure=%s reverseZeroAllowed=1 "
+                                            "auditRecurrenceValid=%u candidateDVCM=%.12g "
+                                            "candidateDVC=%.12g candidateDVM=%.12g "
+                                            "misVmFactor=%.12g misVcFactor=%.12g "
+                                            "pdfRRApplied=0 spectralSelectionPdfIntegrated=0 "
+                                            "fullChildMISValidated=0 physicalChildEnabled=0 "
+                                            "filmChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl,
+                                            child15gl, lane15gl, (u_int)childNextEvent15gq,
+                                            nextEventIsDelta15hc[child15gl] ? 1u : 0u,
+                                            nextNonDeltaEvent15hd[child15gl] ? 1u : 0u,
+                                            (double)childNextPdf15gq,
+                                            (double)childPdfDirect15hd,
+                                            (double)childPdfReverse15hd,
+                                            reversePdfValid15hd ? 1u : 0u,
+                                            pdfMismatch15hd,
+                                            forwardAgreement15hd ? 1u : 0u,
+                                            nextNonDeltaEvent15hd[child15gl] ?
+                                                "SOLID_ANGLE_DENSITY" : "NOT_APPLICABLE_DELTA_OR_INVALID",
+                                            nextNonDeltaMIS15hd[child15gl].valid ? 1u : 0u,
+                                            nextNonDeltaMIS15hd[child15gl].dVCM,
+                                            nextNonDeltaMIS15hd[child15gl].dVC,
+                                            nextNonDeltaMIS15hd[child15gl].dVM,
+                                            (double)misVmWeightFactor,
+                                            (double)misVcWeightFactor);
+                                        fprintf(file15gl,
+                                            "phase15hc NEXT_EVENT_MIS side=%s ticket=%llu child=%u "
+                                            "lane=%u nextEvent=%u nextIsDelta=%u "
+                                            "forwardPdf=%.12g forwardPdfObserved=%u "
+                                            "forwardPdfMeasure=%s reversePdfKnown=0 "
+                                            "childGlassRecurrenceValid=%u "
+                                            "nextSpecularRecurrenceValid=%u "
+                                            "candidateDVCM=%.12g candidateDVC=%.12g candidateDVM=%.12g "
+                                            "nonDeltaRequiresReversePdf=%u "
+                                            "eventProbabilityNotSolidAngleDensity=%u "
+                                            "fullChildMISValidated=0 physicalChildEnabled=0 "
+                                            "filmChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, (u_int)childNextEvent15gq,
+                                            nextEventIsDelta15hc[child15gl] ? 1u : 0u,
+                                            (double)childNextPdf15gq,
+                                            nextPdfObserved15hc[child15gl] ? 1u : 0u,
+                                            nextEventIsDelta15hc[child15gl] ?
+                                                "DISCRETE_DELTA_EVENT" : "SOLID_ANGLE_DENSITY",
+                                            glassMIS15hc[child15gl].valid ? 1u : 0u,
+                                            nextMIS15hc[child15gl].valid ? 1u : 0u,
+                                            nextMIS15hc[child15gl].dVCM,
+                                            nextMIS15hc[child15gl].dVC,
+                                            nextMIS15hc[child15gl].dVM,
+                                            nextEventIsDelta15hc[child15gl] ? 0u : 1u,
+                                            nextEventIsDelta15hc[child15gl] ? 1u : 0u);
+                                        fprintf(file15gl,
+                                            "phase15gq CHILD_CONTINUATION side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.9g materialID=%u "
+                                            "sampleU0=%.9g sampleU1=%.9g "
+                                            "event=%u pdfW=%.9g cosSampledDir=%.9g "
+                                            "nextDir=(%.9g,%.9g,%.9g) nextDirLength=%.9g "
+                                            "weight=(%.9g,%.9g,%.9g) finite=%u usable=%u "
+                                            "nextRayTraced=0 queued=0 childContinued=0 "
+                                            "filmChanged=0 misChanged=0 rrChanged=0 transportApplied=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, childState15gm.lambda, hitMaterial15go,
+                                            draw15hb.u0, draw15hb.u1,
+                                            (unsigned)childNextEvent15gq,
+                                            childNextPdf15gq, childNextCos15gq,
+                                            childNextDir15gq.x, childNextDir15gq.y, childNextDir15gq.z,
+                                            childNextDirLength15gq,
+                                            childNextWeight15gq.c[0], childNextWeight15gq.c[1],
+                                            childNextWeight15gq.c[2],
+                                            childNextFinite15gq ? 1u : 0u,
+                                            childNextUsable15gq ? 1u : 0u);
+                                        // 15gs Stage 8: diagnostic-only scalar throughput/PDF ledger.
+                                        // IMPORTANT: throughputPreGlass is a lane snapshot, NOT a
+                                        // post-glass throughput. Do not interpret the product below
+                                        // as a physically complete spectral path contribution.
+                                        // BSDF::Sample returns a transport weight (not raw f),
+                                        // so do NOT divide by childNextPdf15gq a second time.
+                                        const float preGlass15gs = childState15gm.throughput;
+                                        const float bsdfWeightR15gs = childNextWeight15gq.c[0];
+                                        const float bsdfWeightG15gs = childNextWeight15gq.c[1];
+                                        const float bsdfWeightB15gs = childNextWeight15gq.c[2];
+                                        const float diagnosticProduct15gs =
+                                            preGlass15gs * bsdfWeightR15gs;
+                                        const float wavelengthPdf15gs = childState15gm.wavelengthPdf;
+                                        const float branchPdf15gs = childState15gm.eventPdf;
+                                        const float samplePdf15gs = childNextPdf15gq;
+                                        const bool pdfValid15gs =
+                                            std::isfinite(wavelengthPdf15gs) && wavelengthPdf15gs > 0.f &&
+                                            std::isfinite(branchPdf15gs) && branchPdf15gs >= 0.f &&
+                                            std::isfinite(samplePdf15gs) && samplePdf15gs > 0.f;
+                                        const bool productFinite15gs =
+                                            std::isfinite(preGlass15gs) &&
+                                            std::isfinite(bsdfWeightR15gs) &&
+                                            std::isfinite(bsdfWeightG15gs) &&
+                                            std::isfinite(bsdfWeightB15gs) &&
+                                            std::isfinite(diagnosticProduct15gs);
+                                        fprintf(file15gl,
+                                            "phase15gs CHILD_WEIGHT_LEDGER side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.9g throughputPreGlass=%.9g "
+                                            "bsdfSampleWeightRGB=(%.9g,%.9g,%.9g) "
+                                            "diagnosticProductR=%.9g wavelengthPdf=%.9g "
+                                            "glassEventPdf=%.9g nextBSDFPdfW=%.9g "
+                                            "sampleWeight=%.9g pdfValid=%u productFinite=%u "
+                                            "postGlassWeightKnown=0 childMISComputed=0 "
+                                            "physicalThroughputApplied=0 filmChanged=0 "
+                                            "misChanged=0 rrChanged=0 transportApplied=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, childState15gm.lambda, preGlass15gs,
+                                            bsdfWeightR15gs, bsdfWeightG15gs, bsdfWeightB15gs,
+                                            diagnosticProduct15gs, wavelengthPdf15gs,
+                                            branchPdf15gs, samplePdf15gs,
+                                            childState15gm.sampleWeight,
+                                            pdfValid15gs ? 1u : 0u,
+                                            productFinite15gs ? 1u : 0u);
+                                        // 15jr: audit separate measures and weight ownership ONLY.
+                                        // This is NOT a joint spectral-path PDF or an MIS estimator.
+                                        // The second BSDF's pdfW is a delta-event MASS for ideal
+                                        // Glass, not a solid-angle density. Its Sample() weight
+                                        // already incorporates the sampled-event probability.
+                                        const double jrWavePdf = (double)childState15gm.wavelengthPdf;
+                                        const double jrWaveWeight = (double)childState15gm.sampleWeight;
+                                        const double jrFirstEventMass = (double)childState15gm.eventPdf;
+                                        const double jrSecondEventMass = (double)childNextPdf15gq;
+                                        const double jrFirstTimesSecond = jrFirstEventMass * jrSecondEventMass;
+                                        const double jrWaveIdentity = 400. * jrWavePdf * jrWaveWeight;
+                                        const bool jrWaveValid = std::isfinite(jrWavePdf) && jrWavePdf > 0. &&
+                                            std::isfinite(jrWaveWeight) && jrWaveWeight > 0.;
+                                        const bool jrFirstValid = std::isfinite(jrFirstEventMass) &&
+                                            jrFirstEventMass > 0. && jrFirstEventMass <= 1.000001;
+                                        const bool jrSecondValid = std::isfinite(jrSecondEventMass) &&
+                                            jrSecondEventMass > 0. && jrSecondEventMass <= 1.000001;
+                                        const bool jrIdentityPass = jrWaveValid &&
+                                            std::isfinite(jrWaveIdentity) && fabs(jrWaveIdentity - 1.) < 2.e-4;
+                                        const bool jrWeightFinite = std::isfinite((double)childNextWeight15gq.c[0]) &&
+                                            std::isfinite((double)childNextWeight15gq.c[1]) &&
+                                            std::isfinite((double)childNextWeight15gq.c[2]);
+                                        const bool jrAllPass = jrIdentityPass && jrFirstValid && jrSecondValid &&
+                                            jrWeightFinite && childNextUsable15gq;
+                                        fprintf(file15gl,
+                                            "phase15jr CHILD_PDF_MEASURE_AUDIT side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.12g wavelengthDensityNmInv=%.12g "
+                                            "wavelengthSampleWeight=%.12g wavelengthIdentity=%.12g "
+                                            "firstGlassDiscreteMass=%.12g secondGlassDiscreteMass=%.12g "
+                                            "conditionalEventMassProduct=%.12g "
+                                            "secondBSDFWeightR=%.12g waveValid=%u firstValid=%u "
+                                            "secondValid=%u waveIdentityPass=%u weightFinite=%u "
+                                            "secondSampleUsable=%u allChecksPass=%u "
+                                            "firstMassMeasure=DISCRETE secondMassMeasure=DISCRETE "
+                                            "wavelengthMeasure=CONTINUOUS_NM "
+                                            "conditionalProductNotJointPdf=1 "
+                                            "wavelengthWeightAlreadyOwned=1 bsdfSampleIncludesEventPdf=1 "
+                                            "noExtraPdfDivision=1 childSelectionProbabilityUnvalidated=1 "
+                                            "reversePathPdfUnavailable=1 jointMISUnavailable=1 "
+                                            "diagnosticOnly=1 childRays=0 physicsChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, (double)childState15gm.lambda, jrWavePdf,
+                                            jrWaveWeight, jrWaveIdentity, jrFirstEventMass,
+                                            jrSecondEventMass, jrFirstTimesSecond,
+                                            (double)childNextWeight15gq.c[0],
+                                            jrWaveValid ? 1u : 0u, jrFirstValid ? 1u : 0u,
+                                            jrSecondValid ? 1u : 0u, jrIdentityPass ? 1u : 0u,
+                                            jrWeightFinite ? 1u : 0u,
+                                            childNextUsable15gq ? 1u : 0u, jrAllPass ? 1u : 0u);
+                                        // 15ju: typed-measure / ownership ledger for a potential
+                                        // two-child path. The pair is chosen with probability 1/4;
+                                        // each lane has inclusion probability 1/4, but that is
+                                        // NOT an extra 1/4 per child: both lanes share ONE pair draw.
+                                        // Parent-prefix and post-split independent path densities,
+                                        // reverse strategy masses, geometry and child RR remain unknown.
+                                        const double juPairProbability = .25;
+                                        const double juLaneInclusion = .25;
+                                        const double juConditionalFirst = jrFirstEventMass;
+                                        const double juConditionalSecond = jrSecondEventMass;
+                                        const double juConditionalProduct = juConditionalFirst * juConditionalSecond;
+                                        // Probability for the selected PAIR plus these particular
+                                        // local glass events on this lane; a mixed-measure
+                                        // diagnostic factor, not a full path probability density.
+                                        const double juTaggedLocalFactor = juPairProbability * juConditionalProduct;
+                                        const bool juMassValid = jrFirstValid && jrSecondValid &&
+                                            std::isfinite(juConditionalProduct) &&
+                                            juConditionalProduct > 0. && juConditionalProduct <= 1.000002;
+                                        const bool juSelectionValid =
+                                            fabs(juPairProbability - juLaneInclusion) < 1.e-12 &&
+                                            fabs(4. * juPairProbability - 1.) < 1.e-12;
+                                        const bool juFactorValid = juMassValid && juSelectionValid &&
+                                            std::isfinite(juTaggedLocalFactor) &&
+                                            juTaggedLocalFactor > 0. && juTaggedLocalFactor <= .250001;
+                                        fprintf(file15gl,
+                                            "phase15ju CHILD_PDF_HISTORY_AUDIT side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.12g pairSelectionMass=%.12g "
+                                            "laneInclusionProbability=%.12g wavelengthDensityNmInv=%.12g "
+                                            "firstGlassDeltaEventMass=%.12g secondGlassDeltaEventMass=%.12g "
+                                            "conditionalTwoGlassMass=%.12g taggedLocalSelectionAndEvents=%.12g "
+                                            "selectionValid=%u massesValid=%u localFactorValid=%u "
+                                            "oneSharedPairDraw=1 noIndependentPerChildPairDivision=1 "
+                                            "wavelengthDensityAlreadySampleWeighted=1 "
+                                            "bsdfSampleIncludesDeltaMass=1 noExtraEventPdfDivision=1 "
+                                            "deltaMassMeasure=DISCRETE wavelengthMeasure=CONTINUOUS_NM "
+                                            "jointMeasure=MIXED_DIAGNOSTIC_ONLY "
+                                            "parentPrefixPdf=UNAVAILABLE forwardContinuationPdf=UNAVAILABLE "
+                                            "reverseFirstMass=UNAVAILABLE reverseSecondMass=UNAVAILABLE "
+                                            "geometryJacobian=UNAVAILABLE childRRSurvival=NOT_APPLIED "
+                                            "eyeLightConnectionPdf=UNAVAILABLE alternateStrategyDensities=UNAVAILABLE "
+                                            "fullJointSpectralPdf=UNAVAILABLE spectralBidirMIS=NOT_IMPLEMENTED "
+                                            "physicalChildEnabled=0 filmChanged=0 physicsChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, (double)childState15gm.lambda,
+                                            juPairProbability, juLaneInclusion, jrWavePdf,
+                                            juConditionalFirst, juConditionalSecond, juConditionalProduct,
+                                            juTaggedLocalFactor, juSelectionValid ? 1u : 0u,
+                                            juMassValid ? 1u : 0u, juFactorValid ? 1u : 0u);
+                                        // 15jv: strategy readiness matrix. Explicitly distinguish the
+                                        // conditional probability of observing a selected lane from
+                                        // a full bidirectional density on a shared path measure.
+                                        // No existing scalar BIDIR MIS recurrence is reused.
+                                        const bool jvWavelengthKnown = jrWaveValid;
+                                        const bool jvSelectionKnown = juSelectionValid;
+                                        const bool jvForwardEventsKnown = juMassValid;
+                                        const bool jvPrefixKnown = false;
+                                        const bool jvForwardContinuationKnown = false;
+                                        const bool jvReverseEventsKnown = false;
+                                        const bool jvGeometryKnown = false;
+                                        const bool jvRRKnown = false;
+                                        const bool jvConnectionKnown = false;
+                                        const bool jvAlternateStrategiesKnown = false;
+                                        const bool jvFullJointReady = jvWavelengthKnown &&
+                                            jvSelectionKnown && jvForwardEventsKnown &&
+                                            jvPrefixKnown && jvForwardContinuationKnown &&
+                                            jvReverseEventsKnown && jvGeometryKnown &&
+                                            jvRRKnown && jvConnectionKnown && jvAlternateStrategiesKnown;
+                                        // A single pair draw generates BOTH children: multiplying
+                                        // 0.25 twice would incorrectly treat them as independent.
+                                        const double jvSharedPairMass = juPairProbability;
+                                        const double jvIncorrectIndependentPairMass =
+                                            juPairProbability * juPairProbability;
+                                        const bool jvSharedOwnershipOK = juSelectionValid &&
+                                            fabs(jvSharedPairMass - .25) <= 1.e-12 &&
+                                            fabs(jvIncorrectIndependentPairMass - .0625) <= 1.e-12;
+                                        fprintf(file15gl,
+                                            "phase15jv CHILD_STRATEGY_READINESS side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.12g sharedPairMass=%.12g "
+                                            "incorrectIndependentPairMass=%.12g sharedOwnershipOK=%u "
+                                            "wavelengthMeasure=CONTINUOUS_NM deltaEventMeasure=DISCRETE "
+                                            "wavelengthKnown=%u selectionKnown=%u forwardEventsKnown=%u "
+                                            "parentPrefixKnown=%u forwardContinuationKnown=%u "
+                                            "reverseEventsKnown=%u geometryJacobianKnown=%u "
+                                            "childRRKnown=%u eyeLightConnectionKnown=%u alternateStrategiesKnown=%u "
+                                            "fullJointReady=%u "
+                                            "eyeStrategies=UNAVAILABLE lightStrategies=UNAVAILABLE "
+                                            "dVCM_dVC_dVM=NOT_TRANSFERABLE_WITHOUT_SPECTRAL_DENSITIES "
+                                            "strategyMeasureCompatibility=NOT_VALIDATED "
+                                            "samplingPdfNotEstimatorWeight=1 "
+                                            "pairMassAppliedOncePerSharedDraw=1 "
+                                            "deltaMassNotSolidAnglePdf=1 "
+                                            "diagnosticOnly=1 physicalChildRays=0 physicsChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, (double)childState15gm.lambda,
+                                            jvSharedPairMass, jvIncorrectIndependentPairMass,
+                                            jvSharedOwnershipOK ? 1u : 0u,
+                                            jvWavelengthKnown ? 1u : 0u,
+                                            jvSelectionKnown ? 1u : 0u,
+                                            jvForwardEventsKnown ? 1u : 0u,
+                                            jvPrefixKnown ? 1u : 0u,
+                                            jvForwardContinuationKnown ? 1u : 0u,
+                                            jvReverseEventsKnown ? 1u : 0u,
+                                            jvGeometryKnown ? 1u : 0u,
+                                            jvRRKnown ? 1u : 0u,
+                                            jvConnectionKnown ? 1u : 0u,
+                                            jvAlternateStrategiesKnown ? 1u : 0u,
+                                            jvFullJointReady ? 1u : 0u);
+                                        // 15jw: native BIDIR recurrence ownership map. This is a
+                                        // source-verified audit of *which* native quantities would
+                                        // need a child-specific path state. No scalar parent MIS
+                                        // recurrence is transplanted to a spectral child.
+                                        const bool jwNativeParentMISFinite =
+                                            std::isfinite((double)pathVertex->dVCM) &&
+                                            std::isfinite((double)pathVertex->dVC) &&
+                                            std::isfinite((double)pathVertex->dVM);
+                                        const bool jwLocalAuditFinite = juFactorValid &&
+                                            std::isfinite(jvSharedPairMass);
+                                        fprintf(file15gl,
+                                            "phase15jw CHILD_NATIVE_MIS_OWNERSHIP side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.12g parentDVCM=%.12g parentDVC=%.12g parentDVM=%.12g "
+                                            "parentMISFinite=%u localSelectionEventFinite=%u "
+                                            "nativeSpecularRecurrence=SampleBSDF_dVCM_zero_dVC_dVM_times_cosSquared "
+                                            "nativeNonDeltaRecurrence=SampleBSDF_forwardReverseSolidAnglePdf "
+                                            "nativeInitialEye=GenerateEyePath_cameraPdf "
+                                            "nativeInitialLight=GenerateLightPath_emissionAndDirectPdf "
+                                            "nativeConnectVertices=ConnectVertices_bothEndpointReversePdf "
+                                            "nativeConnectToEye=ConnectToEye_lightVertexHistory "
+                                            "nativeDirectLight=DirectLightSampling_eyeVertexHistory "
+                                            "childPrefixMIS=UNAVAILABLE childReverseDelta=UNAVAILABLE "
+                                            "childNonDeltaForwardReverse=UNAVAILABLE childRR=NOT_APPLIED "
+                                            "childGeometryAndConnections=UNAVAILABLE alternateStrategies=UNAVAILABLE "
+                                            "parentMISReusableForChild=0 jointSpectralMISReady=0 "
+                                            "deltaMeasureIsNotSolidAngle=1 sharedPairDrawOnce=1 "
+                                            "diagnosticOnly=1 physicalChildRays=0 physicsChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, (double)childState15gm.lambda,
+                                            (double)pathVertex->dVCM, (double)pathVertex->dVC,
+                                            (double)pathVertex->dVM,
+                                            jwNativeParentMISFinite ? 1u : 0u,
+                                            jwLocalAuditFinite ? 1u : 0u);
+                                        // 15jx: typed, bounded shadow history for future spectral
+                                        // child MIS. This is per-audit-call diagnostic storage, NOT
+                                        // a production path state, and never touches the renderer MIS.
+                                        // Keep discrete branch masses distinct from direction PDFs.
+                                        struct MLHeroChildMISHistory15jx {
+                                            unsigned int lane;
+                                            double wavelengthNm;
+                                            double wavelengthDensityPerNm;
+                                            double sharedPairSelectionMass;
+                                            double firstDeltaEventMass;
+                                            double secondDeltaEventMass;
+                                            unsigned int knownMask;
+                                            unsigned int deltaCount;
+                                            unsigned int nonDeltaCount;
+                                            bool initialized;
+                                            bool jointReady;
+                                        };
+                                        enum {
+                                            MLHERO_JX_WAVELENGTH = 1u,
+                                            MLHERO_JX_PAIR_DRAW = 2u,
+                                            MLHERO_JX_FIRST_DELTA = 4u,
+                                            MLHERO_JX_SECOND_DELTA = 8u
+                                        };
+                                        MLHeroChildMISHistory15jx jxHistory[8] = {};
+                                        for (unsigned int jxSlot = 0; jxSlot < 8u; ++jxSlot) {
+                                            MLHeroChildMISHistory15jx &h = jxHistory[jxSlot];
+                                            h.lane = 8u; // sentinel: no lane assigned
+                                            h.wavelengthNm = 0.;
+                                            h.wavelengthDensityPerNm = 0.;
+                                            h.sharedPairSelectionMass = 0.;
+                                            h.firstDeltaEventMass = 0.;
+                                            h.secondDeltaEventMass = 0.;
+                                            h.knownMask = 0u;
+                                            h.deltaCount = 0u;
+                                            h.nonDeltaCount = 0u;
+                                            h.initialized = false;
+                                            h.jointReady = false;
+                                        }
+                                        const unsigned int jxSlot = child15gl;
+                                        const bool jxSlotInRange = jxSlot < 8u;
+                                        if (jxSlotInRange) {
+                                            MLHeroChildMISHistory15jx &h = jxHistory[jxSlot];
+                                            h.lane = lane15gl;
+                                            h.wavelengthNm = (double)childState15gm.lambda;
+                                            h.initialized = true;
+                                            if (jrWaveValid) {
+                                                h.wavelengthDensityPerNm = jrWavePdf;
+                                                h.knownMask |= MLHERO_JX_WAVELENGTH;
+                                            }
+                                            if (juSelectionValid) {
+                                                h.sharedPairSelectionMass = juPairProbability;
+                                                h.knownMask |= MLHERO_JX_PAIR_DRAW;
+                                            }
+                                            if (jrFirstValid) {
+                                                h.firstDeltaEventMass = jrFirstEventMass;
+                                                h.knownMask |= MLHERO_JX_FIRST_DELTA;
+                                                ++h.deltaCount;
+                                            }
+                                            if (jrSecondValid) {
+                                                h.secondDeltaEventMass = jrSecondEventMass;
+                                                h.knownMask |= MLHERO_JX_SECOND_DELTA;
+                                                ++h.deltaCount;
+                                            }
+                                        }
+                                        const MLHeroChildMISHistory15jx &jxCurrent =
+                                            jxHistory[jxSlotInRange ? jxSlot : 0u];
+                                        bool jxOtherSlotsClear = true;
+                                        for (unsigned int jxOther = 0; jxOther < 8u; ++jxOther) {
+                                            if (jxOther != jxSlot &&
+                                                (jxHistory[jxOther].initialized || jxHistory[jxOther].knownMask != 0u ||
+                                                 jxHistory[jxOther].deltaCount != 0u))
+                                                jxOtherSlotsClear = false;
+                                        }
+                                        const bool jxKnownDataValid = jxSlotInRange && jxCurrent.initialized &&
+                                            jxCurrent.lane == lane15gl &&
+                                            jxCurrent.knownMask == 15u && jxCurrent.deltaCount == 2u &&
+                                            jxCurrent.nonDeltaCount == 0u &&
+                                            jxCurrent.wavelengthDensityPerNm > 0. &&
+                                            jxCurrent.sharedPairSelectionMass == .25 &&
+                                            jxCurrent.firstDeltaEventMass > 0. &&
+                                            jxCurrent.secondDeltaEventMass > 0. &&
+                                            jxOtherSlotsClear && !jxCurrent.jointReady;
+                                        fprintf(file15gl,
+                                            "phase15jx CHILD_MIS_HISTORY_SHADOW side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.12g capacity=8 activeShadowSlots=1 "
+                                            "initialized=%u knownMask=%u deltaEvents=%u nonDeltaEvents=%u "
+                                            "wavelengthDensityNmInv=%.12g pairSelectionMass=%.12g "
+                                            "firstDeltaMass=%.12g secondDeltaMass=%.12g "
+                                            "otherSlotsClear=%u knownDataValid=%u "
+                                            "prefixDensity=UNAVAILABLE reverseDeltaHistory=UNAVAILABLE "
+                                            "forwardNonDeltaDensity=UNAVAILABLE reverseNonDeltaDensity=UNAVAILABLE "
+                                            "geometryJacobian=UNAVAILABLE continuationRR=NOT_APPLIED "
+                                            "connectionStrategies=UNAVAILABLE jointSpectralMISReady=0 "
+                                            "parentMISImported=0 shadowOnly=1 physicalChildRays=0 "
+                                            "physicsChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, (double)childState15gm.lambda,
+                                            jxCurrent.initialized ? 1u : 0u, jxCurrent.knownMask,
+                                            jxCurrent.deltaCount, jxCurrent.nonDeltaCount,
+                                            jxCurrent.wavelengthDensityPerNm, jxCurrent.sharedPairSelectionMass,
+                                            jxCurrent.firstDeltaEventMass, jxCurrent.secondDeltaEventMass,
+                                            jxOtherSlotsClear ? 1u : 0u, jxKnownDataValid ? 1u : 0u);
+                                        // 15jy: isolated transition contract for the 15jx shadow state.
+                                        // Each transition is applied at most once, in fixed order.
+                                        // This is NOT an event probability product or native MIS.
+                                        struct MLHeroTransitionHistory15jy {
+                                            unsigned int nextStage;
+                                            unsigned int acceptedMask;
+                                            unsigned int deltaEvents;
+                                            unsigned int rejectedTransitions;
+                                            double wavelengthDensityPerNm;
+                                            double sharedPairMass;
+                                            double firstDeltaMass;
+                                            double secondDeltaMass;
+                                            bool initialized;
+                                            MLHeroTransitionHistory15jy() : nextStage(0u), acceptedMask(0u),
+                                                deltaEvents(0u), rejectedTransitions(0u),
+                                                wavelengthDensityPerNm(0.), sharedPairMass(0.),
+                                                firstDeltaMass(0.), secondDeltaMass(0.), initialized(false) { }
+                                            bool Apply(const unsigned int stage, const double value) {
+                                                // Reject out-of-order, repeated, zero or nonfinite entries.
+                                                if (stage != nextStage || stage >= 4u ||
+                                                    !std::isfinite(value) || !(value > 0.) ||
+                                                    (stage > 0u && value > 1.)) {
+                                                    ++rejectedTransitions;
+                                                    return false;
+                                                }
+                                                if (stage == 0u) wavelengthDensityPerNm = value;
+                                                else if (stage == 1u) sharedPairMass = value;
+                                                else if (stage == 2u) { firstDeltaMass = value; ++deltaEvents; }
+                                                else { secondDeltaMass = value; ++deltaEvents; }
+                                                acceptedMask |= (1u << stage);
+                                                ++nextStage;
+                                                initialized = true;
+                                                return true;
+                                            }
+                                        };
+                                        MLHeroTransitionHistory15jy jyState[8];
+                                        const bool jyInitialClear = jyState[0].nextStage == 0u &&
+                                            jyState[0].acceptedMask == 0u && !jyState[0].initialized &&
+                                            jyState[7].nextStage == 0u && !jyState[7].initialized;
+                                        bool jySequencePass = false;
+                                        bool jyRejectPass = false;
+                                        bool jyIsolationPass = true;
+                                        if (jxSlotInRange && jxKnownDataValid) {
+                                            MLHeroTransitionHistory15jy &h = jyState[jxSlot];
+                                            const bool a = h.Apply(0u, jrWavePdf);
+                                            const bool b = h.Apply(1u, juPairProbability);
+                                            const bool c = h.Apply(2u, jrFirstEventMass);
+                                            const bool d = h.Apply(3u, jrSecondEventMass);
+                                            jySequencePass = a && b && c && d &&
+                                                h.nextStage == 4u && h.acceptedMask == 15u &&
+                                                h.deltaEvents == 2u && h.rejectedTransitions == 0u &&
+                                                h.wavelengthDensityPerNm == jxCurrent.wavelengthDensityPerNm &&
+                                                h.sharedPairMass == jxCurrent.sharedPairSelectionMass &&
+                                                h.firstDeltaMass == jxCurrent.firstDeltaEventMass &&
+                                                h.secondDeltaMass == jxCurrent.secondDeltaEventMass;
+                                            // Negative tests are performed only AFTER the successful
+                                            // snapshot and must leave all stored densities untouched.
+                                            const bool duplicateRejected = !h.Apply(3u, jrSecondEventMass);
+                                            const bool nonfiniteRejected = !h.Apply(4u, 0.);
+                                            jyRejectPass = duplicateRejected && nonfiniteRejected &&
+                                                h.rejectedTransitions == 2u && h.nextStage == 4u &&
+                                                h.acceptedMask == 15u && h.deltaEvents == 2u &&
+                                                h.sharedPairMass == juPairProbability &&
+                                                h.firstDeltaMass == jrFirstEventMass &&
+                                                h.secondDeltaMass == jrSecondEventMass;
+                                            for (unsigned int n = 0u; n < 8u; ++n) {
+                                                if (n != jxSlot && (jyState[n].initialized ||
+                                                    jyState[n].acceptedMask != 0u ||
+                                                    jyState[n].rejectedTransitions != 0u ||
+                                                    jyState[n].deltaEvents != 0u))
+                                                    jyIsolationPass = false;
+                                            }
+                                        }
+                                        fprintf(file15gl,
+                                            "phase15jy CHILD_MIS_HISTORY_TRANSITIONS side=%s ticket=%llu child=%u "
+                                            "capacity=8 stageCount=4 initialClear=%u sequencePass=%u "
+                                            "duplicateAndInvalidRejected=%u otherSlotsClear=%u "
+                                            "acceptedMask=%u deltaEvents=%u acceptedSharedPairDraws=%u "
+                                            "knownInputValid=%u transitionContractPass=%u "
+                                            "densityProduct=NOT_COMPUTED childPrefix=UNAVAILABLE "
+                                            "reverseEvents=UNAVAILABLE spectralJointMIS=NOT_IMPLEMENTED "
+                                            "shadowOnly=1 physicalChildRays=0 physicsChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            jyInitialClear ? 1u : 0u, jySequencePass ? 1u : 0u,
+                                            jyRejectPass ? 1u : 0u, jyIsolationPass ? 1u : 0u,
+                                            jxSlotInRange ? jyState[jxSlot].acceptedMask : 0u,
+                                            jxSlotInRange ? jyState[jxSlot].deltaEvents : 0u,
+                                            jxSlotInRange && (jyState[jxSlot].acceptedMask & 2u) ? 1u : 0u,
+                                            jxKnownDataValid ? 1u : 0u,
+                                            (jyInitialClear && jySequencePass && jyRejectPass &&
+                                                jyIsolationPass && jxKnownDataValid) ? 1u : 0u);
+                                        // 15jz: child-specific typed PDF continuation ledger, diagnostic only.
+                                        // A delta event mass MUST NOT be treated as a solid-angle PDF.
+                                        // The current second-boundary Glass probe is delta; if a
+                                        // genuine non-delta observation becomes available, record
+                                        // its native Sample() forward and Pdf() reverse separately.
+                                        enum MLHeroPdfMeasure15jz {
+                                            MLHERO_JZ_UNAVAILABLE = 0u,
+                                            MLHERO_JZ_DISCRETE_DELTA = 1u,
+                                            MLHERO_JZ_SOLID_ANGLE = 2u
+                                        };
+                                        struct MLHeroPdfFactor15jz {
+                                            double value;
+                                            MLHeroPdfMeasure15jz measure;
+                                            bool available;
+                                            MLHeroPdfFactor15jz() : value(0.), measure(MLHERO_JZ_UNAVAILABLE),
+                                                available(false) { }
+                                            bool Set(const double v, const MLHeroPdfMeasure15jz m,
+                                                    const bool allowZero = false) {
+                                                if (available || m == MLHERO_JZ_UNAVAILABLE ||
+                                                        !std::isfinite(v) || v < 0. ||
+                                                        (!allowZero && v == 0.) ||
+                                                        (m == MLHERO_JZ_DISCRETE_DELTA && v > 1.000001))
+                                                    return false;
+                                                value = v;
+                                                measure = m;
+                                                available = true;
+                                                return true;
+                                            }
+                                        };
+                                        struct MLHeroChildContinuation15jz {
+                                            MLHeroPdfFactor15jz forward;
+                                            MLHeroPdfFactor15jz reverse;
+                                            bool nonDeltaObserved;
+                                            MLHeroChildContinuation15jz() : nonDeltaObserved(false) { }
+                                        };
+                                        MLHeroChildContinuation15jz jzHistory[8];
+                                        bool jzNativeForwardRecorded = false;
+                                        bool jzNativeReverseRecorded = false;
+                                        const bool jzNativeNonDelta = jxSlotInRange &&
+                                            nextNonDeltaEvent15hd[child15gl];
+                                        if (jzNativeNonDelta) {
+                                            MLHeroChildContinuation15jz &h = jzHistory[jxSlot];
+                                            h.nonDeltaObserved = true;
+                                            // Zero reverse density is valid: that strategy may
+                                            // have no support in the reverse direction.
+                                            if (std::isfinite((double)childNextPdf15gq) &&
+                                                    childNextPdf15gq > 0.f)
+                                                jzNativeForwardRecorded = h.forward.Set(
+                                                    (double)childNextPdf15gq, MLHERO_JZ_SOLID_ANGLE);
+                                            if (reversePdfValid15hd)
+                                                jzNativeReverseRecorded = h.reverse.Set(
+                                                    (double)childPdfReverse15hd, MLHERO_JZ_SOLID_ANGLE, true);
+                                        }
+                                        // Independent value-only fixtures exercise the measure
+                                        // contract even when the scene offers only delta Glass.
+                                        MLHeroPdfFactor15jz jzFixtureDelta;
+                                        const bool jzDeltaAccepted = jzFixtureDelta.Set(.5,
+                                            MLHERO_JZ_DISCRETE_DELTA);
+                                        const bool jzDeltaDuplicateRejected = !jzFixtureDelta.Set(.25,
+                                            MLHERO_JZ_DISCRETE_DELTA);
+                                        MLHeroPdfFactor15jz jzFixtureForward;
+                                        MLHeroPdfFactor15jz jzFixtureReverse;
+                                        const bool jzSolidForwardAccepted = jzFixtureForward.Set(.375,
+                                            MLHERO_JZ_SOLID_ANGLE);
+                                        const bool jzZeroReverseAccepted = jzFixtureReverse.Set(0.,
+                                            MLHERO_JZ_SOLID_ANGLE, true);
+                                        MLHeroPdfFactor15jz jzFixtureRejected;
+                                        const bool jzZeroForwardRejected = !jzFixtureRejected.Set(0.,
+                                            MLHERO_JZ_SOLID_ANGLE);
+                                        const bool jzOutOfRangeDeltaRejected = !jzFixtureRejected.Set(1.1,
+                                            MLHERO_JZ_DISCRETE_DELTA);
+                                        const bool jzUnavailableRejected = !jzFixtureRejected.Set(.25,
+                                            MLHERO_JZ_UNAVAILABLE);
+                                        bool jzOtherSlotsClear = true;
+                                        for (unsigned int slot = 0u; slot < 8u; ++slot)
+                                            if (slot != jxSlot && (jzHistory[slot].forward.available ||
+                                                jzHistory[slot].reverse.available ||
+                                                jzHistory[slot].nonDeltaObserved))
+                                                jzOtherSlotsClear = false;
+                                        const bool jzNativeOwnershipPass = !jzNativeNonDelta ?
+                                            (!jzNativeForwardRecorded && !jzNativeReverseRecorded &&
+                                             !jzHistory[jxSlotInRange ? jxSlot : 0u].forward.available &&
+                                             !jzHistory[jxSlotInRange ? jxSlot : 0u].reverse.available) :
+                                            (jzNativeForwardRecorded == jzHistory[jxSlot].forward.available &&
+                                             jzNativeReverseRecorded == jzHistory[jxSlot].reverse.available &&
+                                             (!jzNativeForwardRecorded ||
+                                               jzHistory[jxSlot].forward.measure == MLHERO_JZ_SOLID_ANGLE) &&
+                                             (!jzNativeReverseRecorded ||
+                                               jzHistory[jxSlot].reverse.measure == MLHERO_JZ_SOLID_ANGLE));
+                                        const bool jzFixturePass = jzDeltaAccepted &&
+                                            jzDeltaDuplicateRejected && jzSolidForwardAccepted &&
+                                            jzZeroReverseAccepted && jzZeroForwardRejected &&
+                                            jzOutOfRangeDeltaRejected && jzUnavailableRejected &&
+                                            !jzFixtureRejected.available &&
+                                            jzFixtureDelta.measure == MLHERO_JZ_DISCRETE_DELTA &&
+                                            jzFixtureForward.measure == MLHERO_JZ_SOLID_ANGLE &&
+                                            jzFixtureReverse.measure == MLHERO_JZ_SOLID_ANGLE;
+                                        const bool jzAllPass = jxKnownDataValid && jzFixturePass &&
+                                            jzOtherSlotsClear && jzNativeOwnershipPass;
+                                        fprintf(file15gl,
+                                            "phase15jz CHILD_TYPED_PDF_CONTINUATION side=%s ticket=%llu child=%u "
+                                            "lane=%u nativeNonDeltaObserved=%u forwardAvailable=%u "
+                                            "reverseAvailable=%u forwardPdfW=%.12g reversePdfW=%.12g "
+                                            "forwardMeasure=%s reverseMeasure=%s "
+                                            "deltaFixtureAccepted=%u duplicateRejected=%u "
+                                            "solidForwardFixtureAccepted=%u zeroReverseAccepted=%u "
+                                            "zeroForwardRejected=%u deltaOutOfRangeRejected=%u "
+                                            "unavailableMeasureRejected=%u otherSlotsClear=%u "
+                                            "nativeOwnershipPass=%u fixturesPass=%u allChecksPass=%u "
+                                            "deltaEventMassNotSolidAngle=1 mixedMeasuresNotMultiplied=1 "
+                                            "parentPrefix=UNAVAILABLE geometryJacobian=UNAVAILABLE "
+                                            "childRR=NOT_APPLIED alternateStrategies=UNAVAILABLE "
+                                            "fullJointMISReady=0 physicalChildRays=0 "
+                                            "physicsChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, jzNativeNonDelta ? 1u : 0u,
+                                            jzNativeForwardRecorded ? 1u : 0u,
+                                            jzNativeReverseRecorded ? 1u : 0u,
+                                            jzNativeForwardRecorded ? jzHistory[jxSlot].forward.value : -1.,
+                                            jzNativeReverseRecorded ? jzHistory[jxSlot].reverse.value : -1.,
+                                            jzNativeForwardRecorded ? "SOLID_ANGLE" : "UNAVAILABLE",
+                                            jzNativeReverseRecorded ? "SOLID_ANGLE" : "UNAVAILABLE",
+                                            jzDeltaAccepted ? 1u : 0u,
+                                            jzDeltaDuplicateRejected ? 1u : 0u,
+                                            jzSolidForwardAccepted ? 1u : 0u,
+                                            jzZeroReverseAccepted ? 1u : 0u,
+                                            jzZeroForwardRejected ? 1u : 0u,
+                                            jzOutOfRangeDeltaRejected ? 1u : 0u,
+                                            jzUnavailableRejected ? 1u : 0u,
+                                            jzOtherSlotsClear ? 1u : 0u,
+                                            jzNativeOwnershipPass ? 1u : 0u,
+                                            jzFixturePass ? 1u : 0u,
+                                            jzAllPass ? 1u : 0u);
+                                        // 15ka: provenance and availability of genuinely sampled
+                                        // non-delta child continuation PDFs (bounded local probe).
+                                        // This is NOT the production parent BSDF and NOT a
+                                        // persisted physically propagated child path.
+                                        const bool kaHit = childHitAccepted15go;
+                                        const bool kaWeightFinite = childNextFinite15gq;
+                                        const bool kaSampleUsable = childNextUsable15gq;
+                                        const bool kaDelta = nextEventIsDelta15hc[child15gl];
+                                        const bool kaNonDelta = nextNonDeltaEvent15hd[child15gl];
+                                        const bool kaSampleForwardValid = kaNonDelta &&
+                                            std::isfinite((double)childNextPdf15gq) &&
+                                            childNextPdf15gq > 0.f;
+                                        const bool kaQueryForwardValid = directPdfValid15hd;
+                                        const bool kaQueryReverseValid = reversePdfValid15hd;
+                                        const bool kaNativeForwardAgreement = kaSampleForwardValid &&
+                                            kaQueryForwardValid && forwardAgreement15hd;
+                                        const bool kaJzForwardOwnership =
+                                            jzNativeForwardRecorded == kaSampleForwardValid;
+                                        const bool kaJzReverseOwnership =
+                                            jzNativeReverseRecorded == kaQueryReverseValid;
+                                        const bool kaAbsentClean = kaNonDelta ||
+                                            (!jzNativeForwardRecorded && !jzNativeReverseRecorded &&
+                                             !jzHistory[jxSlotInRange ? jxSlot : 0u].forward.available &&
+                                             !jzHistory[jxSlotInRange ? jxSlot : 0u].reverse.available);
+                                        const char *kaReason = !kaHit ? "NO_ACCEPTED_HIT" :
+                                            !kaWeightFinite ? "NONFINITE_SAMPLE" :
+                                            !kaSampleUsable ? "UNUSABLE_SAMPLE" :
+                                            kaDelta ? "DELTA_EVENT" :
+                                            !kaSampleForwardValid ? "FORWARD_INVALID" :
+                                            !kaQueryForwardValid ? "FORWARD_QUERY_INVALID" :
+                                            !kaQueryReverseValid ? "REVERSE_QUERY_INVALID" :
+                                            !kaNativeForwardAgreement ? "FORWARD_MISMATCH" :
+                                            "NATIVE_NONDELTA_PAIR_OBSERVED";
+                                        // Negative fixtures: delta cannot masquerade as W^-1,
+                                        // and a missing reverse density cannot be fabricated.
+                                        const bool kaMeasureGate = kaDelta ?
+                                            (!kaNonDelta && !kaSampleForwardValid &&
+                                             !kaQueryReverseValid) : true;
+                                        const bool kaReverseZeroAllowed =
+                                            !kaQueryReverseValid || childPdfReverse15hd >= 0.f;
+                                        const bool kaPass = kaJzForwardOwnership &&
+                                            kaJzReverseOwnership && kaAbsentClean &&
+                                            kaMeasureGate && kaReverseZeroAllowed &&
+                                            (!kaNonDelta || !kaSampleForwardValid ||
+                                             jzHistory[jxSlot].forward.measure == MLHERO_JZ_SOLID_ANGLE) &&
+                                            (!kaNonDelta || !kaQueryReverseValid ||
+                                             jzHistory[jxSlot].reverse.measure == MLHERO_JZ_SOLID_ANGLE);
+                                        fprintf(file15gl,
+                                            "phase15ka NATIVE_NONDELTA_PROVENANCE side=%s ticket=%llu child=%u "
+                                            "lane=%u source=DIAGNOSTIC_CHILD_NEXT_BSDF_SAMPLE "
+                                            "parentNativePdfImported=0 realChildRayTraced=0 "
+                                            "hit=%u sampleFinite=%u sampleUsable=%u sampledEvent=%u "
+                                            "delta=%u nonDelta=%u reason=%s "
+                                            "sampleForwardPdfW=%.12g queriedForwardPdfW=%.12g "
+                                            "queriedReversePdfW=%.12g sampleForwardValid=%u "
+                                            "queryForwardValid=%u queryReverseValid=%u "
+                                            "forwardAgreement=%u absoluteForwardDifference=%.12g "
+                                            "typedForwardRecorded=%u typedReverseRecorded=%u "
+                                            "jzForwardOwnership=%u jzReverseOwnership=%u "
+                                            "absentClean=%u deltaMeasureGate=%u reverseZeroAllowed=%u "
+                                            "provenanceChecksPass=%u forwardMeasure=%s reverseMeasure=%s "
+                                            "parentPrefix=UNAVAILABLE childPathContinuation=UNAVAILABLE "
+                                            "fullSpectralMISReady=0 physicalChildRays=0 "
+                                            "physicsChanged=0 misChanged=0 rrChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, kaHit ? 1u : 0u, kaWeightFinite ? 1u : 0u,
+                                            kaSampleUsable ? 1u : 0u, (u_int)childNextEvent15gq,
+                                            kaDelta ? 1u : 0u, kaNonDelta ? 1u : 0u, kaReason,
+                                            (double)childNextPdf15gq, (double)childPdfDirect15hd,
+                                            (double)childPdfReverse15hd,
+                                            kaSampleForwardValid ? 1u : 0u,
+                                            kaQueryForwardValid ? 1u : 0u,
+                                            kaQueryReverseValid ? 1u : 0u,
+                                            kaNativeForwardAgreement ? 1u : 0u,
+                                            pdfMismatch15hd,
+                                            jzNativeForwardRecorded ? 1u : 0u,
+                                            jzNativeReverseRecorded ? 1u : 0u,
+                                            kaJzForwardOwnership ? 1u : 0u,
+                                            kaJzReverseOwnership ? 1u : 0u,
+                                            kaAbsentClean ? 1u : 0u,
+                                            kaMeasureGate ? 1u : 0u,
+                                            kaReverseZeroAllowed ? 1u : 0u,
+                                            kaPass ? 1u : 0u,
+                                            jzNativeForwardRecorded ? "SOLID_ANGLE" : "UNAVAILABLE",
+                                            jzNativeReverseRecorded ? "SOLID_ANGLE" : "UNAVAILABLE");
+                                        // 15gu Stage 10: read-only child estimator factor audit.
+                                        // Both glass models are diagnostic alternatives, not
+                                        // confirmed post-glass BSDF throughput. In particular,
+                                        // no extra division by the next BSDF PDF: Sample()
+                                        // already returns a BSDF transport weight.
+                                        // The wavelength sampleWeight already encodes inverse
+                                        // wavelength density (1/(400*pdf)); do not apply it
+                                        // here without verifying the estimator boundary.
+                                        const double pre15gu = (double)childState15gm.throughput;
+                                        const double helper15gu = (double)transport15gl;
+                                        const double parentSample15gu = (double)bsdfSample.c[0];
+                                        const double nextSample15gu = (double)childNextWeight15gq.c[0];
+                                        const double candidateAfterGlass15gu = pre15gu * helper15gu;
+                                        const double candidateAfterNext15gu = candidateAfterGlass15gu * nextSample15gu;
+                                        const double parentModelAfterNext15gu = pre15gu * parentSample15gu * nextSample15gu;
+                                        const double equalTwoLaneDiagnostic15gu = .5 * candidateAfterNext15gu;
+                                        const double wavelengthPdf15gu = (double)childState15gm.wavelengthPdf;
+                                        const double sampleWeight15gu = (double)childState15gm.sampleWeight;
+                                        const double wavelengthIdentity15gu = 400. * wavelengthPdf15gu * sampleWeight15gu;
+                                        const double eventPdf15gu = (double)childState15gm.eventPdf;
+                                        const double nextPdf15gu = (double)childNextPdf15gq;
+                                        const bool finite15gu = std::isfinite(pre15gu) &&
+                                            std::isfinite(helper15gu) && std::isfinite(parentSample15gu) &&
+                                            std::isfinite(nextSample15gu) && std::isfinite(candidateAfterGlass15gu) &&
+                                            std::isfinite(candidateAfterNext15gu) &&
+                                            std::isfinite(parentModelAfterNext15gu) &&
+                                            std::isfinite(equalTwoLaneDiagnostic15gu) &&
+                                            std::isfinite(wavelengthIdentity15gu) &&
+                                            std::isfinite(eventPdf15gu) && std::isfinite(nextPdf15gu);
+                                        const bool pdfPositive15gu = wavelengthPdf15gu > 0. &&
+                                            eventPdf15gu > 0. && nextPdf15gu > 0.;
+                                        fprintf(file15gl,
+                                            "phase15gu CHILD_ESTIMATOR_AUDIT side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.9g preGlass=%.12g helperTransport=%.12g "
+                                            "parentSampleR=%.12g nextBSDFWeightR=%.12g "
+                                            "candidateAfterGlass=%.12g candidateAfterNext=%.12g "
+                                            "parentModelAfterNext=%.12g equalTwoLaneDiagnostic=%.12g "
+                                            "wavelengthPdf=%.12g wavelengthSampleWeight=%.12g "
+                                            "wavelengthIdentity=%.12g glassEventPdf=%.12g nextBSDFPdf=%.12g "
+                                            "finite=%u pdfPositive=%u nextUsable=%u "
+                                            "glassFactorValidated=0 twoLaneNormalizationValidated=0 "
+                                            "wavelengthWeightAppliedAgain=0 eventPdfDividedAgain=0 "
+                                            "nextPdfDividedAgain=0 postGlassWeightKnown=0 "
+                                            "filmChanged=0 misChanged=0 rrChanged=0 transportApplied=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, childState15gm.lambda, pre15gu, helper15gu,
+                                            parentSample15gu, nextSample15gu, candidateAfterGlass15gu,
+                                            candidateAfterNext15gu, parentModelAfterNext15gu,
+                                            equalTwoLaneDiagnostic15gu, wavelengthPdf15gu,
+                                            sampleWeight15gu, wavelengthIdentity15gu,
+                                            eventPdf15gu, nextPdf15gu, finite15gu ? 1u : 0u,
+                                            pdfPositive15gu ? 1u : 0u, childNextUsable15gq ? 1u : 0u);
+                                        // 15gz: continuing the lane-proposal candidate is
+                                        // an accounting exercise only. The next BSDF
+                                        // Sample() weight already includes its own PDF.
+                                        if (glassWeight15gz.valid && childNextUsable15gq) {
+                                            pairLedger15gz[child15gl].nextValid = true;
+                                            pairLedger15gz[child15gl].afterNext =
+                                                pairLedger15gz[child15gl].afterGlass *
+                                                (double)childNextWeight15gq.c[0];
+                                            pairLedger15gz[child15gl].nextValid =
+                                                std::isfinite(pairLedger15gz[child15gl].afterNext);
+                                        }
+                                        fprintf(file15gl,
+                                            "phase15gz CHILD_WEIGHT_CHAIN side=%s ticket=%llu child=%u "
+                                            "lane=%u valid=%u afterGlassR=%.12g "
+                                            "nextSampleR=%.12g afterNextR=%.12g "
+                                            "nextBSDFPdf=%.12g nextPdfAlreadyInSampleWeight=1 "
+                                            "wavelengthNormalizationUnresolved=1 "
+                                            "pairSelectionPdfUnknown=1 "
+                                            "diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, pairLedger15gz[child15gl].nextValid ? 1u : 0u,
+                                            pairLedger15gz[child15gl].afterGlass,
+                                            (double)childNextWeight15gq.c[0],
+                                            pairLedger15gz[child15gl].afterNext,
+                                            (double)childNextPdf15gq);
+                                        // 15gv Stage 11: gate audit before enabling physical children.
+                                        // A valid ray and BSDF are not sufficient: the
+                                        // glass interface volume transition, estimator,
+                                        // child MIS state and per-lane contribution must
+                                        // be implemented before the film can be changed.
+                                        const bool candidateReady15gv =
+                                            ok15gl && !tir15gl && rayValid15gn &&
+                                            childHitAccepted15go && childNextUsable15gq &&
+                                            finite15gu && pdfPositive15gu;
+                                        const bool splitDirectionsDiffer15gv =
+                                            std::isfinite(delta15gl) && delta15gl > 1e-7f;
+                                        fprintf(file15gl,
+                                            "phase15gv CHILD_TRANSPORT_GATE side=%s ticket=%llu child=%u "
+                                            "lane=%u lambda=%.9g candidateReady=%u "
+                                            "directionDiffers=%u glassDirectionDelta=%.9g "
+                                            "glassVolumeTransitionValidated=0 "
+                                            "nextVolumeTransitionValidated=0 "
+                                            "spectralEstimatorValidated=0 childMISValidated=0 "
+                                            "independentSamplerValidated=0 "
+                                            "physicalChildEnabled=0 filmChanged=0 "
+                                            "diagnosticOnly=1\n",
+                                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                            lane15gl, childState15gm.lambda,
+                                            candidateReady15gv ? 1u : 0u,
+                                            splitDirectionsDiffer15gv ? 1u : 0u,
+                                            delta15gl);
+                                        // 15gr Stage 7: trace a SECOND, independent diagnostic ray
+                                        // from the accepted child surface along its sampled direction.
+                                        // Local volume/BSDF/ray state only; no production path writes.
+                                        if (childNextUsable15gq) {
+                                            luxrays::Ray childSecondRay15gr(
+                                                childBSDF15go.GetRayOrigin(childNextDir15gq),
+                                                childNextDir15gq);
+                                            childSecondRay15gr.UpdateMinMaxWithEpsilon();
+                                            childSecondRay15gr.time = time;
+                                            luxrays::RayHit childSecondHit15gr;
+                                            BSDF childSecondBSDF15gr;
+                                            Spectrum childSecondConnection15gr;
+                                            PathVolumeInfo childSecondVolume15gr = childVolumeAfterNext15gw;
+                                            const bool childSecondAccepted15gr =
+                                                engine->renderConfig.GetScene().Intersect(device,
+                                                    (side15gl ? LIGHT_RAY : EYE_RAY) | INDIRECT_RAY,
+                                                    &childSecondVolume15gr, .5f,
+                                                    &childSecondRay15gr, &childSecondHit15gr,
+                                                    &childSecondBSDF15gr, &childSecondConnection15gr);
+                                            const float childSecondT15gr = childSecondAccepted15gr ?
+                                                childSecondHit15gr.t : -1.f;
+                                            const u_int childSecondMaterial15gr = childSecondAccepted15gr ?
+                                                childSecondBSDF15gr.GetMaterialID() : 0u;
+                                            const luxrays::Point childSecondP15gr = childSecondAccepted15gr ?
+                                                childSecondBSDF15gr.hitPoint.p : luxrays::Point(0.f, 0.f, 0.f);
+                                            const bool childSecondFinite15gr =
+                                                std::isfinite(childSecondRay15gr.mint) &&
+                                                std::isfinite(childSecondRay15gr.time) &&
+                                                (!childSecondAccepted15gr ||
+                                                    (std::isfinite(childSecondT15gr) &&
+                                                     std::isfinite(childSecondP15gr.x) &&
+                                                     std::isfinite(childSecondP15gr.y) &&
+                                                     std::isfinite(childSecondP15gr.z)));
+                                            fprintf(file15gl,
+                                                "phase15gr CHILD_SECOND_HIT side=%s ticket=%llu child=%u "
+                                                "lane=%u lambda=%.9g accepted=%u finite=%u "
+                                                "t=%.9g materialID=%u p=(%.9g,%.9g,%.9g) "
+                                                "ownRay=1 ownBSDF=1 ownVolume=1 "
+                                                "queued=0 filmChanged=0 misChanged=0 rrChanged=0 "
+                                                "transportApplied=0\n",
+                                                side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                                lane15gl, childState15gm.lambda,
+                                                childSecondAccepted15gr ? 1u : 0u,
+                                                childSecondFinite15gr ? 1u : 0u,
+                                                childSecondT15gr, childSecondMaterial15gr,
+                                                childSecondP15gr.x, childSecondP15gr.y, childSecondP15gr.z);
+                                             // 15he Stage 20: inspect the SECOND accepted surface.
+                                             // In the glass-sphere test the first child hit is
+                                             // typically the glass backface. The second hit can
+                                             // be the first different material, or glass again.
+                                             // Keep this an isolated, read-only diagnostic walk.
+                                             const bool secondIsNewMaterial15he = childSecondAccepted15gr &&
+                                                 (childSecondMaterial15gr != hitMaterial15go);
+                                             const bool secondIsDelta15he = childSecondAccepted15gr &&
+                                                 childSecondBSDF15gr.IsDelta();
+                                             fprintf(file15gl,
+                                                 "phase15he SURFACE_CHAIN side=%s ticket=%llu child=%u "
+                                                 "lane=%u firstAccepted=%u firstMaterialID=%u "
+                                                 "firstDelta=%u firstEventTransmit=%u "
+                                                 "secondAccepted=%u secondMaterialID=%u "
+                                                 "secondIsNewMaterial=%u secondDelta=%u "
+                                                 "secondDistance=%.12g "
+                                                 "glassExitNotGeometricallyProven=1 "
+                                                 "physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n",
+                                                 side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                                 lane15gl, childHitAccepted15go ? 1u : 0u,
+                                                 hitMaterial15go, childBSDF15go.IsDelta() ? 1u : 0u,
+                                                 childNextIsTransmission15gw ? 1u : 0u,
+                                                 childSecondAccepted15gr ? 1u : 0u,
+                                                 childSecondMaterial15gr, secondIsNewMaterial15he ? 1u : 0u,
+                                                 secondIsDelta15he ? 1u : 0u, (double)childSecondT15gr);
+                                             // A fresh LOCAL counter-stream draw; no production
+                                             // sampler calls and no production state modifications.
+                                             if (childSecondAccepted15gr && childSecondFinite15gr) {
+                                                 const MLHeroChildDebugDraws15hb secondDraw15he =
+                                                     MLHeroDrawChild15hb(childStreams15hb[child15gl]);
+                                                 luxrays::Vector secondDir15he;
+                                                 float secondSamplePdf15he = 0.f, secondCos15he = 0.f;
+                                                 BSDFEvent secondEvent15he;
+                                                 const Spectrum secondWeight15he = childSecondBSDF15gr.Sample(
+                                                     &secondDir15he, secondDraw15he.u0, secondDraw15he.u1,
+                                                     &secondSamplePdf15he, &secondCos15he, &secondEvent15he);
+                                                 const bool secondSampleValid15he = secondDraw15he.finiteAndOpen &&
+                                                     std::isfinite(secondSamplePdf15he) && secondSamplePdf15he > 0.f &&
+                                                     std::isfinite(secondCos15he) &&
+                                                     std::isfinite(secondDir15he.Length()) &&
+                                                     fabsf(secondDir15he.Length() - 1.f) < 1e-3f &&
+                                                     !secondWeight15he.IsNaN() && !secondWeight15he.IsInf() &&
+                                                     !secondWeight15he.Black();
+                                                 const bool secondEventDelta15he = (secondEvent15he & SPECULAR) != 0;
+                                                 float forwardPdf15he = -1.f, reversePdf15he = -1.f;
+                                                 if (secondSampleValid15he && !secondEventDelta15he)
+                                                     childSecondBSDF15gr.Pdf(secondDir15he,
+                                                         &forwardPdf15he, &reversePdf15he);
+                                                 const bool pdfPairValid15he = secondSampleValid15he &&
+                                                     !secondEventDelta15he && std::isfinite(forwardPdf15he) &&
+                                                     std::isfinite(reversePdf15he) && forwardPdf15he > 0.f &&
+                                                     reversePdf15he >= 0.f;
+                                                 fprintf(file15gl,
+                                                     "phase15he SECOND_SURFACE_PDF side=%s ticket=%llu child=%u "
+                                                     "lane=%u materialID=%u event=%u eventDelta=%u "
+                                                     "sampleValid=%u samplePdf=%.12g queriedForwardPdf=%.12g "
+                                                     "queriedReversePdf=%.12g pdfPairValid=%u "
+                                                     "sampleCos=%.12g sampleWeightR=%.12g "
+                                                     "pdfMeasure=%s independentDiagnosticDraws=1 "
+                                                     "fullMISNotComputed=1 physicalChildEnabled=0 "
+                                                     "filmChanged=0 misChanged=0 rrChanged=0\n",
+                                                     side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                                     lane15gl, childSecondMaterial15gr, (u_int)secondEvent15he,
+                                                     secondEventDelta15he ? 1u : 0u,
+                                                     secondSampleValid15he ? 1u : 0u,
+                                                     (double)secondSamplePdf15he, (double)forwardPdf15he,
+                                                     (double)reversePdf15he, pdfPairValid15he ? 1u : 0u,
+                                                     (double)secondCos15he, (double)secondWeight15he.c[0],
+                                                     secondEventDelta15he ? "DISCRETE_DELTA_EVENT" : "SOLID_ANGLE_OR_UNUSABLE");
+                                                 // 15hg Stage 22: solid-angle to surface-area Jacobian
+                                                 // for the observed first->second segment ONLY.
+                                                 // p_A(y|x) = p_omega(w|x) * |n_y . (-w)| / |x-y|^2.
+                                                 // The first event is frequently specular: in that
+                                                 // case the geometric factor is still observable,
+                                                 // but multiplying a discrete delta mass by it is
+                                                 // NOT a continuous area density. In particular the
+                                                 // second-surface reverse Pdf() above refers to the
+                                                 // sampled OUTGOING direction, not this incoming edge.
+                                                 const luxrays::Vector edge15hg =
+                                                     childSecondBSDF15gr.hitPoint.p - childBSDF15go.hitPoint.p;
+                                                 const double distanceSquared15hg = (double)edge15hg.LengthSquared();
+                                                 const double directionLength15hg = (double)childNextDir15gq.Length();
+                                                 const double landingCos15hg = (double)AbsDot(
+                                                     childSecondBSDF15gr.hitPoint.geometryN, -childNextDir15gq);
+                                                 const bool geometryValid15hg =
+                                                     std::isfinite(distanceSquared15hg) && distanceSquared15hg > 1e-12 &&
+                                                     std::isfinite(directionLength15hg) &&
+                                                     fabs(directionLength15hg - 1.) < 1e-3 &&
+                                                     std::isfinite(landingCos15hg) && landingCos15hg >= 0. &&
+                                                     landingCos15hg <= 1.0001;
+                                                 const double jacobian15hg = geometryValid15hg ?
+                                                     landingCos15hg / distanceSquared15hg : -1.;
+                                                 const bool firstDirectional15hg = childNextUsable15gq &&
+                                                     !nextEventIsDelta15hc[child15gl] &&
+                                                     std::isfinite(childNextPdf15gq) && childNextPdf15gq > 0.f;
+                                                 const double firstAreaDensity15hg =
+                                                     firstDirectional15hg && geometryValid15hg ?
+                                                     (double)childNextPdf15gq * jacobian15hg : -1.;
+                                                 fprintf(file15gl,
+                                                     "phase15hg EDGE_GEOMETRY side=%s ticket=%llu child=%u "
+                                                     "lane=%u firstMaterialID=%u secondMaterialID=%u "
+                                                     "distanceSquared=%.12g landingGeomCos=%.12g "
+                                                     "jacobianOmegaToArea=%.12g geometryValid=%u "
+                                                     "firstEventDelta=%u firstForwardOmegaPdf=%.12g "
+                                                     "firstForwardAreaDensity=%.12g continuousAreaDensityAvailable=%u "
+                                                     "deltaMassMustNotConvertToAreaDensity=1 "
+                                                     "secondReversePdfIsForSampledOutgoingDir=1 "
+                                                     "reverseDeltaMassKnown=0 reverseEdgeDensityKnown=0 "
+                                                     "fullPathMISAvailable=0 diagnosticOnly=1 physicalChildEnabled=0 "
+                                                     "filmChanged=0 misChanged=0 rrChanged=0\n",
+                                                     side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                                     lane15gl, hitMaterial15go, childSecondMaterial15gr,
+                                                     distanceSquared15hg, landingCos15hg, jacobian15hg,
+                                                     geometryValid15hg ? 1u : 0u,
+                                                     nextEventIsDelta15hc[child15gl] ? 1u : 0u,
+                                                     (double)childNextPdf15gq, firstAreaDensity15hg,
+                                                     firstDirectional15hg && geometryValid15hg ? 1u : 0u);
+                                                 // 15hf Stage 21: joint event-measure audit across
+                                                 // glass delta, first post-glass BSDF and second
+                                                 // surface. A delta event is a discrete probability,
+                                                 // NEVER a solid-angle PDF. The product is merely a
+                                                 // same-path proposal audit, NOT a BIDIR MIS density:
+                                                 // geometric Jacobians, reverse delta mass, RR,
+                                                 // wavelength selection and connection strategies
+                                                 // are still not included.
+                                                 const bool firstValid15hf = childNextUsable15gq &&
+                                                     std::isfinite(childNextPdf15gq) && childNextPdf15gq > 0.f;
+                                                 const bool secondValid15hf = secondSampleValid15he;
+                                                 const bool firstDelta15hf = nextEventIsDelta15hc[child15gl];
+                                                 const bool secondDelta15hf = secondEventDelta15he;
+                                                 const bool firstReverseKnown15hf = firstValid15hf &&
+                                                     !firstDelta15hf && reversePdfValid15hd;
+                                                 const bool secondReverseKnown15hf = secondValid15hf &&
+                                                     !secondDelta15hf && pdfPairValid15he;
+                                                 const bool forwardChainValid15hf =
+                                                     glassMIS15hc[child15gl].valid && firstValid15hf &&
+                                                     secondValid15hf;
+                                                 const double firstForward15hf = firstValid15hf ?
+                                                     (double)childNextPdf15gq : -1.;
+                                                 const double secondForward15hf = secondValid15hf ?
+                                                     (double)secondSamplePdf15he : -1.;
+                                                 const double forwardEventProduct15hf = forwardChainValid15hf ?
+                                                     firstForward15hf * secondForward15hf : -1.;
+                                                 const bool productFinite15hf = forwardChainValid15hf &&
+                                                     std::isfinite(forwardEventProduct15hf) &&
+                                                     forwardEventProduct15hf > 0.;
+                                                 // Reverse density is deliberately not multiplied
+                                                 // across a delta event with a directional PDF.
+                                                 const bool reverseDirectionalChain15hf =
+                                                     firstReverseKnown15hf && secondReverseKnown15hf;
+                                                 const double reverseProduct15hf = reverseDirectionalChain15hf ?
+                                                     (double)childPdfReverse15hd * (double)reversePdf15he : -1.;
+                                                 fprintf(file15gl,
+                                                     "phase15hf PDF_EVENT_CHAIN side=%s ticket=%llu child=%u "
+                                                     "lane=%u glassMeasure=DISCRETE_DELTA "
+                                                     "firstMeasure=%s secondMeasure=%s "
+                                                     "firstValid=%u secondValid=%u "
+                                                     "firstForward=%.12g secondForward=%.12g "
+                                                     "forwardEventProduct=%.12g productFinite=%u "
+                                                     "firstReverseKnown=%u secondReverseKnown=%u "
+                                                     "reverseDirectionalChain=%u reverseDirectionalProduct=%.12g "
+                                                     "secondMaterialID=%u surfaceChange=%u "
+                                                     "fullJointDensity=NOT_AVAILABLE geometricJacobian=NOT_INCLUDED "
+                                                     "reverseDeltaMass=NOT_AVAILABLE spectralPairSelection=NOT_INCLUDED "
+                                                     "childRR=NOT_APPLIED connectionMIS=NOT_IMPLEMENTED "
+                                                     "diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n",
+                                                     side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                                     lane15gl,
+                                                     firstDelta15hf ? "DISCRETE_DELTA" : "SOLID_ANGLE",
+                                                     secondDelta15hf ? "DISCRETE_DELTA" : "SOLID_ANGLE",
+                                                     firstValid15hf ? 1u : 0u, secondValid15hf ? 1u : 0u,
+                                                     firstForward15hf, secondForward15hf,
+                                                     forwardEventProduct15hf, productFinite15hf ? 1u : 0u,
+                                                     firstReverseKnown15hf ? 1u : 0u,
+                                                     secondReverseKnown15hf ? 1u : 0u,
+                                                     reverseDirectionalChain15hf ? 1u : 0u,
+                                                     reverseProduct15hf, childSecondMaterial15gr,
+                                                     secondIsNewMaterial15he ? 1u : 0u);
+                                             }
+
+                                        }
+                                    }
+                                    fprintf(file15gl,
+                                        "phase15go CHILD_HIT side=%s ticket=%llu child=%u "
+                                        "lane=%u lambda=%.9g traced=1 acceptedHit=%u "
+                                        "hitDistance=%.9g materialID=%u "
+                                        "passThroughSample=0.5 volumeCopied=1 "
+                                        "acceptedIntersectionNotRawTriangle=1 "
+                                        "queued=0 childContinued=0 filmChanged=0 "
+                                        "misChanged=0 rrChanged=0 transportApplied=0\n",
+                                        side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                                        lane15gl, childState15gm.lambda,
+                                        childHitAccepted15go ? 1u : 0u, hitDistance15go,
+                                        hitMaterial15go);
+                                }
+                            }
+                        }
+                        fprintf(file15gl,
+                            "phase15gn CHILD_RAY side=%s ticket=%llu child=%u "
+                            "lane=%u lambda=%.9g rayConstructed=%u "
+                            "directionLength=%.9g reconstructedDelta=%.9g "
+                            "helperDelta=%.9g deltaDifference=%.9g "
+                            "rayMint=%.9g rayTime=%.9g "
+                            "traceCalls=0 queued=0 filmChanged=0 "
+                            "misChanged=0 rrChanged=0 physicsChanged=0\n",
+                            side15gl ? "LIGHT" : "EYE", ticket15gl, child15gl,
+                            lane15gl, childState15gm.lambda, rayValid15gn ? 1u : 0u,
+                            rayDirLength15gn, reconstructedDelta15gn, delta15gl,
+                            (reconstructedDelta15gn >= 0.f) ?
+                                fabsf(reconstructedDelta15gn - delta15gl) : -1.f,
+                            rayMint15gn, rayTime15gn);
+                    }
+                    // 15hc: the exact LuxCore delta recurrence is locally
+                    // reconstructible at glass for each child. This is still
+                    // NOT enough to establish a valid light/eye connection:
+                    // spectral path density, reverse densities at subsequent
+                    // non-delta vertices, branch selection, spectral estimator
+                    // and RR probability ownership are all unresolved.
+                    fprintf(file15gl,
+                        "phase15hc MIS_PAIR_GATE side=%s ticket=%llu "
+                        "glassDeltaRecurrenceA=%u glassDeltaRecurrenceB=%u "
+                        "nextEventDeltaA=%u nextEventDeltaB=%u "
+                        "nextPdfObservedA=%u nextPdfObservedB=%u "
+                        "nextDeltaRecurrenceA=%u nextDeltaRecurrenceB=%u "
+                        "reversePdfForNonDeltaKnown=0 "
+                        "jointWavelengthPathDensityKnown=0 "
+                        "lightEyeConnectionMISKnown=0 "
+                        "childRRPdfIntegrated=0 packetEstimatorValidated=0 "
+                        "fullChildMISValidated=0 physicalChildEnabled=0 "
+                        "filmChanged=0 misChanged=0 rrChanged=0\n",
+                        side15gl ? "LIGHT" : "EYE", ticket15gl,
+                        glassMIS15hc[0].valid ? 1u : 0u,
+                        glassMIS15hc[1].valid ? 1u : 0u,
+                        nextEventIsDelta15hc[0] ? 1u : 0u,
+                        nextEventIsDelta15hc[1] ? 1u : 0u,
+                        nextPdfObserved15hc[0] ? 1u : 0u,
+                        nextPdfObserved15hc[1] ? 1u : 0u,
+                        nextMIS15hc[0].valid ? 1u : 0u,
+                        nextMIS15hc[1].valid ? 1u : 0u);
+                    fprintf(file15gl,
+                        "phase15hd REVERSE_PDF_PAIR_GATE side=%s ticket=%llu "
+                        "nonDeltaA=%u nonDeltaB=%u reverseObservedA=%u reverseObservedB=%u "
+                        "directMatchesSampleA=%u directMatchesSampleB=%u "
+                        "nonDeltaRecurrenceA=%u nonDeltaRecurrenceB=%u "
+                        "deltaEventsNeedNoDirectionalReversePdf=1 "
+                        "spectralPathJointPdfMissing=1 childRRMissing=1 "
+                        "lightEyeConnectionMISMissing=1 actualChildTransport=0 "
+                        "filmChanged=0 misChanged=0 rrChanged=0\n",
+                        side15gl ? "LIGHT" : "EYE", ticket15gl,
+                        nextNonDeltaEvent15hd[0] ? 1u : 0u,
+                        nextNonDeltaEvent15hd[1] ? 1u : 0u,
+                        nextReversePdfObserved15hd[0] ? 1u : 0u,
+                        nextReversePdfObserved15hd[1] ? 1u : 0u,
+                        nextForwardPdfConsistent15hd[0] ? 1u : 0u,
+                        nextForwardPdfConsistent15hd[1] ? 1u : 0u,
+                        nextNonDeltaMIS15hd[0].valid ? 1u : 0u,
+                        nextNonDeltaMIS15hd[1].valid ? 1u : 0u);
+                    // 15hb: end-of-pair sanity check. Distinct local key/state
+                    // is observed, but that is NOT a proof of unbiased MIS or
+                    // physical stochastic independence from the parent path.
+                    const bool pairSamplesValid15hb =
+                        childDraws15hb[0].finiteAndOpen &&
+                        childDraws15hb[1].finiteAndOpen;
+                    const bool pairSamplesDistinct15hb =
+                        childDraws15hb[0].u0 != childDraws15hb[1].u0 ||
+                        childDraws15hb[0].u1 != childDraws15hb[1].u1;
+                    fprintf(file15gl,
+                        "phase15hb STREAM_PAIR_AUDIT side=%s ticket=%llu "
+                        "keyDistinct=%u samplesValid=%u samplesDistinct=%u "
+                        "counterA=%llu counterB=%llu "
+                        "parentSamplerCalls=0 parentSamplerStateUnaffected=1 "
+                        "childDebugBSDFUsesLocalDraws=1 rrPreviewApplied=0 "
+                        "productionChildSamplerValidated=0 "
+                        "unbiasedPathEstimatorValidated=0 childMISValidated=0 "
+                        "physicalChildEnabled=0 filmChanged=0 rrChanged=0\n",
+                        side15gl ? "LIGHT" : "EYE", ticket15gl,
+                        distinctKeys15hb ? 1u : 0u,
+                        pairSamplesValid15hb ? 1u : 0u,
+                        pairSamplesDistinct15hb ? 1u : 0u,
+                        (unsigned long long)childStreams15hb[0].counter,
+                        (unsigned long long)childStreams15hb[1].counter);
+                    // 15gz paired estimator ledger. The arithmetic sum/mean
+                    // are CONTRASTS only, NOT unbiased lane-selection weights.
+                    // The two lanes are deterministic positions in the packet.
+                    const MLHeroPairLedger15gz &a15gz = pairLedger15gz[0];
+                    const MLHeroPairLedger15gz &b15gz = pairLedger15gz[1];
+                    const bool pairGlassReady15gz = a15gz.glassValid && b15gz.glassValid;
+                    const bool pairNextReady15gz = a15gz.nextValid && b15gz.nextValid;
+                    const double afterGlassSum15gz = pairGlassReady15gz ?
+                        a15gz.afterGlass + b15gz.afterGlass : 0.;
+                    const double afterNextSum15gz = pairNextReady15gz ?
+                        a15gz.afterNext + b15gz.afterNext : 0.;
+                    const double afterNextMean15gz = .5 * afterNextSum15gz;
+                    const bool pairFinite15gz = std::isfinite(afterGlassSum15gz) &&
+                        std::isfinite(afterNextSum15gz) && std::isfinite(afterNextMean15gz) &&
+                        std::isfinite(a15gz.wavelengthIdentity) &&
+                        std::isfinite(b15gz.wavelengthIdentity);
+                    fprintf(file15gl,
+                        "phase15gz TWO_LANE_ESTIMATOR_AUDIT side=%s ticket=%llu "
+                        "laneA=%u laneB=%u lambdaA=%.9g lambdaB=%.9g "
+                        "glassReady=%u nextReady=%u finite=%u "
+                        "eventPdfA=%.12g eventPdfB=%.12g "
+                        "wavelengthIdentityA=%.12g wavelengthIdentityB=%.12g "
+                        "afterGlassSumR=%.12g afterNextSumR=%.12g "
+                        "afterNextArithmeticMeanR=%.12g "
+                        "twoLaneSelectionPdfKnown=0 unbiasedNormalizationValidated=0 "
+                        "childMISValidated=0 independentSamplerValidated=0 "
+                        "diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0\n",
+                        side15gl ? "LIGHT" : "EYE", ticket15gl,
+                        a15gz.lane, b15gz.lane, a15gz.lambda, b15gz.lambda,
+                        pairGlassReady15gz ? 1u : 0u, pairNextReady15gz ? 1u : 0u,
+                        pairFinite15gz ? 1u : 0u,
+                        a15gz.lanePdf, b15gz.lanePdf,
+                        a15gz.wavelengthIdentity, b15gz.wavelengthIdentity,
+                        afterGlassSum15gz, afterNextSum15gz, afterNextMean15gz);
+                    // 15ha: explain the 1/N existing packet convention and
+                    // the two-slot arithmetic mean without claiming MIS or
+                    // stochastic subset selection. No branch is reweighted.
+                    const MLHeroPairNorm15ha glassNorm15ha =
+                        MLHeroPairNormAudit15ha(a15gz.afterGlass,
+                            b15gz.afterGlass, pathVertex->mlHeroLaneCount);
+                    const MLHeroPairNorm15ha nextNorm15ha =
+                        MLHeroPairNormAudit15ha(a15gz.afterNext,
+                            b15gz.afterNext, pathVertex->mlHeroLaneCount);
+                    fprintf(file15gl,
+                        "phase15ha TWO_LANE_NORMALIZATION side=%s ticket=%llu "
+                        "packetCount=%u selectedCount=2 selectedSlotFraction=%.12g "
+                        "glassReady=%u nextReady=%u "
+                        "glassAlgebraValid=%u nextAlgebraValid=%u "
+                        "partialPacketGlassR=%.12g pairMeanGlassR=%.12g "
+                        "partialPacketNextR=%.12g pairMeanNextR=%.12g "
+                        "hypotheticalPartialToMeanFactor=%.12g "
+                        "glassArithmeticResidual=%.12g nextArithmeticResidual=%.12g "
+                        "fixedIndexPair=0 selectionPdfNotApplicable=0 "
+                        "conditionalPureWavelengthMeanOnly=1 "
+                        "pureWavelengthUniformMarginalNotProven=1 "
+                        "fullPacketContributionNotObserved=1 "
+                        "unbiasedPathEstimatorValidated=0 childMISValidated=0 "
+                        "independentSamplerValidated=0 "
+                        "diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0\n",
+                        side15gl ? "LIGHT" : "EYE", ticket15gl,
+                        pathVertex->mlHeroLaneCount,
+                        packet15ha.selectedSlotFraction,
+                        pairGlassReady15gz ? 1u : 0u,
+                        pairNextReady15gz ? 1u : 0u,
+                        (pairGlassReady15gz && glassNorm15ha.valid) ? 1u : 0u,
+                        (pairNextReady15gz && nextNorm15ha.valid) ? 1u : 0u,
+                        glassNorm15ha.partialPacket,
+                        glassNorm15ha.pairMean,
+                        nextNorm15ha.partialPacket,
+                        nextNorm15ha.pairMean,
+                        glassNorm15ha.hypotheticalFactor,
+                        glassNorm15ha.residual,
+                        nextNorm15ha.residual);
+                    // 15js: SAME-HIT eight-lane reference for discrete event masses.
+                    // The packet lanes are stratified and the two chosen indices
+                    // are fixed. Pair-vs-full is a *measured discrepancy*, not an
+                    // error bound or an unbiasedness guarantee. We never compare
+                    // continuation throughput across different untraced rays.
+                    double jsMass[8] = {};
+                    double jsThroughputMass[8] = {};
+                    bool jsLaneValid[8] = {};
+                    u_int jsValidCount = 0u, jsTIRCount = 0u;
+                    double jsSum = 0., jsSumWeighted = 0.;
+                    for (u_int jsLane = 0u; jsLane < pathVertex->mlHeroLaneCount && jsLane < 8u; ++jsLane) {
+                        float jsNc=0.f, jsNtBase=0.f, jsNt=0.f, jsF=0.f;
+                        float jsEta=0.f, jsEta2=0.f, jsTransport=0.f, jsDelta=0.f;
+                        float jsCos=0.f, jsSinI2=0.f, jsSinT2=0.f, jsPdf=0.f;
+                        bool jsTIR=false;
+                        Spectrum jsWeight(0.f);
+                        const double jsLambda = (double)pathVertex->mlHeroLaneWaveLength[jsLane];
+                        const double jsPre = (double)pathVertex->mlHeroLaneThroughput[jsLane].c[0];
+                        const bool jsOK = pathVertex->bsdf.EvaluateMLHeroGlassDebugAtWaveLength(
+                            sampledDir, event, bsdfPdfW,
+                            pathVertex->mlHeroLaneWaveLength[jsLane],
+                            &jsNc, &jsNtBase, &jsNt, &jsF,
+                            &jsEta, &jsEta2, &jsTransport,
+                            &jsDelta, &jsWeight, &jsCos,
+                            &jsSinI2, &jsSinT2, &jsTIR, &jsPdf);
+                        const bool jsValid = jsOK && std::isfinite(jsLambda) &&
+                            std::isfinite(jsPre) && jsPre >= 0. &&
+                            std::isfinite((double)jsPdf) && jsPdf >= 0.f && jsPdf <= 1.f;
+                        jsLaneValid[jsLane] = jsValid;
+                        if (jsValid) {
+                            jsMass[jsLane] = (double)jsPdf;
+                            jsThroughputMass[jsLane] = jsPre * (double)jsPdf;
+                            jsSum += jsMass[jsLane];
+                            jsSumWeighted += jsThroughputMass[jsLane];
+                            ++jsValidCount;
+                            if (jsTIR) ++jsTIRCount;
+                        }
+                        fprintf(file15gl,
+                            "phase15js EIGHT_LANE_MASS side=%s ticket=%llu lane=%u "
+                            "lambda=%.12g preGlassR=%.12g helperValid=%u "
+                            "eventMass=%.12g preTimesMassProxy=%.12g tir=%u "
+                            "sameParentHit=1 sampledParentEventOnly=1 "
+                            "differentLaneDirectionsNotTraced=1 proxyNotTransport=1 "
+                            "noRaySpawn=1 noMISChange=1\n",
+                            side15gl ? "LIGHT" : "EYE", ticket15gl, jsLane,
+                            jsLambda, jsPre, jsValid ? 1u : 0u,
+                            jsValid ? jsMass[jsLane] : -1.,
+                            jsValid ? jsThroughputMass[jsLane] : -1.,
+                            jsTIR ? 1u : 0u);
+                    }
+                    const u_int jsN = pathVertex->mlHeroLaneCount;
+                    const bool jsFullValid = jsN == 8u && jsValidCount == jsN;
+                    const bool jsPairValid = jsFullValid &&
+                        jsLaneValid[laneIDs15gl[0]] && jsLaneValid[laneIDs15gl[1]];
+                    const double jsFullMean = jsFullValid ? jsSum / (double)jsN : -1.;
+                    const double jsPairMean = jsPairValid ?
+                        .5 * (jsMass[laneIDs15gl[0]] + jsMass[laneIDs15gl[1]]) : -1.;
+                    const double jsFullWeightedMean = jsFullValid ? jsSumWeighted / (double)jsN : -1.;
+                    const double jsPairWeightedMean = jsPairValid ?
+                        .5 * (jsThroughputMass[laneIDs15gl[0]] +
+                              jsThroughputMass[laneIDs15gl[1]]) : -1.;
+                    const double jsDifference = jsPairValid ? jsPairMean - jsFullMean : -1.;
+                    const double jsWeightedDifference = jsPairValid ?
+                        jsPairWeightedMean - jsFullWeightedMean : -1.;
+                    const bool jsFinite = jsPairValid && std::isfinite(jsDifference) &&
+                        std::isfinite(jsWeightedDifference);
+                    fprintf(file15gl,
+                        "phase15js EIGHT_VS_TWO_MASS_AUDIT side=%s ticket=%llu "
+                        "packetCount=%u validCount=%u tirCount=%u laneA=%u laneB=%u "
+                        "fullMeanMass=%.12g pairMeanMass=%.12g pairMinusFull=%.12g "
+                        "fullMeanPreMassProxy=%.12g pairMeanPreMassProxy=%.12g "
+                        "weightedPairMinusFull=%.12g valid=%u "
+                        "fixedPairIndices=0 actualRandomSubset=1 "
+                        "inclusionProbability=0.25_CONDITIONAL_UNIFORM_IDEAL "
+                        "pairIsNotFullPacketPerSample=1 noClaimOfUnbiasedness=1 "
+                        "fullPathTransportReference=UNAVAILABLE "
+                        "childIndependentContinuation=UNAVAILABLE "
+                        "reverseSpectralMIS=UNAVAILABLE "
+                        "normalizerForLiveSplit=UNVALIDATED "
+                        "diagnosticOnly=1 physicsChanged=0 misChanged=0 rrChanged=0\n",
+                        side15gl ? "LIGHT" : "EYE", ticket15gl,
+                        jsN, jsValidCount, jsTIRCount,
+                        laneIDs15gl[0], laneIDs15gl[1],
+                        jsFullMean, jsPairMean, jsDifference,
+                        jsFullWeightedMean, jsPairWeightedMean,
+                        jsWeightedDifference, jsFinite ? 1u : 0u);
+                    // 15jt: exact finite-population identity across ALL four
+                    // opposite pairs. This is a mathematical check on same-hit
+                    // event masses, not on complete spectral paths or MIS.
+                    double pairMeans15jt[4] = {};
+                    double pairWeighted15jt[4] = {};
+                    double sumPairMeans15jt = 0., sumPairWeighted15jt = 0.;
+                    double maxAbsPairError15jt = 0., maxAbsWeightedError15jt = 0.;
+                    bool pairSetValid15jt = jsFullValid && jsN == 8u && half15jt == 4u;
+                    if (pairSetValid15jt) {
+                        for (u_int p15jt = 0u; p15jt < 4u; ++p15jt) {
+                            pairMeans15jt[p15jt] = .5 *
+                                (jsMass[p15jt] + jsMass[p15jt + 4u]);
+                            pairWeighted15jt[p15jt] = .5 *
+                                (jsThroughputMass[p15jt] + jsThroughputMass[p15jt + 4u]);
+                            sumPairMeans15jt += pairMeans15jt[p15jt];
+                            sumPairWeighted15jt += pairWeighted15jt[p15jt];
+                            maxAbsPairError15jt = std::max(maxAbsPairError15jt,
+                                fabs(pairMeans15jt[p15jt] - jsFullMean));
+                            maxAbsWeightedError15jt = std::max(maxAbsWeightedError15jt,
+                                fabs(pairWeighted15jt[p15jt] - jsFullWeightedMean));
+                        }
+                    }
+                    const double ensembleMean15jt = pairSetValid15jt ? sumPairMeans15jt / 4. : -1.;
+                    const double ensembleWeighted15jt = pairSetValid15jt ? sumPairWeighted15jt / 4. : -1.;
+                    const double residual15jt = pairSetValid15jt ? ensembleMean15jt - jsFullMean : -1.;
+                    const double weightedResidual15jt = pairSetValid15jt ?
+                        ensembleWeighted15jt - jsFullWeightedMean : -1.;
+                    const bool pass15jt = pairSetValid15jt &&
+                        fabs(residual15jt) <= 1.e-10 &&
+                        fabs(weightedResidual15jt) <= 1.e-10;
+                    fprintf(file15gl,
+                        "phase15jt RANDOM_PAIR_NORMALIZATION side=%s ticket=%llu "
+                        "candidatePairs=%u selectedPair=%u laneA=%u laneB=%u "
+                        "laneInclusionProbability=%.12g pairSelectionProbability=%.12g "
+                        "fullMeanMass=%.12g selectedPairMeanMass=%.12g "
+                        "ensembleMeanMass=%.12g ensembleResidual=%.12g "
+                        "fullMeanPreMassProxy=%.12g selectedPairPreMassProxy=%.12g "
+                        "ensembleMeanPreMassProxy=%.12g weightedEnsembleResidual=%.12g "
+                        "maxAbsSinglePairMassError=%.12g maxAbsSinglePairWeightedError=%.12g "
+                        "pairMeans=(%.12g,%.12g,%.12g,%.12g) "
+                        "valid=%u pass=%u "
+                        "selection=LOCAL_DETERMINISTIC_PSEUDORANDOM_DIAGNOSTIC "
+                        "theoreticalIdentity=CONDITIONAL_UNIFORM_PAIR "
+                        "selectionIndependentOfMassAssumed=1 statisticalRandomnessNotValidated=1 "
+                        "completePathEstimatorNotValidated=1 reverseMISUnavailable=1 "
+                        "childArchitectureCapacity=8 activePhysicalChildren=0 "
+                        "adaptiveSplit=ROADMAP_ONLY noExtraRays=1 physicsChanged=0 misChanged=0 rrChanged=0\n",
+                        side15gl ? "LIGHT" : "EYE", ticket15gl,
+                        half15jt, choice15jt, laneIDs15gl[0], laneIDs15gl[1],
+                        half15jt ? 1. / (double)half15jt : 0.,
+                        half15jt ? 1. / (double)half15jt : 0.,
+                        jsFullMean, jsPairMean, ensembleMean15jt, residual15jt,
+                        jsFullWeightedMean, jsPairWeightedMean, ensembleWeighted15jt,
+                        weightedResidual15jt, maxAbsPairError15jt,
+                        maxAbsWeightedError15jt,
+                        pairMeans15jt[0], pairMeans15jt[1], pairMeans15jt[2], pairMeans15jt[3],
+                        pairSetValid15jt ? 1u : 0u, pass15jt ? 1u : 0u);
+                    fclose(file15gl);
+                }
+            }
+        }
         if (glassSpectralActive15ev) {
             const u_int evaluateCount = glassDispersiveTx15ev ? 1u : pathVertex->mlHeroLaneCount;
             for (u_int lane = 0u; lane < evaluateCount; ++lane) {
@@ -6921,6 +13720,7 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
                 valid15fv,beta15fv,engine->rrImportanceCap,&selected15fv);
             random15fu=sampler->GetSample(sampleOffset+2);
             killed15fu=(selected15fv && prob15fv<=0.f) || prob15fv<random15fu;
+            history15ke.Roulette(prob15fv, killed15fu);
             if(audit15fs) {
                 MLHeroMaterialLiveRecord15fv(static_cast<unsigned>(bucket15fu),
                     pathVertex->depth,selected15fv,baseline15fv,prob15fv,random15fu,killed15fu);
@@ -8062,6 +14862,25 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 	}
 	assert (!pathVertex->throughput.IsNaN() && !pathVertex->throughput.IsInf());
 
+    const bool auditBounce15km=engine->GetType()==slg::BIDIRCPU && MLHeroCurrentDiagnosticsEnabled15cq();
+    const slg::mlhero15km::State beforeBounce15km=auditBounce15km?
+        slg::mlhero15km::State(pathVertex->dVCM,pathVertex->dVC,pathVertex->dVM):slg::mlhero15km::State();
+    // 15kn: transport precision is independent of the diagnostic switches.
+    if(engine->GetType()==slg::BIDIRCPU && engine->mlHeroEnabled) {
+        const slg::mlhero15kn::State a(pathVertex->dVCM,pathVertex->dVC,pathVertex->dVM);
+        const bool specular=(event&SPECULAR)!=0;
+        if(specular)assert(bsdfPdfW==bsdfRevPdfW);
+        const auto precise=slg::mlhero15kn::Bounce(a,bsdfPdfW,bsdfRevPdfW,cosSampledDir,
+            specular,misVmWeightFactor,misVcWeightFactor);
+        const auto rounded=precise.Rounded();
+        pathVertex->dVCM=rounded.cm;pathVertex->dVC=rounded.vc;pathVertex->dVM=rounded.vm;
+        if(auditBounce15km) {
+            const auto legacy=slg::mlhero15kn::LegacyBounce(a,bsdfPdfW,bsdfRevPdfW,cosSampledDir,
+                specular,misVmWeightFactor,misVcWeightFactor);
+            MLHeroMISPrecisionAudit15kn(specular?slg::mlhero15kn::SpecularBounce:slg::mlhero15kn::NonSpecularBounce,
+                *pathVertex,a,legacy,precise,cosSampledDir,double(cosSampledDir),bsdfPdfW,bsdfRevPdfW,0.f);
+        }
+    } else {
 	// New MIS weights
 	if (event & SPECULAR) {
 		pathVertex->dVCM = 0.f;
@@ -8080,11 +14899,19 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 				MIS(bsdfRevPdfW) + pathVertex->dVCM * misVcWeightFactor + 1.f);
 		pathVertex->dVCM = MIS(1.f / bsdfPdfW);
 	}
+    }
 
+    if(auditBounce15km) {
+        slg::mlhero15km::Inputs i;i.forward=bsdfPdfW;i.reverse=bsdfRevPdfW;i.cosine=cosSampledDir;
+        i.specular=(event&SPECULAR)!=0;i.event=(unsigned)event;i.rr=mlHeroRrProb15et;
+        i.vmFactor=misVmWeightFactor;i.vcFactor=misVcWeightFactor;
+        MLHeroMISTransition15km(slg::mlhero15km::Bounce,pathVertex->bsdf.hitPoint.fromLight?1u:0u,beforeBounce15km,*pathVertex,i);
+    }
 	// Update volume information
 	pathVertex->volInfo.Update(event, pathVertex->bsdf);
 
 	*nextEventRay = Ray(pathVertex->bsdf.GetRayOrigin(sampledDir), sampledDir);
+    if(directionAudit15ko)MLHeroDirectionTrace15ko(*pathVertex,nextEventRay->d,bsdfPdfW,cosSampledDir,(unsigned)event);
 	nextEventRay->UpdateMinMaxWithEpsilon();
 	nextEventRay->time = time;
 
@@ -8156,37 +14983,71 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
             b15ge.ratio[lane] = (before != 0.f) ? after/before : 0.f;
         }
     }
+    history15ke.Accept();
     ++pathVertex->depth;
 
     return true;
 }
 
-void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
-#ifndef NDEBUG
-	SLG_LOG("[BiDirCPURenderThread::" << threadIndex << "] Rendering thread started");
-#endif
-
-	//--------------------------------------------------------------------------
-	// Initialization
-	//--------------------------------------------------------------------------
-
-	// This is really used only by Windows for 64+ threads support
-	SetThreadGroupAffinity(threadIndex);
-
-	BiDirCPURenderEngine *engine = (BiDirCPURenderEngine *)renderEngine;
-// 15fh BEGIN diagnostic-only
-    MLHeroReset15fh(engine->mlHeroEnabled && engine->mlHeroWavelengthCount>1 &&
-        engine->mlHeroDiagnostics && engine->mlHeroCurrentDiagnostics);
-// 15fh END
-
+// 15kd: called only by the engine while its render workers are stopped.
+// Keep shared resets and log creation out of RenderFunc: a mutex around
+// thread 0 alone does not stop other workers from sampling.
+void BiDirCPURenderEngine::PrepareMLHeroDiagnostics15kd() {
+    auto *engine = this;
 	mlHeroDiagnostics15cq.store(engine->mlHeroDiagnostics, std::memory_order_relaxed);
 	mlHeroCurrentDiagnostics15cq.store(engine->mlHeroCurrentDiagnostics, std::memory_order_relaxed);
 	mlHeroLegacyDiagnostics15cq.store(engine->mlHeroLegacyDiagnostics, std::memory_order_relaxed);
 	mlHeroHeavyDiagnostics15cq.store(engine->mlHeroHeavyDiagnostics, std::memory_order_relaxed);
 	
-	if (threadIndex == 0) {
+	{ // 15kd: engine coordinator, before worker creation
 		{
 			std::lock_guard<std::recursive_mutex> mlHeroStatsResetLock15az(mlHeroDebugLogMutex);
+            // 15gy: reset both splitting probe budgets for EVERY render start.
+            // This is diagnostic-only; never touches sampler, MIS or film.
+            mlHeroSplitTickets15gy[0].store(0ull, std::memory_order_relaxed);
+            mlHeroSplitTickets15gy[1].store(0ull, std::memory_order_relaxed);
+            // 15jc-r1: native Glass audit (15im..15jc) owns an independent
+            // per-render, per-side budget; no production state is changed.
+            mlHeroNativeGlassParentTickets15im[0].store(0ull, std::memory_order_relaxed);
+            mlHeroNativeGlassParentTickets15im[1].store(0ull, std::memory_order_relaxed);
+            // 15jd: glass.cpp has an independent 64-per-side native Sample budget.
+            MLHeroResetNativeGlassChildBudget15jd();
+            mlHeroNativeGlassChildReservations15je[0].store(0ull, std::memory_order_relaxed);
+            mlHeroNativeGlassChildReservations15je[1].store(0ull, std::memory_order_relaxed);
+            mlHero15kbNativeRoughPdfTickets[0].store(0ull, std::memory_order_relaxed);
+            mlHero15kbNativeRoughPdfTickets[1].store(0ull, std::memory_order_relaxed);
+            slg::mlhero15kh::ResetCounters(); // before every worker start
+            slg::mlhero15ki::ResetCounters();
+            slg::mlhero15kl::ResetCounters();
+            // 15kf: per-render anomaly budgets, before worker creation.
+            for (unsigned stage15kf=0u; stage15kf<3u; ++stage15kf) {
+                mlHero15kfEvents[stage15kf].store(0ull, std::memory_order_relaxed);
+                mlHero15kfDetails[stage15kf].store(0ull, std::memory_order_relaxed);
+                mlHero15kfZeroHistoryRecovered[stage15kf].store(0ull, std::memory_order_relaxed);
+            }
+
+            // 15ke: reset once on the engine coordinator before workers.
+            for (unsigned side15ke = 0u; side15ke < 2u; ++side15ke) {
+                mlHero15keTickets[side15ke].store(0ull, std::memory_order_relaxed);
+                mlHero15keRecords[side15ke].store(0ull, std::memory_order_relaxed);
+                mlHero15keEnds[side15ke].store(0ull, std::memory_order_relaxed);
+                mlHero15keGaps[side15ke].store(0ull, std::memory_order_relaxed);
+                mlHero15keInvalid[side15ke].store(0ull, std::memory_order_relaxed);
+                mlHero15keTruncated[side15ke].store(0ull, std::memory_order_relaxed);
+                mlHero15keMixed[side15ke].store(0ull, std::memory_order_relaxed);
+                mlHero15keWriteFailures[side15ke].store(0ull, std::memory_order_relaxed);
+            }
+            // 15kd: these native Glass statistics previously survived render restarts.
+            for (unsigned side15kd = 0u; side15kd < 2u; ++side15kd) {
+                mlHero15ihTotal[side15kd].store(0ull, std::memory_order_relaxed);
+                mlHero15ihReflected[side15kd].store(0ull, std::memory_order_relaxed);
+                mlHero15ihTransmitted[side15kd].store(0ull, std::memory_order_relaxed);
+                mlHero15ihBlack[side15kd].store(0ull, std::memory_order_relaxed);
+                mlHero15ihOther[side15kd].store(0ull, std::memory_order_relaxed);
+            }
+			// 15gf diagnostic-only: reset the detail budget per render.
+			mlHero15gfChecks.store(0ull, std::memory_order_relaxed);
+			mlHero15gfDetails.store(0u, std::memory_order_relaxed);
 			mlHeroGlassCorrectionStats15az = MLHeroGlassCorrectionStats15az();
 			mlHero15azFinishedThreads.store(0u);
 			mlHero15bhPdfTerminations.store(0ull);
@@ -8243,6 +15104,7 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 				mlHero15ctRoughGlassSamples[c15ct].store(0ull, std::memory_order_relaxed);
 				mlHero15ctRoughGlassEvalBlack[c15ct].store(0ull, std::memory_order_relaxed);
 				mlHero15ctRoughGlassEventMismatch[c15ct].store(0ull, std::memory_order_relaxed);
+				mlHero15ctMismatchDetails[c15ct].store(0u, std::memory_order_relaxed);
 				mlHero15ctRoughGlassPdfRelErrSum[c15ct].store(0.0, std::memory_order_relaxed);
 				mlHero15ctRoughGlassPdfRelErrMax[c15ct].store(0.0, std::memory_order_relaxed);
 				mlHero15ctRoughGlassSampleRelErrSum[c15ct].store(0.0, std::memory_order_relaxed);
@@ -8387,6 +15249,13 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
         MLHeroReset15fa();
 // 15fa END diagnostic-only
         MLHeroReset15ew();
+        MLHeroReset15km();
+        MLHeroReset15kn();
+        slg::mlhero15ko::ResetCounters();
+        slg::mlhero15kv::Reset();
+        slg::mlhero15kx::Reset();
+        slg::mlhero15la::Reset();
+        MLHeroReset15kq();
         MLHeroReset15ex();
         MLHeroReset15ey();
         mlHero15euDetailTicket.store(0ull, std::memory_order_relaxed);
@@ -8413,6 +15282,7 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
         }
 
 		if (f) {
+            fprintf(f, "phase15kd DIAGNOSTIC_RESET timing=engine_before_workers sharedCountersReset=1 glassTIRCountersReset=1 nativeBudgetsReset=1 typedParent15kcBudget=shared15kb perWorkerTLSReset=before_sampling onStart=1 onSceneEditRestart=1 physicsChanged=0 misChanged=0 rrChanged=0\n");
 			fprintf(f, "ML HERO v2.11.2 | Test phase: %s | Feature: %s\n", ML_HERO_TEST_PHASE, ML_HERO_FEATURE);
             fprintf(f,"phase15fx REFLECTANCE_FIX scope=CPU_BIDIR_MatteValidatedKdFit_Glossy2SplitKd unitReflectanceBound=0to1 sampledTransportUnbounded=1 genericWholeBSDFUnchanged=1 glassEtaWeightsUnchanged=1 physicsIndependentOfDiagnostics=1\n");
             fprintf(f,"phase15fw FINITE_CONFIG diagnosticsOnly=1 transportChanged=0 absoluteThreshold=64 colorThreshold=16 colorRatio=8 detailBudgetPerStageAndKind=32 connectionBudget=64 rawContributionNotFilmPixel=1 bounceFactorIsRRq=1 connectionFactorIsMIS=1 coordsOrigin=rendererFilmNotEXRRow\n");
@@ -8442,6 +15312,341 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 // 15fa END diagnostic-only
             fprintf(f, "ML HERO phase 15ez CLEANUP: spectralGlass=15ev spectralRoughGlass=15et legacyGlassWeighting=REMOVED legacyMode2Blend25=REMOVED legacyRgbOwnership=REMOVED spectralPhysicsChanged=0 rgbConnectionFallback=RETAINED mode1RgbDualCompensation=RETAINED historicalAuditCountersMayBeInactive=1\n");
 			fprintf(f, "ML HERO phase 15cs CONFIG: path.mlhero.glassmode=%d (legacy IDs; shared spectral Glass/RoughGlass transport in all modes; Mode1 retains RGB-connection compensation)\n", engine->mlHeroGlassMode);
+            fprintf(f, "phase15gl SPLIT_CONFIG requested=%u active=0 spawnRays=0 physicsChanged=0 glassMode=%d rrGlassUntouched=1 rrMaterialUntouched=1 reason=TWO_LANE_BIDIR_MIS_NOT_IMPLEMENTED\n", engine->mlHeroSplittingRequested15gl ? 1u : 0u, engine->mlHeroGlassMode);
+            fprintf(f, "phase15ik PHASE_A_CHILD_CONTRACT_CONFIG type=typed_value_owned_medium_copy probabilities=explicit_measure_and_available reversePdf=UNAVAILABLE jointPdf=UNAVAILABLE normalizer=UNVALIDATED physicalChildEnabled=0 spawnRays=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15il PHASE_A_EVENT_MEASURE_CONFIG eventProposal=DISCRETE_CANDIDATE_ONLY forwardNative=UNAVAILABLE reverseNative=UNAVAILABLE solidAnglePdf=UNAVAILABLE spectralTIR=COUNTERFACTUAL_ONLY jointPathPdf=UNAVAILABLE normalizer=UNVALIDATED childRays=0 physicsChanged=0\n");
+            fprintf(f, "phase15im PHASE_A_NATIVE_PARENT_CONFIG scope=actual_GlassMaterial_Sample sampledParentOnly=1 observedThreshold=transmitMass observedReflectMass=oneMinusThreshold childForward=UNAVAILABLE childReverse=UNAVAILABLE limitPerSide=64 noExtraSampling=1 physicsChanged=0\n");
+            fprintf(f, "phase15gy STACK_CONFIG source=PathVolumeInfo_public_API maxEntries=%u probeTicketsPerSide=32 reset=engine_before_workers_each_render activeMediumNullGuard=1 stackCheck=explicit_ordered_entries_plus_priority diagnosticOnly=1 filmChanged=0 misChanged=0 rrChanged=0 physicalChildEnabled=0\n", (unsigned)PATHVOLUMEINFO_SIZE);
+            fprintf(f, "phase15in PHASE_A_CHILD_BRANCH_CONFIG scope=glass_counterfactual_child_wavelength branchMass=reflect_plus_transmit helper=existing_15ba sampledParentEventOnly=1 nativeChildVerified=0 reverseNative=UNAVAILABLE jointPdf=UNAVAILABLE noExtraSampling=1 childRays=0 physicsChanged=0\n");
+            fprintf(f, "phase15io PHASE_A_REFERENCE_CONFIG method=double_precision_independent_Snell_Fresnel input=helper_eta_and_incident_cos excludes=Kr_Kt_film_transport nativeChildMassValidated=0 diagnosticOnly=1 noExtraSampling=1 childRays=0 physicsChanged=0\n");
+            fprintf(f, "phase15ip PHASE_A_MATERIAL_CONFIG scope=actual_parent_GlassMaterial_Kr_Kt_plus_independent_double_Fresnel_Snell film=UNSUPPORTED reverse=UNAVAILABLE nativeChildVerified=0 diagnosticOnly=1 noExtraSampling=1 childRays=0 physicsChanged=0\n");
+
+            fprintf(f, "phase15ir NATIVE_LOBE_CONFIG scope=actual_GlassMaterial_Sample_parent "
+                "lobeFilters=actual_sampled_BSDF_outputs eventSelection=passThrough_observed "
+                "nativeChildVerified=0 extraSamplerDraws=0 childRays=0 physicsChanged=0\n");
+
+            fprintf(f,"phase15iw NATIVE_SPECTRAL_TIR_CONFIG source=actual_parent_GlassMaterial_Sample materialModel=Cauchy_or_Sellmeier lanes=up_to_8 sameHitPoint=1 parentVsLaneTIR=1 childBSDFSample=0 reversePDF=UNAVAILABLE mediumStackIndependent=0 nativeChildVerified=0 childRays=0 physicsChanged=0\n");
+            fprintf(f,"phase15ix NATIVE_TIR_INTERVAL_CONFIG source=real_15iw_lane_IOR_at_parent_hit minMaxCriticalAngle=1 angleMargin=incident_minus_interval mixedClassification=lane_flags noAdditionalSample=1 childRays=0 physicsChanged=0\n");
+            fprintf(f,"phase15iy CHILD_EVENT_SUPPORT_CONFIG source=real_native_parent_plus_15iw_Snell_lane_flags TIR_forbids_transmission=1 nonTIR_transmission_geometrically_possible_only=1 spectralKrKt=NOT_EVALUATED childForwardReversePdf=UNAVAILABLE extraSamples=0 childRays=0 physicsChanged=0\n");
+            fprintf(f,"phase15iz CHILD_EVENT_MASS_CONFIG source=actual_parent_Kr_Kt_RGB_textures_same_hit laneIOR=15iw Fresnel=native_CauchyEvaluate reflectedFilm=native_calc ifPresent=1 transmissionEyeEtaSquared=1 transmissionLightCosRatio=1 nativeMassClamp=025_075 spectralKrKt=RGB_FILTER_PROXY childSample=0 reversePDF=UNAVAILABLE extraFilmTextureDiagnosticReads=1 noExtraSamplerDraws=1 childRays=0 physicsChanged=0\n");
+            fprintf(f,"phase15ja CHILD_POLICY_REPLAY_CONFIG source=15iz_real_parent_RGB_KrKt_counterfactual_lane_lobes fixedU=7 nativeChildSample=0 childPdfVerified=0 reversePdf=UNAVAILABLE jointMIS=NOT_IMPLEMENTED childRays=0 physicsChanged=0\n");
+            fprintf(f,"phase15jb NATIVE_CHILD_SAMPLE_CONFIG scope=actual_GlassMaterial_Sample_on_counterfactual_lane bounded64_per_side=1 same_hit=1 tls_save_restore=1 extra_native_calls=8_per_hit nativeChildDirection=1 nativeChildDiscretePdf=1 reversePdf=UNAVAILABLE jointMIS=NOT_IMPLEMENTED childRays=0 physicsChanged=0\n");
+            fprintf(f,"phase15jc NATIVE_CHILD_DIRECTION_CONFIG source=native_15jb_child_direction reference=independent_double_precision_local_Snell_and_reflection tolerances_vector_2e-4_Snell_2e-4 nativeChild=1 noChildRays=1 reversePdf=UNAVAILABLE jointMIS=NOT_IMPLEMENTED physicsChanged=0\n");
+            fprintf(f,"phase15lb METAL_PDF_FIX enabled=%u scope=CPU_HERO_METAL2 halfMeasure=SOLID_ANGLE directionJacobian=4_ABS_DOT_FIXED_HALF sampleWeight=D_OVER_GENERATED_DENSITY rejectionRenormalization=0 brdfDChanged=0 spectralHelpersCorrected=1\n",engine->mlHeroEnabled?1u:0u);
+            fprintf(f,"phase15la SCHLICK_AUDIT_CONFIG scope=CPU_HERO_BIDIR_CURRENT_METAL2 selectedAttemptsPerWorkerSide=256 detailsPerSide=16 measure=HALF_VECTOR_SOLID_ANGLE reference=ANALYTIC_INVERSE_MAP_JACOBIAN independentClaimReplay=1 rejectedSamples=INCLUDED conditionalRenormalization=NONE comparisonToleranceRelative=0.0002 histograms=16_BINS_NOT_IID_TEST status0=PRE_DRAW_REJECT status1=HEMISPHERE_REJECT status2=PDF_REJECT status3=GEOMETRY_PDF_ACCEPTED reset=engine_before_workers workerTLS=RESET_SCOPED extraTextureQueries=0 extraSampling=0 independentReferenceNeverApplied=1 productionPdf=GENERATED_HALF_DENSITY physicsChanged=15LB_METAL2_PDF_WEIGHT\n");
+            slg::mlhero15la::WriteFixtures(f);
+            fprintf(f,"phase15kz RR_RUNTIME_CONFIG engine=BIDIRCPU source=ENGINE_FIELDS heroEnabled=%u wavelengths=%u spectralMaterialRR=%u spectralGlassRR=%u rrStartDepth=%u rrMinimumSurvival=%.9g maxEyePathDepth=%u maxLightPathDepth=%u materialScope=EyeMatteMetal2Glossy2 glassScope=EyeIdealGlass flagsAreRequestedSettings=1 eligibilityRequiresHeroAndMultipleWavelengths=1 decisionCounts=NOT_REPORTED rendererPhysicsChanged=0\n",
+                engine->mlHeroEnabled?1u:0u,static_cast<unsigned>(engine->mlHeroWavelengthCount),
+                engine->mlHeroRRMaterialExperiment?1u:0u,engine->mlHeroRRGlassEtaExperiment?1u:0u,
+                static_cast<unsigned>(engine->rrDepth),static_cast<double>(engine->rrImportanceCap),
+                static_cast<unsigned>(engine->maxEyePathDepth),static_cast<unsigned>(engine->maxLightPathDepth));
+            fprintf(f,"phase15ky METAL_DIRECTION_FIX enabled=%u scope=CPU_HERO_METAL2 basis=DOUBLE_ORTHONORMAL localInputs=UNIT localOutputAndWorld=UNIT SampleEvaluatePdfAndSpectral=SHARED proposal=SCHLICK_SAME_INVERSE_CDF_DOUBLE halfVectorAndD=SHARED_STABLE pdfAndWeight=EMITTED_DIRECTION_PAIR textureQueries=CACHED_ONCE fresnelOrientation=SAMPLED_UPPER_HALF_SPACE adjoint=DOUBLE_UNIT_WORLD_DOTS independentOfDiagnostics=1 invalidDirectionsNotReplaced=1 directionTrace=15KO traceLocalSample=EMITTED_WORLD_REPROJECTED_LOCAL physicsChanged=NUMERICAL_DIRECTION_STABILITY\n",engine->mlHeroEnabled?1u:0u);
+            fprintf(f,"phase15kx SURFACE_RECOVERY_CONFIG scope=CPU_HERO_BSDF_SURFACE enabled=%u trigger=INVALID_INTERPOLATED_NORMAL fallback=VALID_GEOMETRY_NORMAL tangent=NATIVE_UV_OR_COORDINATE_SYSTEM normalDerivatives=ZERO independentOfDiagnostics=1 healthyHitsUnchanged=1 meshArrayChanged=0 bumpNotRepaired=1 physicsChanged=INVALID_HITS_ONLY reset=engine_before_workers\n",engine->mlHeroEnabled?1u:0u);
+            fprintf(f,"phase15kw RAW_NORMAL_CONFIG capture=SELECTED_15KV_EXCEPTIONAL_HITS baseMesh=RAW_MEMORY normalStages=RAW_SIGNED_PRENORMALIZE_NATIVE_INTERPOLATED transforms=BASE_INSTANCE_MOTION counterAndBudget=15KV reset=engine_before_workers extraTextureEvaluations=0 physicsChanged=0\n");
+            fprintf(f,"phase15kv SURFACE_ORIGIN_CONFIG scope=CPU_HERO_BIDIR_CURRENT stages=BEFORE_BUMP_AFTER_BUMP_AFTER_FRAME surfaceInits=RAY_AND_POINT invalid=NONFINITE_OR_ZERO_NORMAL_OR_BASIS differentialInvalid=NONFINITE_ONLY extraTextureEvaluations=0 exceptionalMeshReadsOnly=1 maxDetailsPerSideStage=16 callback=THREAD_LOCAL_SYNC workerExit=DISABLED reset=engine_before_workers physicsChanged=0\n");
+            fprintf(f,"phase15ku GLASS_FACTORS_CONFIG scope=CPU_HERO_BIDIR_selected_prefixes source=15kt_verified_conditional_native_GLASS_event_masses consume=ARRIVAL_ONLY storage=VALUE_OWNED maxEdgesPerPrefix=1024 detailedStepBudget=32 pairedLogProducts=1 matchedSubsetRatioOnly=1 forwardRR=SEPARATE reverseRR=UNAVAILABLE deltaMeasureConversion=UNAVAILABLE endpointAndContinuousGeometry=EXCLUDED fullPathPdf=UNAVAILABLE strategyPdfRatio=UNAVAILABLE nativeMISChanged=0 reset=engine_before_workers\n");
+            fprintf(f,"phase15kt GLASS_REVERSE_CONFIG scope=CPU_HERO_BIDIR_selected_prefixes model=NATIVE_CONDITIONAL_EVENT_MASS sameSurface=1 wavelength=FIXED_HERO reverseFixed=ACTUAL_SAMPLED_WORLD_IN_PRECISE_FRAME reverseTransport=TOGGLED reverseIntoObject=FROM_GEOMETRY_NORMAL exteriorInteriorMedia=RETAINED nativeLobeHelpers=1 extraSamples=0 samplerDraws=0 TLS=RESTORED normalAndAnomalyDetailsPerSideEventIncidence=16 supportTolerance=1e-4 legacyMIS=UNCHANGED reverseRR=UNAVAILABLE fullPathPdf=UNAVAILABLE reset=engine_before_workers\n");
+            fprintf(f,"phase15ks CONNECTION_CHAIN_CONFIG stepsPerPrefix=32 storage=VALUE_OWNED order=FIRST_COMPLETED_SAMPLED_EDGES rootEdge=SEPARATE candidatesPerSide=65536 categories=SEPARATE_16_EACH nativeGlassMass=READ_ONLY_PARENT_TLS forwardRR=ACTUAL reverseDeltaScalar=RECURRENCE_ONLY reverseDeltaMass=UNAVAILABLE reverseRR=UNAVAILABLE fullPathPdf=UNAVAILABLE extraSamples=0 extraPdfQueries=0 physicsChanged=0 reset=engine_before_workers stateBytes=%llu\n",(unsigned long long)sizeof(slg::mlhero15kq::State));
+            fprintf(f,"phase15kr GLASS_DIRECTION_FIX enabled=%u scope=CPU_HERO_GLASS frame=DOUBLE_ORTHONORMAL fixedLocal=UNIT nativeMaterialSample=UNCHANGED outputLocalAndWorld=UNIT_NATIVE_FLOAT nativeSamplePdfPreserved=1 nativeLobeAndTIRPolicy=UNCHANGED adjointFixedWorld=UNIT invalidDirectionsNotReplaced=1 independentOfDiagnostics=1 candidateStartsPerSide=65536 rootDetailsPerSide=64 edgeDetailsPerEarlyPath=32 maxEdgesPerPrefix=1024 connectionDetailsPerCategory=16 deltaAndVolumeQuotas=SEPARATE reset=engine_before_workers\n",engine->mlHeroEnabled?1u:0u);
+            fprintf(f,"phase15kq PATH_FACTORS_CONFIG scope=CPU_HERO_BIDIR enabledWith=Current candidateStartsPerSide=65536 rootDetailsPerSide=64 maxEdgesPerPrefix=1024 edgeDetailsPerEarlyPath=32 maxConnectionDetails=64 rootNativePdf=OBSERVED continuousAndDiscreteProducts=SEPARATE logSpace=1 arrivalGeometry=POSITION_BASED targetNormal=UNIT prefixStorage=VALUE_OWNED sourceEndpointMeasureSplit=UNAVAILABLE mediumDistancePdf=UNAVAILABLE reverseRR=UNAVAILABLE deltaReverseMass=UNAVAILABLE wavelengthJointPdf=UNAVAILABLE fullPathPdf=UNAVAILABLE diagnosticOnly=1 reset=engine_before_workers\n");
+            fprintf(f,"phase15kp VOLUME_DIRECTION_FIX enabled=%u scope=CPU_HERO_volume_and_SchlickScatter volumeFixedDirection=UNIT volumeFrame=DOUBLE_ORTHONORMAL phaseSampleAxes=DOUBLE_UNIT phaseEvaluatePdf=UNIT_ANGULAR_INPUT finalVolumeDirection=UNIT_FLOAT originalHeroOff=1 nativePhasePdfFormulaUnchanged=1 noExtraRandomDimensions=1 independentOfDiagnostics=1\n",engine->mlHeroEnabled?1u:0u);
+            fprintf(f,"phase15ko DIRECTION_CONFIG scope=CPU_HERO_BIDIR enabledWith=Current ringStepsPerSide=12 detailsPerSideAndKind=16 maxWindows=64 normSquaredTolerance=0.00002 stages=input_localFixed_frame_materialSample_worldSample_finalRay reset=engine_before_workers_and_worker_TLS noExtraPdfQueries=1 noExtraSampling=1 physicsChanged=0\n");
+            fprintf(f,"phase15kn MIS_PRECISION_FIX enabled=%u scope=CPU_HERO_BIDIR recurrenceIntermediates=DOUBLE geometryDotAndIntermediates=DOUBLE historyStorage=FLOAT clamp=NONE epsilon=NONE originalNonHero=1 independentOfDiagnostics=1 referenceScope=single_step_from_actual_history maxDetails=256 reset=engine_before_workers\n",engine->mlHeroEnabled?1u:0u);
+            fprintf(f,"phase15km MIS_TRANSITION_CONFIG scope=CPU_BIDIR_current_diagnostics stages=light_init_eye_init_light_geometry_eye_geometry_bounce componentOrder=dVCM_dVC_dVM maskBits=1_2_4 newDetailsPerStageSide=16 inheritedDetailsPerStageSide=2 maxDetails=180 reset=engine_before_workers reference=single_operation_double transportChanged=0 pdfChanged=0 diagnosticOnly=1\n");
+            fprintf(f,"phase15kl ROUGH_FRAME_FIX enabled=1 scope=CPU_HERO_RoughGlass orthonormalBasis=double SampleEvaluatePdf=unrounded_local_geometry finalWorldRay=FLOAT noPdfReconciliation=1 newRandomDimensions=0 extraFrameDetailsPerSide=16 extraFrameBand=3 extraFrameMinRel=0.001 extraFrameMaxRelExclusive=0.01 maxRecordsCombinedWith15ki=160 reset=engine_before_workers\n");
+            fprintf(f,"phase15kk ROUGH_INTERFACE_FIX enabled=1 scope=CPU_HERO_RoughGlass normalizedDirections=double FresnelSnell=shared_double queryTransmission=known_cosine_pair criticalSideEpsilon=none sourceSamplerDimensionsUnchanged=1 physicalTIRBranchesCorrected=1 noPdfReconciliation=1\n");
+            fprintf(f,"phase15kj ROUGH_NUMERIC_FIX enabled=1 scope=CPU_HERO_RoughGlass stableNDF=normalized_transverse_double reflectionVNDFPdf=analytical_cosine_cancellation sourceSamplerDimensionsUnchanged=1 transmissionMappingUnchanged=1 reset=existing15ki fullGrazingResolutionNotAssumed=1\n");
+            fprintf(f,"phase15ki ROUGH_PRECISION_CONFIG enabled=1 controlsPerCase=8 errors1to5PercentPerCase=16 errors5PercentPlusPerCase=8 maxRecords=128 extraPdfQueriesPerSelectedRecord=2 reset=engine_before_workers reference=normalized_transverse_Schlick_Z noReferenceApplied=1 diagnosticOnly=1\n");
+            fprintf(f, "phase15kh POLAR_PDF_FIX enabled=1 scope=CPU_SampleableSphericalFunction theta=atan2_transverse_z sine=transverse_over_length exactPolePdf=0 exactPoleEmission=retained sampledPdf=queried_returned_direction additionalSamplerDraws=0 extraCachedDistributionLookupPerSuccessfulSample=1 diagnosticsIndependentPhysics=1 reset=engine_before_workers\n");
+            fprintf(f, "phase15kg EMISSION_SOURCE_CONFIG source=TriangleLight_GetRadiance_and_actual_emission_profile_Pdf storage=thread_local identityCheck=light_pointer_and_both_output_PDFs detailBudget=shared_15kf_16_per_stage trigger=15kf_anomaly reset=owning_worker_before_sampling distributionLookups=unchanged candidateApplied=0 physicsChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15kf DIRECT_HIT_CONFIG diagnosticsOnly=1 stages=MIS,SPECTRAL_RESULT,RGB_RESULT detailBudgetPerStage=16 trigger=nonfinite_competitor_or_MIS_or_contribution nativeMISUnchanged=1 candidate=EXACT_ZERO_HISTORY_ONLY candidateApplied=0 doubleReference=diagnostic_only laneReconstruction=bounded_anomaly_only additionalSamplerDraws=0 additionalBSDFPdfQueries=0 additionalTextureReads=0 reset=engine_before_workers depth1PDFInputs=NOT_READ physicsChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15ke PARENT_HISTORY_CONFIG scope=CPU_BIDIR_native_parent_bounce_chain pathBudgetPerSide=64 stepBudgetPerPath=32 enabledWith=Current reset=engine_before_workers selection=first_bounce_paths sharedPathID=side_plus_ticket noAdditionalSample=1 noAdditionalPdfQuery=1 sampleMeasure=DISCRETE_EVENT_or_SOLID_ANGLE reverseDelta=UNAVAILABLE nativeReverseScalar=production_recurrence_only rr=actual_selected_survival_probability sourceEndpoint=UNAVAILABLE geometryJacobian=UNAVAILABLE mediumDistancePdf=UNAVAILABLE reverseRR=UNAVAILABLE connections=UNAVAILABLE wavelengthJointPdf=UNAVAILABLE noPdfProducts=1 physicsChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15kc TYPED_PARENT_PDF_CONFIG scope=CPU_BIDIR_production_RoughGlass_single_bounce_snapshots parentOnly=1 typedMeasures=SOLID_ANGLE_or_UNAVAILABLE maxPerSide=64 reuse15kbTicket=1 valueOwned=1 completePathHistory=0 childPdfNeverInferred=1 reversePathState=UNVALIDATED jointSpectralMIS=NOT_IMPLEMENTED physicalChildRays=0 physicsChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15kb NATIVE_ROUGHGLASS_PARENT_PDF_CONFIG scope=CPU_BIDIR_Bounce realProductionParentSample=1 continuousNonDeltaOnly=1 budgetPerSide=64 nativePdfQuery=forward_and_reverse reverseZeroAllowed=1 sampleQueryAgreementNotAssumed=1 childPdfNotInferred=1 physicalChildRays=0 physicsChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15ka NATIVE_NONDELTA_PROVENANCE_CONFIG scope=CPU_BIDIR_bounded_diagnostic_child_next_sample readSources=SamplePdfW_and_BSDF_Pdf_forward_reverse noParentPDFImport=1 deltaNotSolidAngle=1 unavailableExplicit=1 noFullJointMIS=1 physicalChildRays=0 physicsChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15jz CHILD_TYPED_PDF_CONFIG scope=CPU_BIDIR_local_shadow nativeNonDelta=SamplePdfW_plus_QueriedReversePdfW delta=DISCRETE_EVENT nonDelta=SOLID_ANGLE reverseZeroAllowed=1 missing=UNAVAILABLE noMixedProduct=1 jointMISReady=0 physicalChildRays=0 physicsChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15jy CHILD_MIS_TRANSITION_CONFIG scope=CPU_BIDIR_local_shadow stages=wavelength,pairDraw,firstDelta,secondDelta capacity=8 duplicateReject=1 invalidReject=1 noJointProduct=1 noChildRays=1 physicsChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15jx CHILD_MIS_HISTORY_CONFIG scope=CPU_BIDIR_shadow_only capacity=8 currentActiveChildren=2 storage=local_per_child_audit zeroInitialized=1 knownMask=wavelength,pairDraw,firstDelta,secondDelta missing=prefix,nonDelta,reverse,geometry,RR,connections jointMISReady=0 physicalChildRays=0 physicsChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15jw NATIVE_MIS_OWNERSHIP_CONFIG scope=CPU_BIDIR_readonly_source_mapping nativeStages=SampleBSDF,GenerateEyePath,GenerateLightPath,ConnectVertices,ConnectToEye,DirectLightSampling specularDelta=DISCRETE nonDelta=SOLID_ANGLE parentScalarMIS=NOT_REUSABLE childPrefix=UNAVAILABLE childReverse=UNAVAILABLE jointSpectralMIS=NOT_IMPLEMENTED physicalChildRays=0 physicsChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15jv STRATEGY_READINESS_CONFIG mode=DIAGNOSTIC_ONLY children=2 capacity=8 oneSharedPairDraw=1 pairMass=0.25 missing=prefix,forwardContinuation,reverseEvents,geometry,RR,eyeLightConnection,alternateStrategies deltaVsSolidAngle=SEPARATE noScalarBidirMISReuse=1 fullJointReady=0 physicalChildRays=0 physicsChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15ju CHILD_PDF_HISTORY_CONFIG scope=CPU_BIDIR_two_child_diagnostic_only capacity=8 candidatePairs=4 sharedPairDraw=1 pairSelectionMass=0.25 perLaneInclusion=0.25 wavelengthMeasure=CONTINUOUS_NM firstSecondGlass=DISCRETE_DELTA_EVENT taggedLocalFactor=NOT_JOINT_PATH_PDF prefixPdf=UNAVAILABLE reversePdf=UNAVAILABLE geometryJacobian=UNAVAILABLE continuationPdf=UNAVAILABLE eyeLightMIS=NOT_IMPLEMENTED childRR=NOT_APPLIED adaptiveSplit=ROADMAP_ONLY physicalChildRays=0 physicsChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15jt RANDOM_PAIR_CONFIG mode=DIAGNOSTIC_ONLY candidatePairs=4 chosenChildren=2 capacityForFutureChildren=8 localPRNG=SplitMix64_pairChoice childSelectionConditionalUniformIdeal=1 exactAllPairEnsembleAudit=1 adaptiveSplitting=ROADMAP_ONLY physicalRays=0 misChanged=0 rrChanged=0 physicsChanged=0\n");
+            fprintf(f, "phase15js EIGHT_LANE_MASS_CONFIG scope=first_GlassMaterial_parent_hit lanes=8 fixedSelectedSlots=0_and_4 comparison=conditional_discrete_event_mass_and_preTimesMassProxy fullPathReference=UNAVAILABLE randomSubsetSelection=0 diagnosticOnly=1 physicsChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15jr PDF_MEASURE_CONFIG wavelength=CONTINUOUS_NM firstGlass=DISCRETE secondGlass=DISCRETE onlyConditionalEventProduct=1 selectionDensity=UNVALIDATED reverseJointPdf=UNAVAILABLE jointMIS=NOT_IMPLEMENTED noDoublePdfDivision=1 diagnosticsOnly=1 physicalChildEnabled=0 physicsChanged=0\n");
+            fprintf(f,"phase15jq CHILD1_TLS_CONFIG scope=diagnostic_second_GlassMaterial_Sample activeLane=child_wavelength restoredTLS=1 physicalChildRays=0 rendererPhysicsChanged=0 MIS=UNCHANGED RR=UNCHANGED\n");
+            fprintf(f,"phase15jp NATIVE_DIRECTION_CONFIG source=actual_second_GlassMaterial_Sample_selected_lane_only analytic=15jo_all_eight maxSpread=ALL_TRANSMISSION_PAIRS sourceIOR=15jn_25 noAdditionalSampling=1 noExtraRays=1 transportChanged=0 MIS=UNCHANGED RR=UNCHANGED\n");
+            fprintf(f,"phase15jo DIRECTION_GROUP_CONFIG source=15jn_second_hit analytic=reflection_and_possible_transmission perLaneDirections=1 extraNativeSamples=0 childRays=0 physicsChanged=0 MIS=UNCHANGED\n");
+            fprintf(f, "phase15jn EIGHT_LANE_BOUNDARY_CONFIG source=original_vertex_packet_lanes secondIdealGlassExitOnly=1 reflectionAndTransmissionSupport=1 eventMass=GlassMaterial_helper noAdditionalSamples=1 directionCheck=NOT_PERFORMED jointMIS=UNAVAILABLE physicsChanged=0 childRays=0\n");
+            fprintf(f, "phase15jm SAME_WAVELENGTH_CONFIG scope=second_ideal_glass_reflection nativeLambda=GlassMaterial_Sample_TLS helperLambda=nativeLambda childLambdaLoggedSeparately=1 noExtraSample=1 diagnosticOnly=1 childRays=0 physicsChanged=0 misChanged=0 rrChanged=0 notForMIS=1\n");
+            fprintf(f, "phase15jl NATIVE_REFLECTION_CONFIG source=actual_second_GlassMaterial_Sample_after_return before_other_diagnostic_BSDF_calls=1 captures=native_lobe_support_threshold_passThrough_ior_tir sampledReflectionOnly=1 diagnosticOnly=1 childRays=0 physicsChanged=0 misChanged=0 rrChanged=0 notForMIS=1\n");
+            fprintf(f, "phase15jk REFLECTION_TIR_IOR_CONFIG comparison=forward_and_rebuilt_reverse_same_hit nativeVsLaneEventMass=1 iorAndCos=1 classificationOnly=1 diagnosticOnly=1 childRays=0 physicsChanged=0 misChanged=0 rrChanged=0 notForMIS=1\n");
+            fprintf(f, "phase15jj REVERSE_REFLECTION_CONFIG scope=second_ideal_glass_boundary_reflection reverse=REBUILT_BSDF_same_hit_unchanged_stack reverseMass=GlassMaterial_helper diagnosticOnly=1 childRays=0 physicsChanged=0 jointSpectralMIS=UNAVAILABLE\n");
+            fprintf(f, "phase15ji SECOND_BOUNDARY_CLASSIFICATION_CONFIG source=actual_second_child_BSDF_Sample reflection=EXPECTED_NON_TRANSMITTING_EVENT twoTransmissionReverseAudit=NOT_APPLICABLE_TO_REFLECTION nativeForwardDiscreteMass=RECORDED reverseReflectionMass=UNAVAILABLE reverseBSDFNotRebuiltForReflection=1 classificationOnly=1 childRays=0 physicsChanged=0\n");
+            fprintf(f, "phase15jh REBUILT_REVERSE_EVENT_CONFIG scope=second_ideal_glass_boundary reverse=REBUILT_BSDF_post_transition_stack compare=COPIED_HITPOINT_helper discreteEventMass=1 jointSpectralMIS=UNAVAILABLE childRays=0 physicsChanged=0\n");
+            fprintf(f, "phase15jg REVERSE_DELTA_EVENT_CONFIG scope=bounded_15gl_disperse_glass_two_lane_probe forward=GlassMaterial_helper reverse=COPIED_HITPOINT_helper measure=DISCRETE_DELTA_EVENT solidAnglePdf=NOT_APPLICABLE reverseBSDF=NOT_REBUILT reverseMediumStack=NOT_REBUILT jointSpectralPdf=UNAVAILABLE misUsable=0 diagnosticOnly=1 childRays=0 physicsChanged=0\n");
+            fprintf(f,"phase15jd DIAGNOSTICS_CONFIG nativeParentBudgetReset=per_render nativeGlassChildBudgetReset=per_render childAuditGate=bounded_native_parent_before_sample_15je current=15jb_15jc_summary legacy=15im_through_15ja heavy=15jb_15jc_lane noDiagnosticsDeleted=1 transportChanged=0\n");
+            fprintf(f,"phase15iv NATIVE_TIR_BOUNDARY_CONFIG source=actual_GlassMaterial_Sample_parent ni_no=from_real_material_IOR_and_local_cos independentEquation=double_precision_Snell criticalAngle=asin_no_over_ni margin=incident_minus_critical nativeTIR=glass_EvalSpecularTransmission sceneDependent=1 sampledParentsPerSide=64 shadingNormal=1 mediumStackIndependent=0 noExtraSampleCalls=1 childRays=0 physicsChanged=0\n");
+            fprintf(f,"phase15iu NATIVE_LOBES_FIXED_U_CONFIG samplesPerParent=7 "
+                "source=real_GlassMaterial_Sample_lobes shadowPolicyOnly=1 "
+                "fixedU=0,0.249999,0.25,0.499999,0.5,0.75,0.999999 "
+                "nativeReplay=0 syntheticHitPoint=0 noExtraSamplerDraws=1 "
+                "nativeTIRCoverage=scene_dependent childRays=0 physicsChanged=0\n");
+            // 15iq: deterministic analytic fixtures ONLY. Not native material samples and
+            // not an independent validation of the spectral helper or child MIS density.
+            fprintf(f, "phase15is NATIVE_SPECIAL_CONFIG scope=actual_parent_GlassMaterial_Sample "
+                "checks=tir_lobe_support_black_zero_lobes_threshold_event_pdf "
+                "fixtureNativeSample=NOT_BUILT nativeSpecialCoverage=SCENE_DEPENDENT "
+                "noExtraSamplerDraws=1 noExtraSampleCalls=1 nativeChildVerified=0 "
+                "childRays=0 physicsChanged=0\n");
+            // 15it: deterministic *selection-policy* cases. These call neither the
+            // native GlassMaterial::Sample nor texture/medium code. They exercise
+            // the same lobe-support decision conditions with specified u values.
+            // The TIR flag represents an externally blocked transmission lobe;
+            // optical TIR itself is NOT natively verified by this fixture.
+            fprintf(f, "phase15it SELECTION_POLICY_CONFIG cases=12 nativeSampleCalled=0 "
+                "syntheticHitPoint=0 samplerDraws=0 tir=blocked_transmit_fixture_only "
+                "materialTextures=NOT_TESTED nativeChildVerified=0 childRays=0 physicsChanged=0\n");
+            struct MLHeroPolicyFixture15it {
+                const char *tag;
+                double reflection, transmission, u;
+                unsigned tir, expectedEvent; // 0=black,1=reflect,2=transmit
+                double expectedPdf;
+            };
+            const MLHeroPolicyFixture15it cases15it[] = {
+                {"BOTH_REFLECT_LOW_U", .2, .8, .0, 0, 2, .75},
+                {"BOTH_REFLECT_HIGH_U", .2, .8, .99, 0, 1, .25},
+                {"BOTH_EQUAL_BELOW", .5, .5, .499, 0, 2, .5},
+                {"BOTH_EQUAL_AT", .5, .5, .5, 0, 1, .5},
+                {"REFLECT_DOMINANT", .9, .1, .5, 0, 1, .75},
+                {"TRANSMIT_DOMINANT", .1, .9, .5, 0, 2, .75},
+                {"ONLY_REFLECT", 1., 0., .0, 0, 1, 1.},
+                {"ONLY_TRANSMIT", 0., 1., .99, 0, 2, 1.},
+                {"BOTH_BLACK", 0., 0., .33, 0, 0, 0.},
+                {"TIR_BLOCKED_TRANSMIT", .6, 0., .0, 1, 1, 1.},
+                {"TIR_BLACK_REFLECT", 0., 0., .0, 1, 0, 0.},
+                {"NEAR_BOUNDARY", .5, .5, .500001, 0, 1, .5}
+            };
+            unsigned pass15it=0u, fail15it=0u;
+            for (unsigned i15it=0; i15it<sizeof(cases15it)/sizeof(cases15it[0]); ++i15it) {
+                const MLHeroPolicyFixture15it &c15it=cases15it[i15it];
+                const bool r15it=c15it.reflection>0., t15it=c15it.transmission>0.;
+                const double threshold15it= !r15it ? (t15it ? 1. : -1.) :
+                    (!t15it ? 0. : std::min(.75,std::max(.25,
+                        c15it.transmission/(c15it.reflection+c15it.transmission))));
+                const unsigned event15it=threshold15it<0. ? 0u :
+                    (c15it.u<threshold15it ? 2u : 1u);
+                const double pdf15it=event15it==0u ? 0. :
+                    (event15it==2u ? threshold15it : 1.-threshold15it);
+                const bool ok15it=event15it==c15it.expectedEvent &&
+                    fabs(pdf15it-c15it.expectedPdf)<1.e-12 &&
+                    (!c15it.tir || event15it!=2u);
+                if (ok15it) ++pass15it; else ++fail15it;
+                fprintf(f,"phase15it SELECTION_POLICY_FIXTURE id=%u tag=%s "
+                    "u=%.9g reflectFilter=%.9g transmitFilter=%.9g tirFlag=%u "
+                    "threshold=%.9g event=%u pdf=%.9g expectedEvent=%u "
+                    "expectedPdf=%.9g pass=%u actualNativeSample=0 physicsChanged=0\n",
+                    i15it,c15it.tag,c15it.u,c15it.reflection,c15it.transmission,
+                    c15it.tir,threshold15it,event15it,pdf15it,c15it.expectedEvent,
+                    c15it.expectedPdf,ok15it?1u:0u);
+            }
+            fprintf(f,"phase15it SELECTION_POLICY_SUMMARY pass=%u fail=%u total=%u "
+                "nativeSampleVerified=0 childRays=0 physicsChanged=0\n",
+                pass15it,fail15it,(unsigned)(sizeof(cases15it)/sizeof(cases15it[0])));
+            fprintf(f, "phase15iq PHASE_A_FIXTURE_CONFIG scope=analytic_dielectric_event_mass "
+                "reversedIOR=1 tirCriticalBoundary=1 nonNeutralKrKt=1 zeroLobeCases=1 "
+                "reference=separate_double_equations materialTextures=FIXTURE_ONLY "
+                "nativeChildVerified=0 childRays=0 filmChanged=0 misChanged=0 rrChanged=0 physicsChanged=0\n");
+            struct MLHeroFixture15iq {
+                double ni, nt, angle, kr, kt;
+                unsigned expectedTIR;
+                const char *tag;
+            };
+            // n=1.5 -> n=1 critical angle ~41.810315 degrees.
+            const MLHeroFixture15iq fixtures15iq[] = {
+                {1., 1.5, 0., 1., 1., 0u, "AIR_NORMAL"},
+                {1., 1.5, 65., .2, .8, 0u, "AIR_NONNEUTRAL"},
+                {1.5, 1., 0., .8, .2, 0u, "EXIT_NORMAL_NONNEUTRAL"},
+                {1.5, 1., 40., .25, 1., 0u, "BELOW_CRITICAL"},
+                {1.5, 1., 41.8, .6, .3, 0u, "NEAR_BELOW_CRITICAL"},
+                {1.5, 1., 41.82, .6, .3, 1u, "NEAR_ABOVE_CRITICAL"},
+                {1.5, 1., 50., .6, .3, 1u, "TIR_NONNEUTRAL"},
+                {1.5, 1., 60., 1., 1., 1u, "TIR_NEUTRAL"},
+                {1., 1.5, 35., 0., 1., 0u, "ONLY_TRANSMIT"},
+                {1., 1.5, 35., 1., 0., 0u, "ONLY_REFLECT"},
+                {1., 1.5, 35., 0., 0., 0u, "BOTH_BLACK"}
+            };
+            const double pi15iq = 3.1415926535897932384626433832795;
+            unsigned pass15iq = 0, fail15iq = 0, tirFixtures15iq = 0;
+            for (unsigned i15iq = 0; i15iq < sizeof(fixtures15iq)/sizeof(fixtures15iq[0]); ++i15iq) {
+                const MLHeroFixture15iq &a15iq = fixtures15iq[i15iq];
+                const double ci15iq = cos(a15iq.angle * pi15iq / 180.);
+                const double sin2t15iq = (a15iq.ni / a15iq.nt) *
+                    (a15iq.ni / a15iq.nt) * (1. - ci15iq * ci15iq);
+                const bool tir15iq = sin2t15iq >= 1.;
+                const double ct15iq = tir15iq ? 0. : sqrt(std::max(0., 1. - sin2t15iq));
+                double fresnel15iq = 1.;
+                if (!tir15iq) {
+                    const double rsNum15iq = a15iq.ni * ci15iq - a15iq.nt * ct15iq;
+                    const double rsDen15iq = a15iq.ni * ci15iq + a15iq.nt * ct15iq;
+                    const double rpNum15iq = a15iq.nt * ci15iq - a15iq.ni * ct15iq;
+                    const double rpDen15iq = a15iq.nt * ci15iq + a15iq.ni * ct15iq;
+                    const double rs15iq = rsNum15iq / rsDen15iq;
+                    const double rp15iq = rpNum15iq / rpDen15iq;
+                    fresnel15iq = .5 * (rs15iq * rs15iq + rp15iq * rp15iq);
+                }
+                // Fixture convention: eye importance uses eta^2, light uses
+                // abs(cosIncident/cosTransmitted). These are intentionally
+                // compared side-by-side, not against native sample PDF.
+                for (unsigned light15iq = 0; light15iq < 2u; ++light15iq) {
+                    const double geometry15iq = tir15iq ? 0. :
+                        (light15iq ? ci15iq / ct15iq :
+                         (a15iq.ni / a15iq.nt) * (a15iq.ni / a15iq.nt));
+                    const double wr15iq = a15iq.kr * fresnel15iq;
+                    const double wt15iq = a15iq.kt * (1. - fresnel15iq) * geometry15iq;
+                    const bool hasR15iq = wr15iq > 0.;
+                    const bool hasT15iq = wt15iq > 0.;
+                    const double raw15iq = hasR15iq && hasT15iq ? wt15iq / (wr15iq + wt15iq) : -1.;
+                    const double pt15iq = !hasR15iq ? (hasT15iq ? 1. : -1.) :
+                        !hasT15iq ? 0. : std::min(.75, std::max(.25, raw15iq));
+                    const double pr15iq = pt15iq >= 0. ? 1. - pt15iq : -1.;
+                    const bool validMass15iq = pt15iq >= 0. &&
+                        fabs(pr15iq + pt15iq - 1.) < 1.e-12;
+                    const bool expectedBlack15iq = a15iq.kr == 0. && a15iq.kt == 0.;
+                    const bool passCase15iq = tir15iq == (a15iq.expectedTIR != 0u) &&
+                        validMass15iq == !expectedBlack15iq &&
+                        (!tir15iq || wt15iq == 0.) &&
+                        (!tir15iq || !hasR15iq || pr15iq == 1.) &&
+                        (!expectedBlack15iq || (pr15iq == -1. && pt15iq == -1.));
+                    if (passCase15iq) ++pass15iq; else ++fail15iq;
+                    if (tir15iq) ++tirFixtures15iq;
+                    fprintf(f, "phase15iq ANALYTIC_MATERIAL_TIR_FIXTURE id=%u tag=%s side=%s "
+                        "ni=%.9g nt=%.9g angleDeg=%.9g kr=%.9g kt=%.9g "
+                        "sinT2=%.12g tir=%u expectedTIR=%u fresnel=%.12g "
+                        "transportGeometry=%.12g reflectWeight=%.12g transmitWeight=%.12g "
+                        "rawTransmit=%.12g reflectMass=%.12g transmitMass=%.12g "
+                        "massAvailable=%u pass=%u analyticOnly=1 nativeChildVerified=0 "
+                        "childRays=0 physicsChanged=0\n",
+                        i15iq, a15iq.tag, light15iq ? "LIGHT" : "EYE",
+                        a15iq.ni, a15iq.nt, a15iq.angle, a15iq.kr, a15iq.kt,
+                        sin2t15iq, tir15iq ? 1u : 0u, a15iq.expectedTIR,
+                        fresnel15iq, geometry15iq, wr15iq, wt15iq, raw15iq,
+                        pr15iq, pt15iq, validMass15iq ? 1u : 0u,
+                        passCase15iq ? 1u : 0u);
+                }
+            }
+            fprintf(f, "phase15iq ANALYTIC_FIXTURE_SUMMARY pass=%u fail=%u "
+                "tirCases=%u total=%u nativeChildVerified=0 childRays=0 physicsChanged=0\n",
+                pass15iq, fail15iq, tirFixtures15iq, pass15iq + fail15iq);
+
+            fprintf(f, "phase15gz WEIGHT_CONFIG source=GlassMaterial_EvaluateMLHeroDebugAtWaveLength sampleMultiplier=Kt_times_transport_div_parentPdf adjoint=child_direction_geometry_normal_ratio eventProposal=lanePdf_for_counterfactual onlyTwoPacketLanes=1 twoLaneMIS=NOT_IMPLEMENTED samplerOwnership=NOT_IMPLEMENTED normalizer=NOT_VALIDATED diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0\n");
+            fprintf(f, "phase15hc MIS_CONFIG scope=CPU_BIDIR_split2_diagnostic_only source=existing_SampleBSDF_specular_recurrence deltaPDF=discrete_event_probability notSolidAngleDensity=1 nextEventMeasure=SPECULAR_flag reverseNonDeltaPdf=NOT_AVAILABLE jointSpectralPathDensity=NOT_AVAILABLE lightEyeConnectionMIS=NOT_IMPLEMENTED packetEstimator=NOT_VALIDATED childRR=NOT_APPLIED physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            // 15hz independent fixed-angle fixtures: air -> nonabsorbing glass n=1.5.
+            // These are analytic Fresnel checks, not actual GlassMaterial evaluations.
+            const double fixtureDegrees15hz[] = {0., 30., 45., 60., 75.};
+            for (unsigned fi15hz = 0; fi15hz < 5u; ++fi15hz) {
+                const double angleRad15hz = fixtureDegrees15hz[fi15hz] *
+                    3.1415926535897932384626433832795 / 180.;
+                const double ci15hz = cos(angleRad15hz);
+                const double st15hz = sin(angleRad15hz) / 1.5;
+                const double ct15hz = sqrt(std::max(0., 1. - st15hz * st15hz));
+                const double rs15hz = (ci15hz - 1.5 * ct15hz) /
+                    (ci15hz + 1.5 * ct15hz);
+                const double rp15hz = (1.5 * ci15hz - ct15hz) /
+                    (1.5 * ci15hz + ct15hz);
+                const double reflection15hz = .5 * (rs15hz * rs15hz + rp15hz * rp15hz);
+                fprintf(f, "phase15hz PBRT_AIR_GLASS_FIXTURE angleDeg=%.6g "
+                    "nIncident=1 nTransmitted=1.5 thetaTransmittedDeg=%.12g "
+                    "reflectance=%.12g transmittance=%.12g energySum=%.12g "
+                    "reference=analytic_unpolarized_dielectric notMaterialSample=1 "
+                    "filmChanged=0 misChanged=0 rrChanged=0\n",
+                    fixtureDegrees15hz[fi15hz], asin(st15hz) *
+                    180. / 3.1415926535897932384626433832795,
+                    reflection15hz, 1. - reflection15hz, 1.);
+            }
+            // Phase A: completed glass audits are Current + Heavy, not default Current.
+            if (MLHeroCurrentHeavyDiagnosticsEnabled15cq()) {
+            fprintf(f, "phase15ii INTERNAL_GLASS_TIR_CONFIG instrumentedFile=src/slg/materials/glass.cpp "
+                "nativeCall=GlassMaterial_Sample nativeRefraction=EvalSpecularTransmission "
+                "reason0=kt_black_or_not_tested reason1=sinT2_ge_1 reason2=sinT2_lt_1 "
+                "selected=black_reflect_transmit counters=global_atomic perSample=thread_local "
+                "logDetailBudget=inherited_15ih noExtraBSDFCalls=1 noSamplerDraws=1 "
+                "diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15ih GLASS_SAMPLING_TIR_AUDIT_CONFIG scope=native_CPU_BIDIR_EYE_LIGHT_glass_sample "
+                "records=reflect_transmit_black_other input=actual_BSDF_Sample "
+                "internalRejectedTransmission=UNKNOWN internalTIR=UNKNOWN "
+                "blackNotAutomaticallyTIR=1 reflectNotAutomaticallyRejectedTransmit=1 "
+                "detailLimit=96_per_side thereafterPowersOfTwo=1 "
+                "noExtraBSDFCalls=1 noExtraSamplerDraws=1 noChangeToTransport=1 "
+                "requires_glass_cpp_hook_for_true_TIR_rejection=1 "
+                "diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            }
+            fprintf(f, "phase15ig BOUNDARY_IOR_TIR_SOURCE_CONFIG scope=second_glass_boundary "
+                "iorPrecedence=explicitTexture_else_hitpointVolume_else_air1 "
+                "compare=forward_boundary_sources_vs_material_helper_baseIOR "
+                "tirReference=spectralHelperEta_double_precision_Snell "
+                "sampledTransmissionOnly=1 independentSpectralIORFromVolume=0 "
+                "emptyStackNotAutomaticallyError=1 diagnosticOnly=1 "
+                "physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15if NESTED_SNELL_FRESNEL_CONFIG scope=second_glass_boundary "
+                "independentEquations=Snell_plus_unpolarized_Fresnel inputA=activeStackBaseIOR "
+                "inputB=LuxCoreSpectralHelperEta independentSpectralIOR=0 "
+                "measuredDirection=reconstructed_15hw shadingNormal=1 geometryReintersection=0 "
+                "fullyIndependentNestedReverseTransport=0 diagnosticsOnly=1 "
+                "physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15ie NESTED_REVERSE_MEDIUM_PAIR_CONFIG scope=second_glass_boundary "
+                "baseIOR=active_before_after_stack_at_forward_hit spectralIOR=existing_glass_helper "
+                "no_equating_base_to_dispersive_eta=1 reverseBSDF=rebuilt_15ib "
+                "no_new_wavelength_independent_transport=1 nestedTransportNotProven=1 "
+                "diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15id STACK_PRIORITY_IOR_CONFIG scope=four_captured_stacks_at_reverse_hit "
+                "checks=volume_priority_active_arbitration_per_volume_IOR_distinct_medium_ior "
+                "depth3plus_not_guaranteed=1 volumeIOR_read_at_reverseHitPoint=1 "
+                "not_proof_of_independent_medium_transport=1 noNewIntersection=1 "
+                "diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15ic REVERSE_IOR_SOURCE_CONFIG scope=rebuilt_reverse_second_ideal_glass "
+                "precedence=explicit_texture_else_hitpoint_volume_else_air1 "
+                "compares=independent_input_reads_vs_actual_GlassMaterial_helper_nc_ntBase "
+                "nestedMediaPriorityNotIndependentlyVerified=1 noNewIntersection=1 "
+                "diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15ib REBUILT_REVERSE_HITPOINT_CONFIG scope=second_ideal_glass_boundary "
+                "reverseBSDF=actual_BSDF_Init_synthetic_ray_same_triangle "
+                "reverseStack=postSecondTransmission "
+                "physicalIORIndependent=0 nestedMediaNotVerified=1 "
+                "diagnosticOnly=1 noNewSceneIntersection=1 physicalChildEnabled=0 "
+                "filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15ia REVERSE_GEOMETRY_STACK_CONFIG scope=second_ideal_glass_boundary "
+                "geometry=analytic_inverse_snell medium=independent_two_boundary_snapshot_15ht "
+                "crosschecks=eta_reciprocity_and_fresnel_and_stack "
+                "reverseHitPointIndependent=0 physicalIORFromStackQueried=0 "
+                "nestedMediaIORNotVerified=1 notForMIS=1 diagnosticOnly=1 "
+                "physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15hz PBRT_REFERENCE_CONFIG independentEquation=unpolarized_Fresnel "
+                "fixtureIOR=1_to_1.5 fixtureAngles=0_30_45_60_75 "
+                "pathIOR=from_LuxCore_helper independentHitPoint=0 "
+                "pdfAndBSDFEstimatorNotYetValidated=1 diagnosticOnly=1 "
+                "physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15hy ACTUAL_KR_KT_CONFIG source=GlassMaterial_GetKr_GetKt_Spectrum_Filter branchMass=realKrF_vs_KtTransport thinFilm=unsupported_when_positive reverseHitPoint=copy notForMIS=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15hx EVENT_MASS_CONFIG neutralKrKtOneProxy=1 forwardReverseFresnelTransportClamp025075=1 actualKrKtNotQueried=1 helperMassIsGroundTruth=1 reverseHitPointIndependent=0 notForMIS=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15hw CHILD_SNELL_CONFIG scope=second_ideal_glass_exit childSpecificDirection=independent_snell_reconstruction reverseMaterialHelper=copyOnly noNewSampling=1 reverseHitPointIndependent=0 notForMIS=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15hv EXIT_DIRECTION_CONFIG scope=second_ideal_glass_exit vectorAudit=forwardFixed_forwardSampled_reverseFixed_reverseTarget normals=geometry_and_shading snellResidual=diagnostic_only noNewBSDFCalls=1 noExtraSampling=1 reverseHitPointIndependent=0 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15hu EXIT_REVERSE_MASS_CONFIG scope=second_ideal_glass_exit sampled_transmission_only=1 copied_reverse_BSDF=1 material_helper_direct=1 reverseHitPointIndependent=0 jointSpectralMISNotImplemented=1 noExtraSampling=1 diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15ht REVERSE_STACK_CONFIG reverseOrder=second_boundary_then_first_boundary source=independent_ordered_PathVolumeInfo_snapshots sampledTransmissionOnly=1 reverseHitPointNotBuilt=1 noPhysicalChild=1 noTransportChange=1 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15hs EXIT_SPECTRAL_CONFIG probe=first_accepted_postglass_hit secondMaterial=GlassMaterial_only sampledTransmitOnly=1 etaReciprocalConditionalOnMatchedMedia=1 noNewSamplerDraws=1 noTransportChange=1 childSplittingActive=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15hr MATERIAL_IOR_CONFIG source=GlassMaterial_public_GetInteriorIOR_GetExteriorIOR second=first_accepted_postglass_surface materialSelectionReadOnly=1 noSecondGlassSample=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15hq HITPOINT_IOR_CONFIG source=material.cpp_ExtractInteriorIors_ExtractExteriorIors precedence=materialIORTexture_then_hitPointVolume_then_1 materialIORTexturePresenceNotQueried=1 diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15hp INTERIOR_IOR_CONFIG source=GlassMaterial_debug_plus_GetMaterialInteriorVolume_IORTextureAtForwardHitPoint origin=numeric_match_not_callsite_proof noNewBSDFEvaluations=1 nestedMediaUnverified=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15ho SPECTRAL_IOR_CONFIG source=GlassMaterial_debug_plus_15hn_ObservedVolumeIOR restoredCrosscheck=1 noNewBSDFEvaluations=1 diagnosticOnly=1 notForMIS=1 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15hm REVERSE_MEDIUM_CONFIG scope=CPU_BIDIR_split2_diagnostic_only state=local_child_volume_stack_vs_reverse_BSDF_copy eta=inverse_forward_vs_reverse_material_probe fullReverseHitPoint=NOT_REBUILT stackPhysicalIOR=NOT_QUERIED nestedMedia=NOT_VERIFIED notForMIS=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15hl REVERSE_GLASS_DIRECT_COPY_CONFIG scope=CPU_BIDIR_split2_diagnostic_only source=GlassMaterial_EvaluateMLHeroDebugAtWaveLength localBSDFCopy=1 swapTraversalDirections=1 toggleFromLight=1 copiedHitPointTexturesQueried=1 reverseVolumeStackNotRebuilt=1 reverseMediumIORNotVerified=1 compareConditional15hkBounds=1 actualReversePathBSDFNotValidated=1 notForMIS=1 childPhysicsChanged=0 filmChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15hk REVERSE_INTERVAL_CONFIG scope=CPU_BIDIR_split2_diagnostic_only forwardClamp=inversion_as_odds_interval reverseOdds=forwardOdds_times_transportRatio boundTo025_075=1 conditionalOnSameKrKtFilmTextures=1 reverseBSDFNotQueried=1 reverseMassNotConfirmed=1 MISUnchanged=1 physicalChildEnabled=0 filmChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15hj REVERSE_TRANSPORT_CONFIG scope=CPU_BIDIR_split2_diagnostic_only forwardEye=1minusF_timesEtaSquared forwardLight=1minusF_timesCosIncidentOverCosRefracted reverseTraversal=oppositeSide_and_inverseEta conditionalOdds=onlyIfUnclamped_andSameKrKt reverseTextures=NOT_EVALUATED film=NOT_EVALUATED reverseEventMass=NOT_AVAILABLE proxyNotMIS=1 diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15hi GLASS_SAMPLING_CONFIG scope=CPU_BIDIR_split2_diagnostic_only source=GlassMaterial_Sample_and_EvaluateMLHeroDebugAtWaveLength samplingMass=KrF_KtTransport_filter_clamped025_075 whenBothLobesPresent reverseKrKt=NOT_EVALUATED reverseEventMass=NOT_AVAILABLE comparison=FresnelOnlyProxy_and_ParentSample massMeasure=DISCRETE diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15hh REVERSE_FRESNEL_CONFIG scope=CPU_BIDIR_split2_diagnostic_only reverseEta=inverse_forwardEta reverseAngle=Snell analyticFresnel=unpolarized_dielectric reverseBSDFMass=NOT_AVAILABLE proxyNotMIS=1 noAdditionalSamplerCalls=1 physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15hg EDGE_GEOMETRY_CONFIG scope=CPU_BIDIR_split2_diagnostic_only segment=first_to_second omegaToArea=landing_abs_geom_cos_over_distance_squared onlyNonDeltaCanBecomeContinuousAreaDensity=1 deltaMassConversion=FORBIDDEN secondReversePdfNotReverseEdge=1 reverseDeltaMass=NOT_AVAILABLE reverseEdgeMIS=NOT_AVAILABLE physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15hf PDF_CHAIN_CONFIG scope=CPU_BIDIR_split2_diagnostic_only stages=glass_delta_first_postglass_second_surface eventMeasures=EXPLICIT mixedMeasureProduct=DIAGNOSTIC_ONLY fullJointPdf=NOT_AVAILABLE reverseDeltaMass=NOT_AVAILABLE spectralSelection=NOT_INCLUDED geometricJacobians=NOT_INCLUDED childRR=NOT_APPLIED connectionMIS=NOT_IMPLEMENTED physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15hd MIS_PDF_CONFIG scope=CPU_BIDIR_split2_diagnostic_only source=childBSDF.Pdf(sampledDir,direct,reverse)_for_NonDelta only deltaPdfMeasure=DISCRETE nonDeltaPdfMeasure=SOLID_ANGLE nativeRecurrence=SampleBSDF_nonSpecularFormulation sampledForwardPdfUnchanged=1 queriedForwardPdfAuditOnly=1 reversePdfForNonDelta=QUERIED_WHEN_PRESENT spectralMIS=NOT_IMPLEMENTED childRR=NOT_APPLIED physicalChildEnabled=0 filmChanged=0 misChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15hb SAMPLER_CONFIG scope=CPU_BIDIR_child_diagnostics_only stream=SplitMix64_derived_counter_state baseSeed=renderSeed_plus_side_ticket_lane perChildMutableCounter=1 drawsPerChild=3 nextBSDFDrawsFromChildStream=1 rrDraw=PREVIEW_NOT_APPLIED productionSamplerConsumed=0 deterministicWithinAssignedTicket=1 ticketOrderMayVaryAcrossThreads=1 unbiasedPathEstimator=NOT_VALIDATED childMIS=NOT_IMPLEMENTED physicalChildEnabled=0 filmChanged=0 rrChanged=0\n");
+            fprintf(f, "phase15ha SELECTION_CONFIG design=shared_u0_plus_stratified_offsets fixedChildIndices=0_and_N_over_2 pairIndexRandomized=0 packetEstimator=mean_over_N pairEstimator=pure_wavelength_candidate_mean_over_2 conditionalUniformityAssumption=1 quarterCyclingMayCorrelateSamples=1 childBSDFDebugSamples=local_15hb_counter noProductionChildSampler=noMIS unbiasedPathEstimator=NOT_VALIDATED diagnosticOnly=1 physicalChildEnabled=0 filmChanged=0 rrChanged=0\n");
 			fprintf(f, "ML HERO phase 15bz CONFIG: path.mlhero.glassperlaneweight=%u\n", engine->mlHeroGlassPerLaneWeight ? 1u : 0u);
 			fprintf(f, "ML HERO phase 15bz CONFIG: path.mlhero.quartercycling=%u\n", engine->mlHeroQuarterCycling ? 1u : 0u);
 			fprintf(f, "ML HERO phase 15bz CONFIG: path.mlhero.dualterminationcompensation=%u\n", engine->mlHeroDualTerminationCompensation ? 1u : 0u);
@@ -8475,6 +15680,41 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 		}
 	}
 	
+}
+
+void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
+#ifndef NDEBUG
+	SLG_LOG("[BiDirCPURenderThread::" << threadIndex << "] Rendering thread started");
+#endif
+
+	//--------------------------------------------------------------------------
+	// Initialization
+	//--------------------------------------------------------------------------
+
+	// This is really used only by Windows for 64+ threads support
+	SetThreadGroupAffinity(threadIndex);
+
+	BiDirCPURenderEngine *engine = (BiDirCPURenderEngine *)renderEngine;
+    MLHeroResetGlassDiagnosticThreadState15kd();
+    slg::mlhero15ki::ResetThread();
+    slg::mlhero15ko::ResetThread();
+    mlHeroThread15fw=threadIndex;
+    slg::mlhero15kv::WorkerScope surfaceScope15kv(engine->GetType()==BIDIRCPU&&engine->mlHeroEnabled&&
+        MLHeroCurrentDiagnosticsEnabled15cq(),MLHeroSurfaceReport15kv);
+    slg::mlhero15la::WorkerScope schlickScope15la(engine->GetType()==BIDIRCPU&&engine->mlHeroEnabled&&
+        MLHeroCurrentDiagnosticsEnabled15cq(),MLHeroSchlickReport15la);
+    slg::mlhero15kg::ResetThread(engine->GetType() == BIDIRCPU &&
+        MLHeroCurrentDiagnosticsEnabled15cq());
+
+
+// 15fh BEGIN diagnostic-only
+    // 15jf: the old 15fh/15fj/15fk/15fn/15fq/15fr family is LEGACY.
+    // Keep diagnostic calculations and reporting available when explicitly enabled;
+    // do not flood Current-only native-child audit logs.
+    MLHeroReset15fh(engine->mlHeroEnabled && engine->mlHeroWavelengthCount>1 &&
+        engine->mlHeroDiagnostics && engine->mlHeroLegacyDiagnostics);
+// 15fh END
+
 	// (engine->seedBase + 1) seed is used for sharedRndGen
 
 	auto rndGen = std::make_unique<RandomGenerator>(engine->seedBase + 1 + threadIndex);
@@ -8538,7 +15778,7 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 		const float timeSample = sampler->GetSample(12);
 		const float time = scene.GetCamera().GenerateRayTime(timeSample);
 
-		SetMLHeroEnabled(engine->mlHeroEnabled);
+		::SetMLHeroEnabled(engine->mlHeroEnabled);
 		mlHeroRoughGlassFresnelImportance = engine->mlHeroRoughGlassFresnelImportanceConfig;
 		// ML HERO phase 15u:
 		// When HERO is disabled, force the shared packet state back to one lane.
@@ -8627,7 +15867,7 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 					mlWaveLength = Lerp(mlU, 380.f, 780.f);
 
 				if (lane == 0)
-					SetMLDispersionWaveLength(mlWaveLength, mlSampleWeight);
+					::SetMLDispersionWaveLength(mlWaveLength, mlSampleWeight);
 				else
 					SetMLHeroWaveLengthAt(lane, mlWaveLength, mlSampleWeight);
 			}
@@ -8690,6 +15930,7 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 			//------------------------------------------------------------------
 
 			PathVertexVM eyeVertex;
+            MLHeroParentPathEnd15ke endEye15ke(eyeVertex, 0u);
 			SampleResult &eyeSampleResult = AddResult(sampleResults, false);
 
 			eyeSampleResult.filmX = sampler->GetSample(0);
@@ -8716,9 +15957,14 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 			}
 			float cameraPdfW;
 			scene.GetCamera().GetPDF(eyeRay, 0.f, eyeSampleResult.filmX, eyeSampleResult.filmY, &cameraPdfW, nullptr);
+            if(engine->GetType()==slg::BIDIRCPU && engine->mlHeroEnabled && MLHeroCurrentDiagnosticsEnabled15cq())MLHeroPathStart15kq(eyeVertex,0u,eyeRay.o,cameraPdfW,0.,1.,(unsigned)scene.GetCamera().GetType());
 			eyeVertex.dVCM = MIS(1.f / cameraPdfW);
 			eyeVertex.dVC = 0.f;
 			eyeVertex.dVM = 0.f;
+            if(engine->GetType()==slg::BIDIRCPU && MLHeroCurrentDiagnosticsEnabled15cq()) {
+                slg::mlhero15km::Inputs i;i.forward=cameraPdfW;
+                MLHeroMISTransition15km(slg::mlhero15km::EyeInit,0u,{},eyeVertex,i);
+            }
 
 			bool albedoToDo = true;
 			eyeSampleResult.albedo = Spectrum(); // Just in case albedoToDo is never true
@@ -8802,11 +16048,34 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 					t_MIS = eyeRayHit.t;
 				}
 
+                if(eyeVertex.mlHeroPathFactors15kq.selected)MLHeroPathArrival15kq(eyeVertex);
+                const bool auditGeometry15km=engine->GetType()==slg::BIDIRCPU && MLHeroCurrentDiagnosticsEnabled15cq();
+                const slg::mlhero15km::State beforeGeometry15km=auditGeometry15km?
+                    slg::mlhero15km::State(eyeVertex.dVCM,eyeVertex.dVC,eyeVertex.dVM):slg::mlhero15km::State();
+                if(engine->GetType()==slg::BIDIRCPU && engine->mlHeroEnabled) {
+                    const slg::mlhero15kn::State a(eyeVertex.dVCM,eyeVertex.dVC,eyeVertex.dVM);
+                    const double cosine=slg::mlhero15kn::AbsDot(eyeVertex.bsdf.hitPoint.shadeN,eyeVertex.bsdf.hitPoint.fixedDir);
+                    const auto precise=slg::mlhero15kn::Geometry(a,cosine,t_MIS,true);
+                    const auto rounded=precise.Rounded();
+                    eyeVertex.dVCM=rounded.cm;eyeVertex.dVC=rounded.vc;eyeVertex.dVM=rounded.vm;
+                    if(auditGeometry15km) {
+                        const float oldCosine=AbsDot(eyeVertex.bsdf.hitPoint.shadeN,eyeVertex.bsdf.hitPoint.fixedDir);
+                        const auto legacy=slg::mlhero15kn::LegacyGeometry(a,oldCosine,t_MIS,true,true);
+                        MLHeroMISPrecisionAudit15kn(slg::mlhero15kn::EyeGeometry,eyeVertex,a,legacy,precise,
+                            oldCosine,cosine,0.f,0.f,t_MIS);
+                    }
+                } else {
 				// Update MIS constants
 				const float factor = 1.f / MIS(AbsDot(eyeVertex.bsdf.hitPoint.shadeN, eyeVertex.bsdf.hitPoint.fixedDir));
 				eyeVertex.dVCM *= MIS(t_MIS * t_MIS) * factor;
 				eyeVertex.dVC *= factor;
-				eyeVertex.dVM *= factor;
+				eyeVertex.dVM *= factor;                }
+
+                if(auditGeometry15km) {
+                    slg::mlhero15km::Inputs i;i.cosine=AbsDot(eyeVertex.bsdf.hitPoint.shadeN,eyeVertex.bsdf.hitPoint.fixedDir);
+                    i.distance=t_MIS;i.distanceApplied=true;
+                    MLHeroMISTransition15km(slg::mlhero15km::EyeGeometry,0u,beforeGeometry15km,eyeVertex,i);
+                }
 
 				// Check if it is a light source
 				if (eyeVertex.bsdf.IsLightSource() &&
@@ -8972,6 +16241,104 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 		FILE *f15cq = MLHeroOpenCurrentLog15cq("a");
 		if (f15cq) {
 			fprintf(f15cq, "------------------------------------------------------------\n");
+            for (unsigned side15ke=0u; side15ke<2u; ++side15ke) {
+                fprintf(f15cq, "phase15ke PARENT_HISTORY_SUMMARY side=%s selectedPaths=%llu records=%llu endedPaths=%llu mixedMaterialPaths=%llu depthGaps=%llu typedFailures=%llu truncatedPaths=%llu writeFailures=%llu\n",
+                    side15ke ? "LIGHT" : "EYE",
+                    std::min(mlHero15keTickets[side15ke].load(std::memory_order_relaxed),
+                        static_cast<unsigned long long>(slg::mlhero15ke::PathBudget)),
+                    mlHero15keRecords[side15ke].load(std::memory_order_relaxed),
+                    mlHero15keEnds[side15ke].load(std::memory_order_relaxed),
+                    mlHero15keMixed[side15ke].load(std::memory_order_relaxed),
+                    mlHero15keGaps[side15ke].load(std::memory_order_relaxed),
+                    mlHero15keInvalid[side15ke].load(std::memory_order_relaxed),
+                    mlHero15keTruncated[side15ke].load(std::memory_order_relaxed),
+                    mlHero15keWriteFailures[side15ke].load(std::memory_order_relaxed));
+            }
+            for (unsigned stage15kf=0u; stage15kf<3u; ++stage15kf) {
+                fprintf(f15cq, "phase15kf DIRECT_HIT_SUMMARY stage=%s events=%llu zeroHistoryCandidateRecoversNonfiniteMIS=%llu detailsWrittenAtMost=16 candidateApplied=0\n",
+                    MLHeroDirectHitStage15kf(stage15kf),
+                    mlHero15kfEvents[stage15kf].load(std::memory_order_relaxed),
+                    mlHero15kfZeroHistoryRecovered[stage15kf].load(std::memory_order_relaxed));
+            }
+            for(unsigned side15kq=0;side15kq<2;++side15kq)
+                fprintf(f15cq,"phase15kq PATH_FACTORS_SUMMARY side=%s candidateStartsTracked=%llu arrivals=%llu arrivalsWithIncompleteKnownFactors=%llu truncatedPrefixes=%llu writeFailures=%llu\n",
+                    side15kq?"LIGHT":"EYE",std::min(65536ull,mlHero15kqTickets[side15kq].load(std::memory_order_relaxed)),
+                    mlHero15kqArrivals[side15kq].load(std::memory_order_relaxed),mlHero15kqInvalid[side15kq].load(std::memory_order_relaxed),
+                    mlHero15kqTruncated[side15kq].load(std::memory_order_relaxed),mlHero15kqWriteFailures[side15kq].load(std::memory_order_relaxed));
+            slg::mlhero15la::WriteSummary(f15cq);
+            for(unsigned s15kx=0;s15kx<2;++s15kx)
+                fprintf(f15cq,"phase15kx SURFACE_RECOVERY_SUMMARY side=%s attempts=%llu recovered=%llu unrecoverable=%llu scope=DIAGNOSTIC_WORKERS_ONLY\n",
+                    s15kx?"LIGHT":"EYE",slg::mlhero15kx::counters[s15kx][0].load(std::memory_order_relaxed),
+                    slg::mlhero15kx::counters[s15kx][1].load(std::memory_order_relaxed),
+                    slg::mlhero15kx::counters[s15kx][2].load(std::memory_order_relaxed));
+            for(unsigned s15kv=0;s15kv<2;++s15kv)for(unsigned k15kv=0;k15kv<3;++k15kv)
+                fprintf(f15cq,"phase15kv SURFACE_ORIGIN_SUMMARY side=%s kind=%s events=%llu detailsSelected=%llu writeFailures=%llu\n",
+                    s15kv?"LIGHT":"EYE",MLHeroSurfaceKind15kv(k15kv),
+                    slg::mlhero15kv::events[s15kv][k15kv].load(std::memory_order_relaxed),
+                    std::min(16ull,slg::mlhero15kv::details[s15kv][k15kv].load(std::memory_order_relaxed)),
+                    slg::mlhero15kv::writeFailures[s15kv][k15kv].load(std::memory_order_relaxed));
+            for(unsigned s15ku=0;s15ku<2;++s15ku){
+                auto*c=mlHero15kuArrived[s15ku];
+                fprintf(f15cq,"phase15ku GLASS_FACTORS_SUMMARY side=%s arrivedGlassEdges=%llu matchedPairs=%llu invalidEdges=%llu missingEvidence=%llu forwardMismatches=%llu unsupportedReverse=%llu invalidMassOrRR=%llu otherDeltaEdges=%llu selection=FIRST_65536_ROOTS fullPathPdf=UNAVAILABLE nativeMISChanged=0\n",
+                    s15ku?"LIGHT":"EYE",c[0].load(std::memory_order_relaxed),c[1].load(std::memory_order_relaxed),
+                    c[2].load(std::memory_order_relaxed),c[3].load(std::memory_order_relaxed),c[4].load(std::memory_order_relaxed),
+                    c[5].load(std::memory_order_relaxed),c[6].load(std::memory_order_relaxed),mlHero15kuOtherDelta[s15ku].load(std::memory_order_relaxed));
+            }
+            for(unsigned s15kt=0;s15kt<2;++s15kt)for(unsigned t15kt=0;t15kt<2;++t15kt)for(unsigned in15kt=0;in15kt<2;++in15kt){
+                auto*counts=mlHero15ktStats[s15kt][t15kt][in15kt];
+                fprintf(f15cq,"phase15kt GLASS_REVERSE_SUMMARY side=%s event=%s incidence=%s attempted=%llu evaluated=%llu forwardReplayMismatches=%llu reverseSupportFailures=%llu reverseVsForwardDifferent=%llu invalidEvaluations=%llu zeroReverseMass=%llu writeFailures=%llu selection=FIRST_65536_ROOTS reverseRR=UNAVAILABLE nativeMISChanged=0\n",
+                    s15kt?"LIGHT":"EYE",t15kt?"TRANSMIT":"REFLECT",in15kt?"NEGATIVE_LOCAL_Z":"POSITIVE_LOCAL_Z",
+                    counts[0].load(std::memory_order_relaxed),counts[1].load(std::memory_order_relaxed),
+                    counts[2].load(std::memory_order_relaxed),counts[3].load(std::memory_order_relaxed),
+                    counts[4].load(std::memory_order_relaxed),counts[5].load(std::memory_order_relaxed),
+                    counts[6].load(std::memory_order_relaxed),mlHero15ktWriteFailures[s15kt].load(std::memory_order_relaxed));
+            }
+            for(unsigned side15ks=0;side15ks<2;++side15ks)
+                fprintf(f15cq,"phase15ks GLASS_MASS_SUMMARY side=%s completedSelectedGlassEdgesObserved=%llu nativeMassMismatches=%llu reverseMass=UNAVAILABLE\n",
+                    side15ks?"LIGHT":"EYE",mlHero15ksGlassObserved[side15ks].load(std::memory_order_relaxed),
+                    mlHero15ksMassMismatch[side15ks].load(std::memory_order_relaxed));
+            for(unsigned kind15kq=0;kind15kq<4;++kind15kq)
+                fprintf(f15cq,"phase15kq CONNECTION_FACTORS_SUMMARY kind=%u eligibleConnections=%llu detailsSelected=%llu\n",kind15kq,
+                    mlHero15kqConnections[kind15kq].load(std::memory_order_relaxed),std::min(16ull,mlHero15kqConnections[kind15kq].load(std::memory_order_relaxed)));
+            for(unsigned side15ko=0;side15ko<2;++side15ko)for(unsigned kind15ko=0;kind15ko<2;++kind15ko)
+                fprintf(f15cq,"phase15ko DIRECTION_SUMMARY side=%s kind=%s events=%llu windowsSelected=%llu writeFailures=%llu\n",
+                    side15ko?"LIGHT":"EYE",kind15ko?"INHERITED_INPUT_DRIFT":"UNIT_INPUT_STAGE_DRIFT",
+                    slg::mlhero15ko::events[side15ko][kind15ko].load(std::memory_order_relaxed),
+                    std::min(16ull,slg::mlhero15ko::details[side15ko][kind15ko].load(std::memory_order_relaxed)),
+                    slg::mlhero15ko::writeFailures[side15ko][kind15ko].load(std::memory_order_relaxed));
+            for(unsigned s15kn=0;s15kn<slg::mlhero15kn::StageCount;++s15kn)
+                for(unsigned side15kn=0;side15kn<2;++side15kn)
+                    fprintf(f15cq,"phase15kn MIS_PRECISION_SUMMARY stage=%s side=%s legacyNonfiniteUpdates=%llu recoveredFiniteUpdates=%llu actualNonfiniteUpdates=%llu roundedZeroCosineUpdates=%llu recoveredDetailsSelected=%llu remainingDetailsSelected=%llu writeFailures=%llu referenceScope=single_step_from_actual_history\n",
+                        slg::mlhero15kn::Name(s15kn),side15kn?"LIGHT":"EYE",
+                        mlHero15knLegacyBad[s15kn][side15kn].load(std::memory_order_relaxed),
+                        mlHero15knRecovered[s15kn][side15kn].load(std::memory_order_relaxed),
+                        mlHero15knActualBad[s15kn][side15kn].load(std::memory_order_relaxed),
+                        mlHero15knRoundedZero[s15kn][side15kn].load(std::memory_order_relaxed),
+                        std::min(16ull,mlHero15knDetails[s15kn][side15kn][0].load(std::memory_order_relaxed)),
+                        std::min(16ull,mlHero15knDetails[s15kn][side15kn][1].load(std::memory_order_relaxed)),
+                        mlHero15knWriteFailures[s15kn][side15kn].load(std::memory_order_relaxed));
+            for(unsigned stage15km=0;stage15km<slg::mlhero15km::StageCount;++stage15km)
+                for(unsigned side15km=0;side15km<2;++side15km)
+                    fprintf(f15cq,"phase15km MIS_TRANSITION_SUMMARY stage=%s side=%s newlyNonfiniteComponentUpdates=%llu inheritedNonfiniteUpdates=%llu newDetailsSelected=%llu inheritedDetailsSelected=%llu writeFailures=%llu diagnosticOnly=1\n",
+                        slg::mlhero15km::Name(stage15km),side15km?"LIGHT":"EYE",
+                        mlHero15kmNew[stage15km][side15km].load(std::memory_order_relaxed),
+                        mlHero15kmInherited[stage15km][side15km].load(std::memory_order_relaxed),
+                        std::min(16ull,mlHero15kmNewDetails[stage15km][side15km].load(std::memory_order_relaxed)),
+                        std::min(2ull,mlHero15kmInheritedDetails[stage15km][side15km].load(std::memory_order_relaxed)),
+                        mlHero15kmWriteFailures[stage15km][side15km].load(std::memory_order_relaxed));
+            fprintf(f15cq,"phase15kl FRAME_DETAIL_SUMMARY extraEye=%llu extraLight=%llu maxExtraPerSide=16 countersResetBeforeWorkers=1\n",
+                slg::mlhero15kl::extraFrameDetails[0].load(std::memory_order_relaxed),
+                slg::mlhero15kl::extraFrameDetails[1].load(std::memory_order_relaxed));
+            for(unsigned c15ki=0;c15ki<4;++c15ki)
+                fprintf(f15cq,"phase15ki ROUGH_PRECISION_SUMMARY case=%u controlSelected=%llu error1to5PercentSelected=%llu error5PercentPlusSelected=%llu diagnosticOnly=1\n",c15ki,
+                    slg::mlhero15ki::selected[c15ki][0].load(std::memory_order_relaxed),
+                    slg::mlhero15ki::selected[c15ki][1].load(std::memory_order_relaxed),
+                    slg::mlhero15ki::selected[c15ki][2].load(std::memory_order_relaxed));
+            fprintf(f15cq, "phase15kh POLAR_PDF_SUMMARY roundedPolarRecovered=%llu exactPolePdfZero=%llu invalidDirectionPdfZero=%llu rejectedSampleEndpoints=%llu countersDiagnosticOnly=1\n",
+                slg::mlhero15kh::roundedPolarRecovered.load(std::memory_order_relaxed),
+                slg::mlhero15kh::exactPolePdfZero.load(std::memory_order_relaxed),
+                slg::mlhero15kh::invalidDirectionPdfZero.load(std::memory_order_relaxed),
+                slg::mlhero15kh::rejectedSampleEndpoints.load(std::memory_order_relaxed));
 			fprintf(f15cq, "ML HERO phase 15ct CURRENT DIAGNOSTICS SUMMARY heavy=%u\n", mlHeroHeavyDiagnostics15cq.load(std::memory_order_relaxed) ? 1u : 0u);
 // 15fb BEGIN
             MLHeroSummary15fb(f15cq);
@@ -10500,7 +17867,7 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 	}
 
 // 15fh BEGIN diagnostic-only
-    if(MLHeroCurrentDiagnosticsEnabled15cq()) {
+    if(MLHeroLegacyDiagnosticsEnabled15cq()) {
         std::lock_guard<std::recursive_mutex> lock15fh(mlHeroDebugLogMutex);
         FILE*f15fh=MLHeroOpenAnyLog15gj("a");
         if(f15fh){

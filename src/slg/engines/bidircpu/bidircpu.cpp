@@ -84,6 +84,7 @@ void BiDirCPURenderEngine::StartLockLess() {
 	mlHeroSamplingMode = Clamp(cfg.Get(GetDefaultProps()->Get("path.mlhero.samplingmode")).Get<int>(), 1, 3);
 	mlHeroWavelengthCount = Clamp(cfg.Get(GetDefaultProps()->Get("path.mlhero.wavelengthcount")).Get<int>(), 1, 8);
 	mlHeroGlassMode = (cfg.Get(GetDefaultProps()->Get("path.mlhero.glassmode")).Get<int>() == 1) ? 1 : 0; // 15gj: unsupported/legacy mode 2 -> Standard (0)
+    mlHeroSplittingRequested15gl = mlHeroEnabled && (mlHeroWavelengthCount > 1) && cfg.Get(GetDefaultProps()->Get("path.mlhero.splitting.enable")).Get<bool>(); // requested only; no transport branching
 	mlHeroGlassPerLaneWeight = cfg.Get(GetDefaultProps()->Get("path.mlhero.glassperlaneweight")).Get<bool>();
 	mlHeroQuarterCycling = cfg.Get(GetDefaultProps()->Get("path.mlhero.quartercycling")).Get<bool>();
 	mlHeroDualTerminationCompensation = cfg.Get(GetDefaultProps()->Get("path.mlhero.dualterminationcompensation")).Get<bool>();
@@ -167,7 +168,18 @@ void BiDirCPURenderEngine::StartLockLess() {
 
 	SetSampleSplatter(std::make_unique<FilmSampleSplatter>(GetPixelFilter()));
 
+	// 15kd: initialize once on the coordinator, before worker creation.
+	if (GetType() == BIDIRCPU)
+		PrepareMLHeroDiagnostics15kd();
+
 	CPUNoTileRenderEngine::StartLockLess();
+}
+
+// BeginSceneEdit has stopped and joined every CPU worker before this call.
+void BiDirCPURenderEngine::EndSceneEditLockLess(const EditActionList &editActions) {
+	if (GetType() == BIDIRCPU)
+		PrepareMLHeroDiagnostics15kd();
+	CPUNoTileRenderEngine::EndSceneEditLockLess(editActions);
 }
 
 void BiDirCPURenderEngine::InitFilm() {
@@ -209,6 +221,7 @@ PropertiesUPtr BiDirCPURenderEngine::ToProperties(const Properties &cfg) {
 			cfg.Get(GetDefaultProps()->Get("path.mlhero.samplingmode")) <<
 			cfg.Get(GetDefaultProps()->Get("path.mlhero.wavelengthcount")) <<
 			cfg.Get(GetDefaultProps()->Get("path.mlhero.glassmode")) <<
+            cfg.Get(GetDefaultProps()->Get("path.mlhero.splitting.enable")) <<
 			cfg.Get(GetDefaultProps()->Get("path.mlhero.glassperlaneweight")) <<
 			cfg.Get(GetDefaultProps()->Get("path.mlhero.quartercycling")) <<
 			cfg.Get(GetDefaultProps()->Get("path.mlhero.dualterminationcompensation")) <<
@@ -249,6 +262,7 @@ PropertiesUPtr BiDirCPURenderEngine::GetDefaultProps() {
 		Property("path.mlhero.samplingmode")(1) <<
 		Property("path.mlhero.wavelengthcount")(1) <<
 		Property("path.mlhero.glassmode")(0) <<
+        Property("path.mlhero.splitting.enable")(false) <<
 		Property("path.mlhero.glassperlaneweight")(true) <<
 		Property("path.mlhero.quartercycling")(true) <<
 		Property("path.mlhero.dualterminationcompensation")(false) <<

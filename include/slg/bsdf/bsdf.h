@@ -27,6 +27,7 @@
 #include "slg/lights/light.h"
 #include "slg/lights/trianglelight.h"
 #include "slg/materials/material.h"
+#include "slg/engines/mlhero_glass_reverse15kt.h"
 #include "slg/volumes/volume.h"
 #include "slg/bsdf/bsdfevents.h"
 #include "slg/bsdf/hitpoint.h"
@@ -146,6 +147,9 @@ public:
 	const luxrays::Spectrum &GetPassThroughShadowTransparency() const { return material->GetPassThroughShadowTransparency(); }
 	const bool &GetPassThroughShadowTransparencyOverride() const { return material->GetPassThroughShadowTransparencyOverride(); }
 	const luxrays::Frame &GetFrame() const { return frame; }
+
+    slg::mlhero15kt::Evidence EvaluateMLHeroGlassReverse15kt(const luxrays::Vector &sampled,
+            const BSDFEvent event,const float nativeForwardMass) const;
 
 	luxrays::Spectrum Albedo() const;
 	luxrays::Spectrum EvaluateTotal() const;

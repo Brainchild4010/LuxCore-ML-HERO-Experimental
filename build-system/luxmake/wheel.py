@@ -116,61 +116,49 @@ def _check_repairwheel():
 
 
 def _read_ml_hero_source_metadata():
-    """Read BUILD / PHASE / FEATURE from the active ML HERO engine source.
+    """Read the *single* authoritative ML HERO version header.
 
-    PATHCPU is checked first because current HERO builds are developed in
-    pathtracer.cpp. BIDIRCPU is retained as a compatibility fallback so older
-    wheels and Bidir-only checkpoints still get useful metadata.
+    Never silently put UNKNOWN into a release wheel: a missing/stale identity
+    must fail packaging so it is caught before deployment.
     """
-    candidates = (
-        PARAMS.SOURCE_DIR / "src" / "slg" / "engines" / "pathtracer.cpp",
-        PARAMS.SOURCE_DIR / "src" / "slg" / "engines" / "bidircpu" / "bidircputhread.cpp",
-    )
+    header = PARAMS.SOURCE_DIR / "include" / "slg" / "engines" / "mlhero_version.h"
+    if not header.is_file():
+        raise RuntimeError(f"ML HERO version header missing: {header}")
 
+    source = header.read_text(encoding="utf-8")
     define_map = {
         "build": "ML_HERO_BUILD",
         "phase": "ML_HERO_TEST_PHASE",
         "feature": "ML_HERO_FEATURE",
     }
-
-    for source_file in candidates:
-        if not source_file.is_file():
-            logger.warning("ML HERO metadata: source file not found: %s", source_file)
-            continue
-
-        try:
-            source = source_file.read_text(encoding="utf-8", errors="ignore")
-        except OSError as err:
-            logger.warning("ML HERO metadata: could not read %s: %s", source_file, err)
-            continue
-
-        result = {
-            "build": "UNKNOWN",
-            "phase": "UNKNOWN",
-            "feature": "UNKNOWN",
-        }
-        found = False
-
-        for key, define_name in define_map.items():
-            match = re.search(
-                rf'^\s*#\s*define\s+{re.escape(define_name)}\s+"([^"]*)"',
-                source,
-                flags=re.MULTILINE,
+    result = {}
+    for key, define_name in define_map.items():
+        matches = re.findall(
+            rf'^\s*#\s*define\s+{re.escape(define_name)}\s+"([^"\r\n]*)"\s*(?://[^\n]*)?$',
+            source,
+            flags=re.MULTILINE,
+        )
+        if len(matches) != 1 or not matches[0].strip():
+            raise RuntimeError(
+                f"ML HERO header must define {define_name} exactly once "
+                f"as a nonempty quoted string: {header}"
             )
-            if match:
-                result[key] = match.group(1)
-                found = True
+        result[key] = matches[0]
 
-        if found:
-            logger.info("ML HERO metadata source: %s", source_file)
-            return result
+    schemas = re.findall(
+        r'^\s*#\s*define\s+ML_HERO_IDENTITY_SCHEMA\s+(\d+)\s*(?://[^\n]*)?$',
+        source,
+        flags=re.MULTILINE,
+    )
+    if len(schemas) != 1:
+        raise RuntimeError(f"ML HERO identity schema missing/ambiguous: {header}")
+    result["schema"] = int(schemas[0])
+    if result["schema"] != 1:
+        raise RuntimeError(f"Unsupported ML HERO identity schema {result['schema']} in {header}")
 
-    logger.warning("ML HERO metadata: no BUILD / PHASE / FEATURE defines found")
-    return {
-        "build": "UNKNOWN",
-        "phase": "UNKNOWN",
-        "feature": "UNKNOWN",
-    }
+    logger.info("ML HERO metadata source: %s", header)
+    logger.info("ML HERO identity: %s / %s", result["build"], result["phase"])
+    return result
 
 
 def _read_ml_hero_compile_flags():
@@ -220,7 +208,8 @@ def _write_ml_hero_build_info(wheeltree, version, python_tag, platform_tag):
     source_metadata = _read_ml_hero_source_metadata()
 
     build_info = {
-        "schema": 1,
+        "schema": source_metadata["schema"],
+        "version_source": "include/slg/engines/mlhero_version.h",
         "project": "ML LuxCore HERO",
         "build": source_metadata["build"],
         "phase": source_metadata["phase"],

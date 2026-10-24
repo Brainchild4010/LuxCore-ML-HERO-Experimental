@@ -696,6 +696,7 @@ set(SLG_FILM_SRCS
   ${PROJECT_SOURCE_DIR}/src/slg/film/filters/mitchell.cpp
   ${PROJECT_SOURCE_DIR}/src/slg/film/filters/mitchellss.cpp
   ${PROJECT_SOURCE_DIR}/src/slg/film/filters/sinc.cpp
+  ${PROJECT_SOURCE_DIR}/src/slg/film/filters/lanczos.cpp
   ${PROJECT_SOURCE_DIR}/src/slg/film/imagepipeline/imagepipeline.cpp
   ${PROJECT_SOURCE_DIR}/src/slg/film/imagepipeline/imagepipelineserialization.cpp
   ${PROJECT_SOURCE_DIR}/src/slg/film/imagepipeline/radiancechannelscale.cpp

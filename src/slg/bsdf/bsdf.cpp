@@ -1,3 +1,5 @@
+#include "slg/engines/mlhero_metal_direction15ky.h"
+#include "slg/engines/mlhero_surface_recovery15kx.h"
 /***************************************************************************
  * Copyright 1998-2020 by authors (see AUTHORS.txt)                        *
  *                                                                         *
@@ -20,6 +22,11 @@
 #include "slg/scene/scene.h"
 #include "slg/materials/glass.h"
 #include "slg/materials/roughglass.h"
+#include "slg/engines/mlhero_rough_frame15kl.h"
+#include "slg/engines/mlhero_direction_trace15ko.h"
+#include "slg/engines/mlhero_volume_direction15kp.h"
+#include "slg/engines/mlhero_surface_trace15kv.h"
+extern thread_local bool mlHeroEnabled;
 #include <memory>
 #include <cmath>
 
@@ -41,6 +48,139 @@ using namespace luxrays;
 using namespace slg;
 using namespace std;
 
+// 15ky BEGIN: one local-direction convention for every CPU Metal2 wrapper.
+static float MLHeroMetalNG15ky(const Vector&v,const Normal&n,bool metal){
+    if(!mlHeroEnabled||!metal)return Dot(v,n);
+    using namespace slg::mlhero15kk;
+    return float(slg::mlhero15kk::Dot(Unit(V(v)),V(n)));
+}
+static float MLHeroMetalAbsNG15ky(const Vector&v,const Normal&n,bool metal){
+    return fabsf(MLHeroMetalNG15ky(v,n,metal));
+}
+static Vector MLHeroMetalLocal15ky(const Frame&f,const Vector&v,bool metal){
+    return mlHeroEnabled&&metal?slg::mlhero15ky::Local(f,v):f.ToLocal(v);
+}
+// 15ky END
+
+// 15kw BEGIN: read-only exceptional mesh audit; no extra texture or sampling calls.
+static void MLHeroRawNormals15kw(const HitPoint&hp,slg::mlhero15kv::Trace&t){
+    using slg::mlhero15kv::V;
+    const ExtTriangleMesh*base=nullptr;
+    const Transform*normalTransform=nullptr;
+    switch(hp.mesh->GetType()){
+        case TYPE_EXT_TRIANGLE:base=static_cast<const ExtTriangleMesh*>(hp.mesh.get());break;
+        case TYPE_EXT_TRIANGLE_INSTANCE:{
+            const auto*instance=static_cast<const ExtInstanceTriangleMesh*>(hp.mesh.get());
+            base=&instance->GetExtTriangleMesh();normalTransform=&instance->GetTransformation();break;
+        }
+        case TYPE_EXT_TRIANGLE_MOTION:
+            base=&static_cast<const ExtMotionTriangleMesh*>(hp.mesh.get())->GetExtTriangleMesh();
+            normalTransform=&hp.localToWorld;break;
+        default:return;
+    }
+    t.rawAvailable=true;t.rawNormals=base->HasNormals();t.transformApplied=normalTransform!=nullptr;
+    const Transform&tr=normalTransform?*normalTransform:Transform::TRANS_IDENTITY;
+    const auto matrix=tr.GetMatrix();
+    for(unsigned r=0;r<4;++r)for(unsigned c=0;c<4;++c){
+        t.matrix[r][c]=matrix.m[r][c];t.inverseMatrix[r][c]=tr.mInv.m[r][c];
+    }
+    const auto&triangle=base->GetTriangles()[hp.triangleIndex];
+    for(unsigned i=0;i<3;++i){
+        const unsigned vi=triangle.v[i];t.rawVertex[i]=V::From(base->GetVertices()[vi]);
+        if(t.rawNormals){
+            const Normal n=base->GetNormals()[vi];t.rawNormal[i]=V::From(n);
+            if(!t.rawNormal[i].Finite())t.rawNonfiniteMask|=1u<<i;
+            else if(t.rawNormal[i].Norm2()==0.)t.rawZeroMask|=1u<<i;
+            const Normal signedN=base->GetShadeNormal(Transform::TRANS_IDENTITY,hp.triangleIndex,i);
+            t.baseShade[i]=V::From(signedN);
+            t.preNormalize[i]=V::From(normalTransform?tr*signedN:signedN);
+        }
+    }
+    t.rawFaceCross=slg::mlhero15kv::Cross(t.rawVertex[1]-t.rawVertex[0],t.rawVertex[2]-t.rawVertex[0]);
+    if(t.rawNormals){
+        const float b1=hp.triangleBariCoord1,b2=hp.triangleBariCoord2,b0=1.f-b1-b2;
+        const Normal*ns=base->GetNormals();
+        const Normal blend=b0*ns[triangle.v[0]]+b1*ns[triangle.v[1]]+b2*ns[triangle.v[2]];
+        t.rawBlendFloat=V::From(blend);
+        t.rawBlendDouble=t.rawNormal[0]*(1.-t.b1-t.b2)+t.rawNormal[1]*t.b1+t.rawNormal[2]*t.b2;
+        const Normal n=base->InterpolateTriNormal(Transform::TRANS_IDENTITY,hp.triangleIndex,b1,b2);
+        t.baseInterpolated=V::From(n);
+        t.interpolatedPreNormalize=V::From(normalTransform?tr*n:n);
+    }
+}
+// 15kw END
+
+// 15kv BEGIN: invoked only for CPU HERO BIDIR workers with Current diagnostics.
+static void MLHeroSurfaceOrigin15kv(const HitPoint&hp,const Material&material,const Frame&frame,
+        const slg::mlhero15kv::Snapshot&before,const slg::mlhero15kv::V&beforeDndu,
+        const slg::mlhero15kv::V&beforeDndv,unsigned initKind,unsigned recoveryOutcome=0){
+    using namespace slg::mlhero15kv;
+    if(!reporter)return;
+    Trace t;t.recoveryOutcome=recoveryOutcome;t.side=hp.fromLight?1u:0u;t.initKind=initKind;t.before=before;t.after=Snapshot::From(hp);
+    t.frameX=V::From(frame.X);t.frameY=V::From(frame.Y);t.frameZ=V::From(frame.Z);
+    if(!Select(t))return;
+    t.materialID=material.GetID();t.materialType=(unsigned)material.GetType();t.materialName=material.GetName().c_str();
+    const auto bump=material.GetBumpTexture();t.bump=bool(bump);t.bumpDistance=material.GetBumpSampleDistance();
+    if(bump){t.bumpType=(unsigned)bump->GetType();t.bumpName=bump->GetName().c_str();}
+    t.position=V::From(hp.p);t.fixed=V::From(hp.fixedDir);t.triangle=hp.triangleIndex;t.objectID=hp.objectID;
+    t.b1=hp.triangleBariCoord1;t.b2=hp.triangleBariCoord2;
+    t.beforeDndu=beforeDndu;t.beforeDndv=beforeDndv;t.afterDndu=V::From(hp.dndu);t.afterDndv=V::From(hp.dndv);
+    if(hp.mesh){
+        MLHeroRawNormals15kw(hp,t);
+        t.meshType=(unsigned)hp.mesh->GetType();t.vertexNormals=hp.mesh->HasNormals();
+        const auto&tri=hp.mesh->GetTriangles()[hp.triangleIndex];
+        for(unsigned i=0;i<3;++i){
+            t.vertexIndex[i]=tri.v[i];t.vertex[i]=V::From(hp.mesh->GetVertex(hp.localToWorld,tri.v[i]));
+            if(t.vertexNormals)t.normal[i]=V::From(hp.mesh->GetShadeNormal(hp.localToWorld,hp.triangleIndex,i));
+        }
+        t.weightedNormal=t.normal[0]*(1.-t.b1-t.b2)+t.normal[1]*t.b1+t.normal[2]*t.b2;
+        t.faceCross=Cross(t.vertex[1]-t.vertex[0],t.vertex[2]-t.vertex[0]);
+    }
+    reporter(t);
+}
+// 15kv END
+
+// 15kx BEGIN: CPU HERO recovery for invalid interpolated surface normals.
+// Work on a copy: a bad geometry normal or failed basis leaves the hit unchanged.
+static bool MLHeroRecoverNormal15kx(HitPoint&hp){
+    using slg::mlhero15kv::V;using slg::mlhero15kv::BadAxis;
+    const V g=V::From(hp.geometryN);
+    if(BadAxis(g)||!hp.mesh)return false;
+    const double invLength=1./std::sqrt(g.Norm2());
+    const Normal flat(float(g.x*invLength),float(g.y*invLength),float(g.z*invLength));
+    if(BadAxis(V::From(flat)))return false;
+    HitPoint recovered=hp;
+    recovered.interpolatedN=flat;recovered.shadeN=flat;
+    // Preserve native UV tangent construction; invalid source-normal derivatives
+    // are replaced by zero because this fallback uses a locally flat normal.
+    recovered.mesh->GetDifferentials(recovered.localToWorld,recovered.triangleIndex,
+        flat,0,&recovered.dpdu,&recovered.dpdv,&recovered.dndu,&recovered.dndv);
+    recovered.dndu=Normal(0.f,0.f,0.f);recovered.dndv=Normal(0.f,0.f,0.f);
+    auto frameValid=[](const Frame&f){return !BadAxis(V::From(f.X))&&!BadAxis(V::From(f.Y))&&!BadAxis(V::From(f.Z));};
+    if(!V::From(recovered.dpdu).Finite()||!V::From(recovered.dpdv).Finite()||!frameValid(recovered.GetFrame())){
+        CoordinateSystem(Vector(flat),&recovered.dpdu,&recovered.dpdv);
+    }
+    if(!V::From(recovered.dpdu).Finite()||!V::From(recovered.dpdv).Finite()||!frameValid(recovered.GetFrame()))return false;
+    hp.interpolatedN=recovered.interpolatedN;hp.shadeN=recovered.shadeN;
+    hp.dpdu=recovered.dpdu;hp.dpdv=recovered.dpdv;hp.dndu=recovered.dndu;hp.dndv=recovered.dndv;
+    return true;
+}
+static void MLHeroGuardNormal15kx(HitPoint&hp,const Material&material,unsigned initKind){
+    using namespace slg::mlhero15kv;
+    if(!mlHeroEnabled||!BadAxis(V::From(hp.interpolatedN)))return;
+    const HitPoint original=hp;
+    const bool repaired=MLHeroRecoverNormal15kx(hp);
+    if(reporter){
+        const unsigned side=hp.fromLight?1u:0u;
+        slg::mlhero15kx::counters[side][0].fetch_add(1ull,std::memory_order_relaxed);
+        slg::mlhero15kx::counters[side][repaired?1:2].fetch_add(1ull,std::memory_order_relaxed);
+        // Report original evidence before recovery/material bump, with outcome.
+        if(repaired)MLHeroSurfaceOrigin15kv(original,material,original.GetFrame(),Snapshot::From(original),
+            V::From(original.dndu),V::From(original.dndv),initKind,repaired?1u:2u);
+    }
+}
+// 15kx END
+
 // Used when hitting a surface
 void BSDF::Init(
 		const bool fixedFromLight, const bool throughShadowTransparency,
@@ -61,6 +201,7 @@ void BSDF::Init(
 
 	// Get the material
 	material = &sceneObject->GetMaterial();
+    MLHeroGuardNormal15kx(hitPoint,*material,0u);
 
 	// Set interior and exterior volumes
 	volInfo->SetHitPointVolumes(hitPoint,
@@ -80,11 +221,16 @@ void BSDF::Init(
 	else
 		triangleLightSource = nullptr;
 
-	// Apply bump or normal mapping
+    const bool surfaceAudit15kv=mlHeroEnabled&&slg::mlhero15kv::reporter;
+    slg::mlhero15kv::Snapshot before15kv;slg::mlhero15kv::V dndu15kv,dndv15kv;
+    if(surfaceAudit15kv){before15kv=slg::mlhero15kv::Snapshot::From(hitPoint);
+        dndu15kv=slg::mlhero15kv::V::From(hitPoint.dndu);dndv15kv=slg::mlhero15kv::V::From(hitPoint.dndv);}
+	// Apply bump or normal mapping (15kv observed)
 	material->Bump(&hitPoint);
 
 	// Build the local reference system
 	frame = hitPoint.GetFrame();
+    if(surfaceAudit15kv)MLHeroSurfaceOrigin15kv(hitPoint,*material,frame,before15kv,dndu15kv,dndv15kv,0u);
 }
 
 // Used when have a point of a surface
@@ -114,6 +260,7 @@ void BSDF::Init(
 
 	// Get the material
 	material = &sceneObject->GetMaterial();
+    MLHeroGuardNormal15kx(hitPoint,*material,1u);
 
 	// Set interior and exterior volumes
 	volInfo->SetHitPointVolumes(hitPoint,
@@ -130,11 +277,16 @@ void BSDF::Init(
 	else
 		triangleLightSource = nullptr;
 
+    const bool surfaceAudit15kv=mlHeroEnabled&&slg::mlhero15kv::reporter;
+    slg::mlhero15kv::Snapshot before15kv;slg::mlhero15kv::V dndu15kv,dndv15kv;
+    if(surfaceAudit15kv){before15kv=slg::mlhero15kv::Snapshot::From(hitPoint);
+        dndu15kv=slg::mlhero15kv::V::From(hitPoint.dndu);dndv15kv=slg::mlhero15kv::V::From(hitPoint.dndv);}
 	// Apply bump or normal mapping
 	material->Bump(&hitPoint);
 
 	// Build the local reference system
 	frame = hitPoint.GetFrame();
+    if(surfaceAudit15kv)MLHeroSurfaceOrigin15kv(hitPoint,*material,frame,before15kv,dndu15kv,dndv15kv,1u);
 }
 
 // Used when hitting a volume scatter point
@@ -152,12 +304,12 @@ void BSDF::Init(
 	hitPoint.passThroughEvent = passThroughEvent;
 
 	hitPoint.p = ray(t);
-	hitPoint.fixedDir = -ray.d;
+	hitPoint.fixedDir = mlHeroEnabled ? slg::mlhero15kp::Normalize(-ray.d) : -ray.d;
 
 	sceneObject = nullptr;
 	material = &volume;
 
-	hitPoint.geometryN = Normal(-ray.d);
+	hitPoint.geometryN = Normal(hitPoint.fixedDir);
 	hitPoint.interpolatedN = hitPoint.geometryN;
 	hitPoint.shadeN = hitPoint.geometryN;
 
@@ -182,6 +334,14 @@ void BSDF::Init(
 
 	// Build the local reference system
 	frame.SetFromZ(hitPoint.shadeN);
+    if(mlHeroEnabled) {
+        const slg::mlhero15kp::Basis unitFrame(hitPoint.shadeN);
+        if(unitFrame.valid) {
+            frame.X=slg::mlhero15kp::Cast<Vector>(unitFrame.x);
+            frame.Y=slg::mlhero15kp::Cast<Vector>(unitFrame.y);
+            frame.Z=slg::mlhero15kp::Cast<Vector>(unitFrame.z);
+        }
+    }
 }
 
 void BSDF::MoveHitPoint(const Point &p, const Normal &n) {
@@ -306,9 +466,9 @@ Spectrum BSDF::Evaluate(const Vector &generatedDir,
 	const Vector &eyeDir = hitPoint.fromLight ? generatedDir : hitPoint.fixedDir;
 	const Vector &lightDir = hitPoint.fromLight ? hitPoint.fixedDir : generatedDir;
 
-	const float dotLightDirNG = Dot(lightDir, hitPoint.geometryN);
+	const float dotLightDirNG = MLHeroMetalNG15ky(lightDir,hitPoint.geometryN,material->GetType()==METAL2);
 	const float absDotLightDirNG = fabsf(dotLightDirNG);
-	const float dotEyeDirNG = Dot(eyeDir, hitPoint.geometryN);
+	const float dotEyeDirNG = MLHeroMetalNG15ky(eyeDir,hitPoint.geometryN,material->GetType()==METAL2);
 	const float absDotEyeDirNG = fabsf(dotEyeDirNG);
 
 	if (!IsVolume()) {
@@ -333,10 +493,14 @@ Spectrum BSDF::Evaluate(const Vector &generatedDir,
 			return Spectrum();
 	}
 
-	const Vector localLightDir = frame.ToLocal(lightDir);
-	const Vector localEyeDir = frame.ToLocal(eyeDir);
-	Spectrum result = material->Evaluate(hitPoint, localLightDir, localEyeDir,
-			event, directPdfW, reversePdfW);
+	const Vector localLightDir = MLHeroMetalLocal15ky(frame,lightDir,material->GetType()==METAL2);
+	const Vector localEyeDir = MLHeroMetalLocal15ky(frame,eyeDir,material->GetType()==METAL2);
+    Spectrum result;
+    if(mlHeroEnabled && material->GetType()==ROUGHGLASS) {
+        const slg::mlhero15kl::Frame precise(frame);
+        result=static_cast<const RoughGlassMaterial &>(*material).EvaluateMLHeroPrecise15kl(hitPoint,
+            precise.ToLocal(lightDir),precise.ToLocal(eyeDir),event,directPdfW,reversePdfW);
+    }else result=material->Evaluate(hitPoint,localLightDir,localEyeDir,event,directPdfW,reversePdfW);
 	verify (!result.IsNaN() && !result.IsInf());
 	if (result.Black())
 		return result;
@@ -380,17 +544,51 @@ Spectrum BSDF::Sample(Vector *sampledDir,
 		const float u0, const float u1,
 		float *pdfW, float *absCosSampledDir,
 		BSDFEvent *event) const {
-	Vector localFixedDir = frame.ToLocal(hitPoint.fixedDir);
-	Vector localSampledDir;
-
-	Spectrum result = material->Sample(hitPoint,
-			localFixedDir, &localSampledDir, u0, u1, hitPoint.passThroughEvent,
-			pdfW, event);
-	if (result.Black())
-		return result;
-
-	*absCosSampledDir = fabsf(CosTheta(localSampledDir));
-	*sampledDir = frame.ToWorld(localSampledDir);
+    Spectrum result;
+    if(mlHeroEnabled && material->GetType()==GLASS) {
+        // 15kr: ideal-glass deltas use unit directions in a double orthonormal basis.
+        const slg::mlhero15kl::Frame precise(frame);
+        const auto local=precise.ToLocal(hitPoint.fixedDir);
+        const Vector fixed=slg::mlhero15kp::Normalize(Vector(local.x,local.y,local.z));
+        Vector nativeGenerated;
+        result=material->Sample(hitPoint,fixed,&nativeGenerated,u0,u1,hitPoint.passThroughEvent,pdfW,event);
+        if(result.Black())return result;
+        const Vector generated=slg::mlhero15kp::Normalize(nativeGenerated);
+        const auto world=precise.ToWorld(slg::mlhero15kk::V(generated));
+        *sampledDir=slg::mlhero15kp::Normalize(Vector(world.x,world.y,world.z));
+        *absCosSampledDir=fabsf(CosTheta(generated));
+        if(slg::mlhero15ko::armed)slg::mlhero15ko::Capture(hitPoint.fixedDir,fixed,nativeGenerated,*sampledDir,
+            precise.x,precise.y,precise.z,true,false);
+    }else if(mlHeroEnabled && material->GetType()==ROUGHGLASS) {
+        const slg::mlhero15kl::Frame precise(frame);
+        slg::mlhero15kk::V generated;
+        result=static_cast<const RoughGlassMaterial &>(*material).SampleMLHeroPrecise15kl(hitPoint,
+            precise.ToLocal(hitPoint.fixedDir),&generated,u0,u1,hitPoint.passThroughEvent,pdfW,event);
+        if(result.Black())return result;
+        const auto world=precise.ToWorld(generated);
+        *sampledDir=Vector(world.x,world.y,world.z);
+        *absCosSampledDir=std::fabs(generated.z);
+        if(slg::mlhero15ko::armed)slg::mlhero15ko::Capture(hitPoint.fixedDir,precise.ToLocal(hitPoint.fixedDir),generated,*sampledDir,
+            precise.x,precise.y,precise.z,true,IsVolume());
+    }else if(mlHeroEnabled && material->GetType()==METAL2) {
+        result=static_cast<const Metal2Material&>(*material).SampleMLHeroWorld15ky(hitPoint,frame,
+            sampledDir,u0,u1,hitPoint.passThroughEvent,pdfW,absCosSampledDir,event);
+        if(result.Black())return result;
+        if(slg::mlhero15ko::armed){
+            const slg::mlhero15kl::Frame precise(frame);
+            const Vector fixed=slg::mlhero15ky::Local(frame,hitPoint.fixedDir);
+            const Vector generated=slg::mlhero15ky::Local(frame,*sampledDir);
+            slg::mlhero15ko::Capture(hitPoint.fixedDir,fixed,generated,*sampledDir,
+                precise.x,precise.y,precise.z,true,false);
+        }
+    }else {
+        const Vector fixed=MLHeroMetalLocal15ky(frame,hitPoint.fixedDir,material->GetType()==METAL2);Vector generated;
+        result=material->Sample(hitPoint,fixed,&generated,u0,u1,hitPoint.passThroughEvent,pdfW,event);
+        if(result.Black())return result;
+        *absCosSampledDir=fabsf(CosTheta(generated));*sampledDir=frame.ToWorld(generated);
+        if(mlHeroEnabled && IsVolume())*sampledDir=slg::mlhero15kp::Normalize(*sampledDir);
+        if(slg::mlhero15ko::armed)slg::mlhero15ko::Capture(hitPoint.fixedDir,fixed,generated,*sampledDir,frame.X,frame.Y,frame.Z,false,IsVolume());
+    }
 
 	// Shadow terminator artefact avoidance
 	if ((*event & REFLECT) &&
@@ -404,8 +602,10 @@ Spectrum BSDF::Sample(Vector *sampledDir,
 
 	// Adjoint BSDF
 	if (hitPoint.fromLight) {
-		const float absDotFixedDirNG = AbsDot(hitPoint.fixedDir, hitPoint.geometryN);
-		const float absDotSampledDirNG = AbsDot(*sampledDir, hitPoint.geometryN);
+		const float absDotFixedDirNG = (mlHeroEnabled && material->GetType()==GLASS) ?
+            AbsDot(slg::mlhero15kp::Normalize(hitPoint.fixedDir),hitPoint.geometryN) :
+            MLHeroMetalAbsNG15ky(hitPoint.fixedDir,hitPoint.geometryN,material->GetType()==METAL2);
+		const float absDotSampledDirNG = MLHeroMetalAbsNG15ky(*sampledDir,hitPoint.geometryN,material->GetType()==METAL2);
 		result *= (absDotSampledDirNG / absDotFixedDirNG);
 	}
 
@@ -485,8 +685,8 @@ bool BSDF::EvaluateMLHeroMetal2SampleAtWaveLength(const Vector &sampledDir,
 
 	const Metal2Material &metal2 = static_cast<const Metal2Material &>(*material);
 
-	const Vector localFixedDir = frame.ToLocal(hitPoint.fixedDir);
-	const Vector localSampledDir = frame.ToLocal(sampledDir);
+	const Vector localFixedDir = MLHeroMetalLocal15ky(frame,hitPoint.fixedDir,material->GetType()==METAL2);
+	const Vector localSampledDir = MLHeroMetalLocal15ky(frame,sampledDir,material->GetType()==METAL2);
 	Spectrum result;
 	if (!metal2.EvaluateSampleAtWaveLength(hitPoint, localFixedDir, localSampledDir,
 			waveLength, &result))
@@ -501,8 +701,8 @@ bool BSDF::EvaluateMLHeroMetal2SampleAtWaveLength(const Vector &sampledDir,
 	}
 
 	if (hitPoint.fromLight) {
-		const float absDotFixedDirNG = AbsDot(hitPoint.fixedDir, hitPoint.geometryN);
-		const float absDotSampledDirNG = AbsDot(sampledDir, hitPoint.geometryN);
+		const float absDotFixedDirNG = MLHeroMetalAbsNG15ky(hitPoint.fixedDir,hitPoint.geometryN,material->GetType()==METAL2);
+		const float absDotSampledDirNG = MLHeroMetalAbsNG15ky(sampledDir,hitPoint.geometryN,material->GetType()==METAL2);
 		result *= (absDotSampledDirNG / absDotFixedDirNG);
 	}
 
@@ -518,9 +718,9 @@ bool BSDF::EvaluateMLHeroMetal2AtWaveLength(const Vector &generatedDir,
 	const Vector &eyeDir = hitPoint.fromLight ? generatedDir : hitPoint.fixedDir;
 	const Vector &lightDir = hitPoint.fromLight ? hitPoint.fixedDir : generatedDir;
 
-	const float dotLightDirNG = Dot(lightDir, hitPoint.geometryN);
+	const float dotLightDirNG = MLHeroMetalNG15ky(lightDir,hitPoint.geometryN,material->GetType()==METAL2);
 	const float absDotLightDirNG = fabsf(dotLightDirNG);
-	const float dotEyeDirNG = Dot(eyeDir, hitPoint.geometryN);
+	const float dotEyeDirNG = MLHeroMetalNG15ky(eyeDir,hitPoint.geometryN,material->GetType()==METAL2);
 	const float absDotEyeDirNG = fabsf(dotEyeDirNG);
 	if ((absDotLightDirNG < DEFAULT_COS_EPSILON_STATIC) ||
 			(absDotEyeDirNG < DEFAULT_COS_EPSILON_STATIC))
@@ -531,8 +731,8 @@ bool BSDF::EvaluateMLHeroMetal2AtWaveLength(const Vector &generatedDir,
 		return false;
 
 	const Metal2Material &metal2 = static_cast<const Metal2Material &>(*material);
-	const Vector localLightDir = frame.ToLocal(lightDir);
-	const Vector localEyeDir = frame.ToLocal(eyeDir);
+	const Vector localLightDir = MLHeroMetalLocal15ky(frame,lightDir,material->GetType()==METAL2);
+	const Vector localEyeDir = MLHeroMetalLocal15ky(frame,eyeDir,material->GetType()==METAL2);
 	Spectrum result;
 	if (!metal2.EvaluateAtWaveLength(hitPoint, localLightDir, localEyeDir, waveLength, &result))
 		return false;
@@ -561,9 +761,9 @@ bool BSDF::EvaluateMLHeroMetal2DebugAtWaveLength(const Vector &generatedDir,
 	const Vector &eyeDir = hitPoint.fromLight ? generatedDir : hitPoint.fixedDir;
 	const Vector &lightDir = hitPoint.fromLight ? hitPoint.fixedDir : generatedDir;
 
-	const float dotLightDirNG = Dot(lightDir, hitPoint.geometryN);
+	const float dotLightDirNG = MLHeroMetalNG15ky(lightDir,hitPoint.geometryN,material->GetType()==METAL2);
 	const float absDotLightDirNG = fabsf(dotLightDirNG);
-	const float dotEyeDirNG = Dot(eyeDir, hitPoint.geometryN);
+	const float dotEyeDirNG = MLHeroMetalNG15ky(eyeDir,hitPoint.geometryN,material->GetType()==METAL2);
 	const float absDotEyeDirNG = fabsf(dotEyeDirNG);
 	if ((absDotLightDirNG < DEFAULT_COS_EPSILON_STATIC) ||
 			(absDotEyeDirNG < DEFAULT_COS_EPSILON_STATIC))
@@ -575,8 +775,8 @@ bool BSDF::EvaluateMLHeroMetal2DebugAtWaveLength(const Vector &generatedDir,
 		return false;
 
 	const Metal2Material &metal2 = static_cast<const Metal2Material &>(*material);
-	const Vector localLightDir = frame.ToLocal(lightDir);
-	const Vector localEyeDir = frame.ToLocal(eyeDir);
+	const Vector localLightDir = MLHeroMetalLocal15ky(frame,lightDir,material->GetType()==METAL2);
+	const Vector localEyeDir = MLHeroMetalLocal15ky(frame,eyeDir,material->GetType()==METAL2);
 
 	Spectrum result;
 	if (!metal2.EvaluateAtWaveLengthDebug(hitPoint,
@@ -695,6 +895,13 @@ bool BSDF::EvaluateMLHeroRoughGlassMicrofacetOwnershipDebug(
 		return false;
 
 	const RoughGlassMaterial &roughGlass = static_cast<const RoughGlassMaterial &>(*material);
+    if(mlHeroEnabled) {
+        const slg::mlhero15kl::Frame precise(frame);
+        return roughGlass.EvaluateMLHeroMicrofacetOwnershipPrecise15kl(hitPoint,
+            precise.ToLocal(hitPoint.fixedDir),precise.ToLocal(sampledDir),sampledEvent,
+            heroWaveLength,laneWaveLength,heroEta,laneEta,heroMicrofacetPdf,laneSharedMicrofacetPdf,
+            naturalJacobian,sharedJacobian,naturalDirPdf,sharedDirPdf,naturalDirDelta,sharedWhDelta,naturalTir);
+    }
 	const Vector localFixedDir = frame.ToLocal(hitPoint.fixedDir);
 	const Vector localSharedDir = frame.ToLocal(sampledDir);
 	return roughGlass.EvaluateMLHeroMicrofacetOwnershipDebug(hitPoint,
@@ -768,8 +975,13 @@ bool BSDF::EvaluateMLHeroGlossy2DebugSampleComponents(
 void BSDF::Pdf(const Vector &sampledDir, float *directPdfW, float *reversePdfW) const {
 	const Vector &eyeDir = hitPoint.fromLight ? sampledDir : hitPoint.fixedDir;
 	const Vector &lightDir = hitPoint.fromLight ? hitPoint.fixedDir : sampledDir;
-	Vector localLightDir = frame.ToLocal(lightDir);
-	Vector localEyeDir = frame.ToLocal(eyeDir);
+    if(mlHeroEnabled && material->GetType()==ROUGHGLASS) {
+        const slg::mlhero15kl::Frame precise(frame);
+        static_cast<const RoughGlassMaterial &>(*material).PdfMLHeroPrecise15kl(hitPoint,
+            precise.ToLocal(lightDir),precise.ToLocal(eyeDir),directPdfW,reversePdfW);return;
+    }
+	Vector localLightDir = MLHeroMetalLocal15ky(frame,lightDir,material->GetType()==METAL2);
+	Vector localEyeDir = MLHeroMetalLocal15ky(frame,eyeDir,material->GetType()==METAL2);
 
 	material->Pdf(hitPoint, localLightDir, localEyeDir, directPdfW, reversePdfW);
 }
@@ -815,3 +1027,19 @@ const string slg::AlbedoSpecularSetting2String(const AlbedoSpecularSetting type)
 	}
 }
 // vim: autoindent noexpandtab tabstop=4 shiftwidth=4
+
+// 15kt BEGIN: reconstruct the same precise local basis used by the actual GLASS wrapper.
+slg::mlhero15kt::Evidence BSDF::EvaluateMLHeroGlassReverse15kt(const Vector &sampled,
+        const BSDFEvent event,const float nativeForwardMass) const {
+    if(!mlHeroEnabled||material->GetType()!=GLASS)return {};
+    const slg::mlhero15kl::Frame precise(frame);
+    const auto lf=precise.ToLocal(hitPoint.fixedDir),lr=precise.ToLocal(sampled);
+    const Vector fixed=slg::mlhero15kp::Normalize(Vector(lf.x,lf.y,lf.z));
+    const Vector reverseFixed=slg::mlhero15kp::Normalize(Vector(lr.x,lr.y,lr.z));
+    HitPoint reversed=hitPoint;reversed.fromLight=!hitPoint.fromLight;
+    reversed.fixedDir=slg::mlhero15kp::Normalize(sampled);
+    reversed.intoObject=Dot(reversed.fixedDir,hitPoint.geometryN)>0.f;
+    return static_cast<const GlassMaterial &>(*material).EvaluateMLHeroReverseMass15kt(
+        hitPoint,reversed,fixed,reverseFixed,event,nativeForwardMass);
+}
+// 15kt END

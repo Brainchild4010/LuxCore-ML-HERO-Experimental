@@ -20,6 +20,8 @@
 
 #include "slg/volumes/volume.h"
 #include "slg/bsdf/bsdf.h"
+#include "slg/engines/mlhero_volume_direction15kp.h"
+extern thread_local bool mlHeroEnabled;
 
 using namespace std;
 using namespace luxrays;
@@ -99,7 +101,7 @@ Spectrum SchlickScatter::Evaluate(
 
 	*event = DIFFUSE | REFLECT;
 
-	const float dotEyeLight = Dot(localEyeDir, localLightDir);
+	const float dotEyeLight = mlHeroEnabled ? slg::mlhero15kp::AngularCos(localEyeDir,localLightDir) : Dot(localEyeDir,localLightDir);
 	const float kFilter = k.Filter();
 	// 1+k*cos instead of 1-k*cos because localEyeDir is reversed compared to the
 	// standard phase function definition
@@ -133,10 +135,13 @@ Spectrum SchlickScatter::Sample(const HitPoint &hitPoint,
 	// function definition
 	const float cost = -(2.f * u0 + kFilter - 1.f) / (2.f * kFilter * u0 - kFilter + 1.f);
 
+    if(!mlHeroEnabled || !slg::mlhero15kp::SampleDirection(localFixedDir,cost,
+            float(2.f*M_PI*u1),*localSampledDir)) {
 	Vector x, y;
 	CoordinateSystem(localFixedDir, &x, &y);
 	*localSampledDir = SphericalDirection(sqrtf(Max(0.f, 1.f - cost * cost)), cost,
 			2.f * M_PI * u1, x, y, localFixedDir);
+    }
 
 	// The - becomes a + because cost has been reversed above
 	const float compcost = 1.f + kFilter * cost;
@@ -158,7 +163,7 @@ void SchlickScatter::Pdf(
 	const Spectrum k = gValue * (Spectrum(1.55f) - .55f * gValue * gValue);
 	const float kFilter = k.Filter();
 
-	const float dotEyeLight = Dot(localEyeDir, localLightDir);
+	const float dotEyeLight = mlHeroEnabled ? slg::mlhero15kp::AngularCos(localEyeDir,localLightDir) : Dot(localEyeDir,localLightDir);
 
 	// 1+k*cos instead of 1-k*cos because localEyeDir is reversed compared to the
 	// standard phase function definition

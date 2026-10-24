@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <cmath>
+#include "slg/engines/mlhero_version.h"
 #include "slg/engines/mlhero_unit_reflectance15fx.h"
 #include "slg/engines/mlhero_path_rr15fz.h"
 #include "mlherolog.h"
@@ -48,6 +49,12 @@
 // They are currently defined in the global namespace (same as the BIDIR patch).
 void SetMLHeroEnabled(const bool enabled);
 extern thread_local bool mlHeroRoughGlassFresnelImportance;
+// 15gf PATH diagnostic bridge; never changes BSDF transport.
+thread_local bool mlHeroPathRoughConsistencyEnabled15gf = false;
+static std::atomic<bool> mlHeroPathHeavyDiagnostics15gf(false);
+static std::atomic<unsigned int> mlHeroPathRoughConsistencyDetails15gf(0u);
+static std::atomic<unsigned long long> mlHeroPathRoughConsistencyChecks15gf(0ull);
+
 void SetMLHeroWavelengthCount(const u_int count);
 void SetMLHeroWaveLengthAt(const u_int lane, const float waveLength, const float sampleWeight);
 float GetMLHeroWaveLengthAt(const u_int lane);
@@ -86,9 +93,6 @@ static unsigned MLHeroTerminalLightGuard15fl(LightSourceConstRef light,const flo
 // ML HERO 15ev - CPU PATH parallel packet-throughput diagnostics
 //------------------------------------------------------------------------------
 
-#define ML_HERO_BUILD "HERO_170"
-#define ML_HERO_TEST_PHASE "15gb"
-#define ML_HERO_FEATURE "Central CPU diagnostic log filenames; renderer physics unchanged from 15ga"
 #define ML_HERO_PATH_LOG_FILE slg::mlhero15gb::FilePath()
 
 // 15gj: diagnostic master gate for ALL CPU PATH HERO log files.
@@ -98,6 +102,25 @@ static inline FILE *MLHeroPathOpenLog15gj(const char *mode) {
         fopen(slg::mlhero15gb::FilePath(), mode) : nullptr;
 }
 static std::mutex mlHeroPathDebugMutex15ev;
+// Called from RoughGlass::Sample only for CPU PATH with Current + Heavy enabled.
+void MLHeroPathRoughConsistencyReport15gf(bool fromLight, bool transmit,
+        float nc, float nt, float samplePdf, float evalPdf, float pdfFunction,
+        float sampleWeight, float evaluateWeight, float cosFixed, float cosSampled) {
+    if (!mlHeroPathRoughConsistencyEnabled15gf) return;
+    mlHeroPathRoughConsistencyChecks15gf.fetch_add(1ull, std::memory_order_relaxed);
+    const unsigned ticket = mlHeroPathRoughConsistencyDetails15gf.fetch_add(1u, std::memory_order_relaxed);
+    if (ticket >= 96u) return;
+    const float ratio = evaluateWeight != 0.f ? sampleWeight / evaluateWeight : 0.f;
+    std::lock_guard<std::mutex> lock(mlHeroPathDebugMutex15ev);
+    FILE *f = MLHeroPathOpenLog15gj("a");
+    if (!f) return;
+    fprintf(f, "phase15gf ROUGH_CONSISTENCY engine=PATHCPU ticket=%u side=%s event=%s nc=%.9g nt=%.9g etaInOut=%.9g samplePdf=%.9g evalDirectPdf=%.9g pdfFunction=%.9g sampleWeight=%.9g evalOverPdf=%.9g sampleVsEvalRatio=%.9g cosFixed=%.9g cosSampled=%.9g diagnosticOnly=1\n",
+        ticket, fromLight ? "LIGHT" : "EYE", transmit ? "TRANSMIT" : "REFLECT",
+        nc, nt, nt != 0.f ? nc / nt : 0.f, samplePdf, evalPdf, pdfFunction,
+        sampleWeight, evaluateWeight, ratio, cosFixed, cosSampled);
+    fclose(f);
+}
+
 static std::atomic<unsigned long long> mlHeroPathEyeSamples15ev(0ull);
 static std::atomic<unsigned long long> mlHeroPathPacketSamples15ev(0ull);
 static std::atomic<unsigned long long> mlHeroPathQuarterSamples15ev(0ull);
@@ -149,6 +172,8 @@ static void MLHeroPathLogIllumBasis15ev(FILE *f);
 static void MLHeroPathResetDiagnostics15ev(const bool enabled, const int samplingMode,
         const int wavelengthCount, const bool quarterCycling, const bool compensation15fg,
         const bool diagnostics15fg, const bool lightTracing15fg) {
+    mlHeroPathRoughConsistencyDetails15gf.store(0u, std::memory_order_relaxed);
+    mlHeroPathRoughConsistencyChecks15gf.store(0ull, std::memory_order_relaxed);
     mlHeroRoughBounceBudget15ev.store(64ull, std::memory_order_relaxed);
     mlHeroRoughDLSBudget15ev.store(64ull, std::memory_order_relaxed);
     mlHeroPathEyeSamples15ev.store(0ull, std::memory_order_relaxed);
@@ -1912,6 +1937,7 @@ void PathTracer::RenderEyePath(IntersectionDevice *device,
 // 15fg BEGIN
     mlHeroPathComp15fg=mlHeroGenericReflectanceCompensation;
     mlHeroPathDiag15fg=mlHeroDiagnostics15fg;
+    mlHeroPathRoughConsistencyEnabled15gf=mlHeroDiagnostics15fg && mlHeroPathHeavyDiagnostics15gf.load(std::memory_order_relaxed);
     mlHeroPathNativeSample15fg=false;
 // 15fg END
 
@@ -3076,6 +3102,7 @@ void PathTracer::ParseOptions(
     mlHeroGenericReflectanceCompensation=cfg.Get(defaultProps.Get("path.mlhero.genericreflectancecompensation")).Get<bool>();
     mlHeroDiagnostics15fg=cfg.Get(defaultProps.Get("path.mlhero.diagnostics")).Get<bool>() &&
         cfg.Get(defaultProps.Get("path.mlhero.currentdiagnostics")).Get<bool>();
+    mlHeroPathHeavyDiagnostics15gf.store(cfg.Get(defaultProps.Get("path.mlhero.heavydiagnostics")).Get<bool>(), std::memory_order_relaxed);
 // 15fg END
 	MLHeroPathResetDiagnostics15ev(mlHeroEnabled, mlHeroSamplingMode, mlHeroWavelengthCount, mlHeroQuarterCycling,
         mlHeroGenericReflectanceCompensation,mlHeroDiagnostics15fg,
@@ -3161,6 +3188,7 @@ PropertiesUPtr PathTracer::ToProperties(const Properties &cfg) {
             cfg.Get(GetDefaultProps()->Get("path.mlhero.genericreflectancecompensation")) <<
             cfg.Get(GetDefaultProps()->Get("path.mlhero.diagnostics")) <<
             cfg.Get(GetDefaultProps()->Get("path.mlhero.currentdiagnostics")) <<
+            cfg.Get(GetDefaultProps()->Get("path.mlhero.heavydiagnostics")) <<
 // 15fg END
 
 			cfg.Get(GetDefaultProps()->Get("path.hybridbackforward.enable")) <<
@@ -3191,6 +3219,7 @@ PropertiesUPtr PathTracer::GetDefaultProps() {
             Property("path.mlhero.genericreflectancecompensation")(true) <<
             Property("path.mlhero.diagnostics")(false) <<
             Property("path.mlhero.currentdiagnostics")(true) <<
+            Property("path.mlhero.heavydiagnostics")(false) <<
 // 15fg END
 
 			Property("path.hybridbackforward.enable")(false) <<

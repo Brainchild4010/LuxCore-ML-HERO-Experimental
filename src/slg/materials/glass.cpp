@@ -1,3 +1,4 @@
+#include "slg/engines/mlhero_volume_direction15kp.h"
 /***************************************************************************
  * Copyright 1998-2020 by authors (see AUTHORS.txt)                        *
  *                                                                         *
@@ -44,6 +45,198 @@ thread_local GlassSellmeierPreset mlDispersionCurrentSellmeierPreset = GLASS_SEL
 thread_local float mlDispersionSampleWeight = 1.f;
 thread_local bool mlHeroEnabled = true;
 thread_local bool mlHeroRoughGlassFresnelImportance = false;
+
+// 15ii / Diagnose 50: exact internal Sample -> EvalSpecularTransmission TIR audit.
+// Stored per thread so a BIDIR caller can read the exact native sample result.
+// No sampling, PDF, direction, weight or renderer decision is modified.
+#include <atomic>
+struct MLHeroGlassTIRState15ii {
+    unsigned int reason; // 0=not-tested, 1=TIR, 2=transmission-computed
+    unsigned int selected; // 0=black, 1=reflect, 2=transmit
+    float wavelength, nc, ntBase, ntLambda, cosFixed, eta, sinT2, threshold;
+    unsigned int fromLight;
+};
+static thread_local MLHeroGlassTIRState15ii mlHeroGlassTIR15ii = {};
+static std::atomic<unsigned long long> mlHeroGlassTIRTotal15ii(0);
+static std::atomic<unsigned long long> mlHeroGlassTIRRejected15ii(0);
+static std::atomic<unsigned long long> mlHeroGlassTIRBlack15ii(0);
+// Exposed only to BIDIR diagnostics; called after the real GLASS BSDF sample.
+bool GetMLHeroGlassTIRSample15ii(unsigned int *reason, unsigned int *selected,
+        float *wavelength, float *nc, float *ntBase, float *ntLambda,
+        float *cosFixed, float *eta, float *sinT2, float *threshold,
+        unsigned int *fromLight, unsigned long long *total,
+        unsigned long long *tirCount, unsigned long long *blackCount) {
+    if (!reason || !selected || !wavelength || !nc || !ntBase || !ntLambda ||
+            !cosFixed || !eta || !sinT2 || !threshold || !fromLight ||
+            !total || !tirCount || !blackCount) return false;
+    const MLHeroGlassTIRState15ii &s = mlHeroGlassTIR15ii;
+    *reason=s.reason; *selected=s.selected; *wavelength=s.wavelength;
+    *nc=s.nc; *ntBase=s.ntBase; *ntLambda=s.ntLambda;
+    *cosFixed=s.cosFixed; *eta=s.eta; *sinT2=s.sinT2;
+    *threshold=s.threshold; *fromLight=s.fromLight;
+    *total=mlHeroGlassTIRTotal15ii.load(std::memory_order_relaxed);
+    *tirCount=mlHeroGlassTIRRejected15ii.load(std::memory_order_relaxed);
+    *blackCount=mlHeroGlassTIRBlack15ii.load(std::memory_order_relaxed);
+    return true;
+}
+
+// 15iw: counterfactual TIR for packet wavelengths at the REAL parent hit.
+// No child BSDF Sample, no ray construction and no renderer changes.
+struct MLHeroLaneTIR15iw {
+    unsigned valid, count, parentTIR, differing, invalid;
+    float wavelength[8], nInterior[8], sinT2[8];
+    unsigned tir[8], laneValid[8];
+};
+static thread_local MLHeroLaneTIR15iw mlHeroLaneTIR15iw = {};
+bool GetMLHeroLaneTIR15iw(unsigned *valid, unsigned *count, unsigned *parentTIR,
+        unsigned *differing, unsigned *invalid, float *wavelength,
+        float *nInterior, float *sinT2, unsigned *tir, unsigned *laneValid) {
+    if (!valid || !count || !parentTIR || !differing || !invalid ||
+            !wavelength || !nInterior || !sinT2 || !tir || !laneValid) return false;
+    const MLHeroLaneTIR15iw &a=mlHeroLaneTIR15iw;
+    *valid=a.valid; *count=a.count; *parentTIR=a.parentTIR;
+    *differing=a.differing; *invalid=a.invalid;
+    for (unsigned i=0;i<8;++i) {
+        wavelength[i]=a.wavelength[i]; nInterior[i]=a.nInterior[i];
+        sinT2[i]=a.sinT2[i]; tir[i]=a.tir[i]; laneValid[i]=a.laneValid[i];
+    }
+    return true;
+}
+
+// 15iz: actual parent Kr/Kt textures, counterfactual per-lane Fresnel and
+// native-style discrete event MASS. No additional texture reads, sampling or rays.
+// This uses RGB Spectrum.Filter(), not independently measured spectral Kr(lambda).
+struct MLHeroLaneMass15iz {
+    unsigned valid, count, invalid;
+    float krFilter, ktFilter;
+    float reflectFilter[8], transmitFilter[8], transmitMass[8], reflectMass[8];
+    unsigned laneValid[8], reflectSupport[8], transmitSupport[8], bothBlack[8];
+};
+static thread_local MLHeroLaneMass15iz mlHeroLaneMass15iz = {};
+bool GetMLHeroLaneMass15iz(unsigned *valid,unsigned *count,unsigned *invalid,
+        float *krFilter,float *ktFilter,float *reflectFilter,float *transmitFilter,
+        float *transmitMass,float *reflectMass,unsigned *laneValid,
+        unsigned *reflectSupport,unsigned *transmitSupport,unsigned *bothBlack) {
+    if (!valid||!count||!invalid||!krFilter||!ktFilter||!reflectFilter||
+            !transmitFilter||!transmitMass||!reflectMass||!laneValid||
+            !reflectSupport||!transmitSupport||!bothBlack) return false;
+    const MLHeroLaneMass15iz &a=mlHeroLaneMass15iz;
+    *valid=a.valid;*count=a.count;*invalid=a.invalid;
+    *krFilter=a.krFilter;*ktFilter=a.ktFilter;
+    for (unsigned i=0;i<8;++i) {
+        reflectFilter[i]=a.reflectFilter[i];transmitFilter[i]=a.transmitFilter[i];
+        transmitMass[i]=a.transmitMass[i];reflectMass[i]=a.reflectMass[i];
+        laneValid[i]=a.laneValid[i];reflectSupport[i]=a.reflectSupport[i];
+        transmitSupport[i]=a.transmitSupport[i];bothBlack[i]=a.bothBlack[i];
+    }
+    return true;
+}
+
+// 15jb: genuine native counterfactual GlassMaterial::Sample calls. These
+// calls are bounded, isolated and MUST NOT be used for production transport.
+struct MLHeroNativeChild15jb {
+    unsigned valid, count, fail;
+    unsigned sampled[8], event[8], expectedEvent[8], match[8];
+    float pdf[8], expectedPdf[8], directionNorm[8], directionResidual[8], snellResidual[8];
+    unsigned directionPass[8], tirBlocked[8];
+};
+static thread_local MLHeroNativeChild15jb mlHeroNativeChild15jb = {};
+static thread_local bool mlHeroChildReentry15jb = false;
+static std::atomic<unsigned> mlHeroChildBudget15jb[2] = {}; // retained, no quota ownership
+// 15je: bounded gate set by actual BIDIR parent call, never by arbitrary Sample.
+static thread_local bool mlHeroNativeChildArmed15je = false;
+void MLHeroSetNativeGlassChildArmed15je(bool enabled) {
+    mlHeroNativeChildArmed15je = enabled;
+}
+// 15jd: reset native diagnostic Child Sample budget at the start of each render.
+// Call only while no render workers are executing GlassMaterial::Sample.
+void MLHeroResetNativeGlassChildBudget15jd() {
+    // 15kd: reset native TIR statistics as well as the retained child budget.
+    // The BIDIR engine calls this before starting ANY of its workers.
+    mlHeroGlassTIRTotal15ii.store(0ull, std::memory_order_relaxed);
+    mlHeroGlassTIRRejected15ii.store(0ull, std::memory_order_relaxed);
+    mlHeroGlassTIRBlack15ii.store(0ull, std::memory_order_relaxed);
+    mlHeroChildBudget15jb[0].store(0u, std::memory_order_relaxed);
+    mlHeroChildBudget15jb[1].store(0u, std::memory_order_relaxed);
+}
+
+bool GetMLHeroNativeChild15jb(unsigned *valid,unsigned *count,unsigned *fail,
+        unsigned *sampled,unsigned *event,unsigned *expectedEvent,unsigned *match,
+        float *pdf,float *expectedPdf,float *directionNorm,
+        float *directionResidual,float *snellResidual,unsigned *directionPass,unsigned *tirBlocked) {
+    if (!valid||!count||!fail||!sampled||!event||!expectedEvent||!match||
+            !pdf||!expectedPdf||!directionNorm||!directionResidual||!snellResidual||
+            !directionPass||!tirBlocked) return false;
+    const MLHeroNativeChild15jb &a=mlHeroNativeChild15jb;
+    *valid=a.valid;*count=a.count;*fail=a.fail;
+    for (unsigned i=0;i<8;++i) {
+        sampled[i]=a.sampled[i];event[i]=a.event[i];
+        expectedEvent[i]=a.expectedEvent[i];match[i]=a.match[i];
+        pdf[i]=a.pdf[i];expectedPdf[i]=a.expectedPdf[i];
+        directionNorm[i]=a.directionNorm[i];
+        directionResidual[i]=a.directionResidual[i];snellResidual[i]=a.snellResidual[i];
+        directionPass[i]=a.directionPass[i];tirBlocked[i]=a.tirBlocked[i];
+    }
+    return true;
+}
+
+// 15is: Native decision invariant snapshot. No synthetic Sample() call.
+// Each validity flag describes only the actual parent surface hit.
+struct MLHeroNativeSpecial15is {
+    unsigned valid, tir, reflectionPresent, transmissionPresent, bothBlack;
+    unsigned supportConsistent, thresholdConsistent, selectedConsistent, pdfExpected;
+    float expectedThreshold, expectedSelectedPdf, actualSelectedPdf;
+};
+static thread_local MLHeroNativeSpecial15is mlHeroNativeSpecial15is = {};
+bool GetMLHeroNativeSpecial15is(unsigned *valid, unsigned *tir,
+        unsigned *reflectionPresent, unsigned *transmissionPresent, unsigned *bothBlack,
+        unsigned *supportConsistent, unsigned *thresholdConsistent,
+        unsigned *selectedConsistent, unsigned *pdfExpected,
+        float *expectedThreshold, float *expectedSelectedPdf, float *actualSelectedPdf) {
+    if (!valid || !tir || !reflectionPresent || !transmissionPresent || !bothBlack ||
+            !supportConsistent || !thresholdConsistent || !selectedConsistent || !pdfExpected ||
+            !expectedThreshold || !expectedSelectedPdf || !actualSelectedPdf) return false;
+    const MLHeroNativeSpecial15is &s=mlHeroNativeSpecial15is;
+    *valid=s.valid; *tir=s.tir;
+    *reflectionPresent=s.reflectionPresent; *transmissionPresent=s.transmissionPresent;
+    *bothBlack=s.bothBlack; *supportConsistent=s.supportConsistent;
+    *thresholdConsistent=s.thresholdConsistent; *selectedConsistent=s.selectedConsistent;
+    *pdfExpected=s.pdfExpected; *expectedThreshold=s.expectedThreshold;
+    *expectedSelectedPdf=s.expectedSelectedPdf; *actualSelectedPdf=s.actualSelectedPdf;
+    return true;
+}
+
+// 15ir: read-only observation of actual native GlassMaterial::Sample weights.
+struct MLHeroNativeLobe15ir {
+    unsigned valid, reflectionPresent, transmissionPresent, black;
+    float reflectionFilter, transmissionFilter, threshold, passThrough;
+};
+static thread_local MLHeroNativeLobe15ir mlHeroNativeLobe15ir = {};
+bool GetMLHeroNativeLobe15ir(unsigned *valid, unsigned *reflectionPresent,
+        unsigned *transmissionPresent, unsigned *black, float *reflectionFilter,
+        float *transmissionFilter, float *threshold, float *passThrough) {
+    if (!valid || !reflectionPresent || !transmissionPresent || !black ||
+            !reflectionFilter || !transmissionFilter || !threshold || !passThrough) return false;
+    const MLHeroNativeLobe15ir &v = mlHeroNativeLobe15ir;
+    *valid=v.valid; *reflectionPresent=v.reflectionPresent;
+    *transmissionPresent=v.transmissionPresent; *black=v.black;
+    *reflectionFilter=v.reflectionFilter; *transmissionFilter=v.transmissionFilter;
+    *threshold=v.threshold; *passThrough=v.passThrough;
+    return true;
+}
+
+// 15kd: per-worker observations are separate from the shared counters.
+// This touches diagnostics only, never wavelength or transport state.
+void MLHeroResetGlassDiagnosticThreadState15kd() {
+    mlHeroGlassTIR15ii = {};
+    mlHeroLaneTIR15iw = {};
+    mlHeroLaneMass15iz = {};
+    mlHeroNativeChild15jb = {};
+    mlHeroNativeSpecial15is = {};
+    mlHeroNativeLobe15ir = {};
+    mlHeroChildReentry15jb = false;
+    mlHeroNativeChildArmed15je = false;
+}
 
 // ML HERO multi-wavelength packet infrastructure. Lane 0 is always the
 // existing primary HERO wavelength, so wavelengthcount=1 keeps the old
@@ -407,6 +600,17 @@ Spectrum GlassMaterial::EvalSpecularTransmission(const HitPoint &hitPoint,
 	const float sini2 = SinTheta2(localFixedDir);
 	const float sint2 = eta2 * sini2;
 
+	// 15ii: record exact wavelength-specific native refraction decision.
+	mlHeroGlassTIR15ii.reason = (sint2 >= 1.f) ? 1u : 2u;
+	mlHeroGlassTIR15ii.wavelength = (mlHeroEnabled && ((mlDispersionCurrentModel == GLASS_DISPERSION_SELLMEIER) || (cauchyB > 0.f))) ? GetMLDispersionWaveLength(u0) :
+		((mlDispersionCurrentModel == GLASS_DISPERSION_SELLMEIER) || (cauchyB > 0.f)) ? Lerp(u0, 380.f, 780.f) : -1.f;
+	mlHeroGlassTIR15ii.nc = nc;
+	mlHeroGlassTIR15ii.ntBase = nt;
+	mlHeroGlassTIR15ii.ntLambda = lnt;
+	mlHeroGlassTIR15ii.cosFixed = cosTheta;
+	mlHeroGlassTIR15ii.eta = eta;
+	mlHeroGlassTIR15ii.sinT2 = sint2;
+	mlHeroGlassTIR15ii.fromLight = hitPoint.fromLight ? 1u : 0u;
 	// Handle total internal reflection for transmission
 	if (sint2 >= 1.f)
 		return Spectrum();
@@ -579,6 +783,16 @@ Spectrum GlassMaterial::Sample(const HitPoint &hitPoint,
 		const Vector &localFixedDir, Vector *localSampledDir,
 		const float u0, const float u1, const float passThroughEvent,
 		float *pdfW, BSDFEvent *event) const {
+	// 15ii reset ensures no previous surface data can leak into this event.
+    if (!mlHeroChildReentry15jb)
+        mlHeroNativeChild15jb=MLHeroNativeChild15jb();
+	mlHeroGlassTIR15ii = MLHeroGlassTIRState15ii();
+	mlHeroNativeLobe15ir = MLHeroNativeLobe15ir();
+	mlHeroNativeSpecial15is = MLHeroNativeSpecial15is();
+	mlHeroLaneTIR15iw = MLHeroLaneTIR15iw();
+	mlHeroLaneMass15iz = MLHeroLaneMass15iz();
+    if (!mlHeroChildReentry15jb)
+        mlHeroGlassTIRTotal15ii.fetch_add(1ull, std::memory_order_relaxed);
 	const Spectrum kr = Kr->GetSpectrumValue(hitPoint).Clamp(0.f, 1.f);
 	const Spectrum kt = Kt->GetSpectrumValue(hitPoint).Clamp(0.f, 1.f);
 
@@ -596,6 +810,89 @@ Spectrum GlassMaterial::Sample(const HitPoint &hitPoint,
 	Vector transLocalSampledDir; 
 	const Spectrum trans = EvalSpecularTransmission(hitPoint, localFixedDir, u0,
 			kt, nc, nt, cauchyBValue, &transLocalSampledDir);
+	// 15iw uses the same native material IOR inputs and local direction.
+    // Packet lanes are counterfactual: at most eight read-only Snell decisions.
+    MLHeroLaneTIR15iw &audit15iw=mlHeroLaneTIR15iw;
+    audit15iw.count=Min(mlHeroWavelengthCount,8u);
+    audit15iw.parentTIR=(mlHeroGlassTIR15ii.reason==1u) ? 1u : 0u;
+    const double cos15iw=(double)CosTheta(localFixedDir);
+    const double sinI2_15iw=Max(0.,1.-cos15iw*cos15iw);
+    const bool entering15iw=cos15iw>0.;
+    const bool dispersion15iw=(dispersionModel==GLASS_DISPERSION_SELLMEIER || cauchyBValue>0.f);
+    for (unsigned i15iw=0;i15iw<audit15iw.count;++i15iw) {
+        const float wavelength15iw=mlHeroWaveLengths[i15iw];
+        audit15iw.wavelength[i15iw]=wavelength15iw;
+        const bool validWl15iw=std::isfinite((double)wavelength15iw) &&
+            wavelength15iw>=380.f && wavelength15iw<=780.f;
+        const float n15iw=(!dispersion15iw || !validWl15iw) ? nt :
+            (dispersionModel==GLASS_DISPERSION_SELLMEIER ?
+                WaveLength2IORSellmeier(wavelength15iw,sellmeierPreset) :
+                WaveLength2IOR(wavelength15iw,nt,cauchyBValue));
+        audit15iw.nInterior[i15iw]=n15iw;
+        const bool valid15iw=validWl15iw &&
+            std::isfinite((double)n15iw) && n15iw>0.f &&
+            std::isfinite((double)nc) && nc>0.f;
+        audit15iw.laneValid[i15iw]=valid15iw ? 1u : 0u;
+        if (!valid15iw) {++audit15iw.invalid;continue;}
+        const double eta15iw=entering15iw ? (double)nc/n15iw : (double)n15iw/nc;
+        const double sinT2_15iw=eta15iw*eta15iw*sinI2_15iw;
+        audit15iw.sinT2[i15iw]=(float)sinT2_15iw;
+        audit15iw.tir[i15iw]=(sinT2_15iw>=1.) ? 1u : 0u;
+        if (audit15iw.tir[i15iw]!=audit15iw.parentTIR) ++audit15iw.differing;
+    }
+    audit15iw.valid=(audit15iw.count>0u && audit15iw.invalid==0u) ? 1u : 0u;
+    // 15iz: recompute the existing native material sampling policy with
+    // cached, REAL Kr/Kt texture evaluations and each lane's material IOR.
+    // The native parent event remains untouched; these are diagnostic masses.
+    MLHeroLaneMass15iz &mass15iz=mlHeroLaneMass15iz;
+    mass15iz.count=audit15iw.count;
+    mass15iz.krFilter=kr.Filter();mass15iz.ktFilter=kt.Filter();
+    const float filmThickness15iz=filmThickness ? filmThickness->GetFloatValue(hitPoint) : 0.f;
+    const float filmIor15iz=(filmThickness15iz>0.f && filmIor) ?
+        filmIor->GetFloatValue(hitPoint) : 1.f;
+    for (unsigned i15iz=0;i15iz<mass15iz.count;++i15iz) {
+        if (!audit15iw.laneValid[i15iz]) { ++mass15iz.invalid; continue; }
+        const float ni15iz=audit15iw.nInterior[i15iz];
+        const float ntc15iz=ni15iz/nc;
+        const float cos15iz=CosTheta(localFixedDir);
+        const float fresnel15iz=FresnelTexture::CauchyEvaluate(ntc15iz,cos15iz);
+        Spectrum refl15iz=kr*fresnel15iz;
+        if (filmThickness15iz>0.f)
+            refl15iz*=CalcFilmColor(localFixedDir,filmThickness15iz,filmIor15iz);
+        Spectrum trans15iz(0.f);
+        if (!audit15iw.tir[i15iz]) {
+            const float cost15iz=sqrtf(Max(0.f,1.f-audit15iw.sinT2[i15iz]));
+            const float eta15iz=entering15iw ? nc/ni15iz : ni15iz/nc;
+            float ce15iz=0.f;
+            if (!hitPoint.fromLight)
+                ce15iz=(1.f-FresnelTexture::CauchyEvaluate(ntc15iz,
+                    cost15iz*(entering15iw?-1.f:1.f)))*eta15iz*eta15iz;
+            else if (cost15iz>1.e-20f)
+                ce15iz=(1.f-fresnel15iz)*fabsf(cos15iz/cost15iz);
+            trans15iz=kt*ce15iz;
+        }
+        const bool r15iz=!refl15iz.Black(),t15iz=!trans15iz.Black();
+        mass15iz.reflectSupport[i15iz]=r15iz?1u:0u;
+        mass15iz.transmitSupport[i15iz]=t15iz?1u:0u;
+        mass15iz.bothBlack[i15iz]=(!r15iz&&!t15iz)?1u:0u;
+        mass15iz.reflectFilter[i15iz]=r15iz?refl15iz.Filter():0.f;
+        mass15iz.transmitFilter[i15iz]=t15iz?trans15iz.Filter():0.f;
+        float pTx15iz=0.f;
+        if (!r15iz) pTx15iz=t15iz?1.f:0.f;
+        else if (t15iz) pTx15iz=Clamp(mass15iz.transmitFilter[i15iz]/
+                (mass15iz.reflectFilter[i15iz]+mass15iz.transmitFilter[i15iz]),.25f,.75f);
+        mass15iz.transmitMass[i15iz]=pTx15iz;
+        mass15iz.reflectMass[i15iz]=(!r15iz&&!t15iz)?0.f:1.f-pTx15iz;
+        const bool validMass15iz=std::isfinite((double)fresnel15iz) &&
+            std::isfinite((double)mass15iz.reflectFilter[i15iz]) &&
+            std::isfinite((double)mass15iz.transmitFilter[i15iz]) &&
+            std::isfinite((double)pTx15iz);
+        mass15iz.laneValid[i15iz]=validMass15iz?1u:0u;
+        if (!validMass15iz) ++mass15iz.invalid;
+    }
+    mass15iz.valid=(mass15iz.count>0u && mass15iz.invalid==0u)?1u:0u;
+    if (!mlHeroChildReentry15jb && mlHeroGlassTIR15ii.reason == 1u)
+        mlHeroGlassTIRRejected15ii.fetch_add(1ull, std::memory_order_relaxed);
 	
 	const float localFilmThickness = filmThickness ? filmThickness->GetFloatValue(hitPoint) : 0.f;
 	const float localFilmIor = (localFilmThickness > 0.f && filmIor) ? filmIor->GetFloatValue(hitPoint) : 1.f;
@@ -603,6 +900,29 @@ Spectrum GlassMaterial::Sample(const HitPoint &hitPoint,
 	const Spectrum refl = EvalSpecularReflection(hitPoint, localFixedDir,
 			kr, nc, nt, &reflLocalSampledDir, localFilmThickness, localFilmIor);
 
+	// 15ir snapshot: actual computed BSDF lobe filters; no extra evaluations.
+	mlHeroNativeLobe15ir.valid = 1u;
+	mlHeroNativeLobe15ir.reflectionPresent = refl.Black() ? 0u : 1u;
+	mlHeroNativeLobe15ir.transmissionPresent = trans.Black() ? 0u : 1u;
+	mlHeroNativeLobe15ir.black = (refl.Black() && trans.Black()) ? 1u : 0u;
+	mlHeroNativeLobe15ir.reflectionFilter = refl.Black() ? 0.f : refl.Filter();
+	mlHeroNativeLobe15ir.transmissionFilter = trans.Black() ? 0.f : trans.Filter();
+	mlHeroNativeLobe15ir.passThrough = passThroughEvent;
+	// 15is: independently derive the discrete event mass from the lobe support.
+	// This observes the REAL native lobe evaluations (no second BSDF evaluation).
+	MLHeroNativeSpecial15is &special15is=mlHeroNativeSpecial15is;
+	special15is.valid=1u;
+	special15is.tir=(mlHeroGlassTIR15ii.reason == 1u) ? 1u : 0u;
+	special15is.reflectionPresent=refl.Black() ? 0u : 1u;
+	special15is.transmissionPresent=trans.Black() ? 0u : 1u;
+	special15is.bothBlack=(!special15is.reflectionPresent && !special15is.transmissionPresent) ? 1u : 0u;
+	special15is.supportConsistent=(!special15is.tir || !special15is.transmissionPresent) ? 1u : 0u;
+	special15is.expectedThreshold= special15is.bothBlack ? -1.f :
+		(!special15is.reflectionPresent ? 1.f : (!special15is.transmissionPresent ? 0.f :
+			Clamp(trans.Filter() / (refl.Filter() + trans.Filter()), .25f, .75f)));
+	special15is.thresholdConsistent=special15is.bothBlack ? 1u : 0u;
+	special15is.selectedConsistent=special15is.bothBlack ? 1u : 0u;
+	special15is.pdfExpected=0u;
 	// Decide to transmit or reflect
 	float threshold;
 	if (!refl.Black()) {
@@ -620,12 +940,25 @@ Spectrum GlassMaterial::Sample(const HitPoint &hitPoint,
 	} else {
 		if (!trans.Black())
 			threshold = 1.f;
-		else
+		else {
+			mlHeroGlassTIR15ii.selected = 0u;
+            if (!mlHeroChildReentry15jb)
+                mlHeroGlassTIRBlack15ii.fetch_add(1ull, std::memory_order_relaxed);
+			special15is.thresholdConsistent=1u;
+			special15is.selectedConsistent=1u;
 			return Spectrum();
+		}
 	}
+
+	mlHeroGlassTIR15ii.threshold = threshold;
+	mlHeroNativeLobe15ir.threshold = threshold;
+	special15is.thresholdConsistent=(fabsf(special15is.expectedThreshold-threshold) <= 2.e-6f) ? 1u : 0u;
+	special15is.selectedConsistent=((passThroughEvent < special15is.expectedThreshold) == (passThroughEvent < threshold)) ? 1u : 0u;
+	special15is.expectedSelectedPdf=(passThroughEvent < special15is.expectedThreshold) ? special15is.expectedThreshold : (1.f-special15is.expectedThreshold);
 
 	Spectrum result;
 	if (passThroughEvent < threshold) {
+		mlHeroGlassTIR15ii.selected = 2u;
 		// Transmit
 
 		*localSampledDir = transLocalSampledDir;
@@ -636,6 +969,7 @@ Spectrum GlassMaterial::Sample(const HitPoint &hitPoint,
 		result = trans;
 	} else {
 		// Reflect
+		mlHeroGlassTIR15ii.selected = 1u;
 
 		*localSampledDir = reflLocalSampledDir;
 
@@ -645,6 +979,105 @@ Spectrum GlassMaterial::Sample(const HitPoint &hitPoint,
 		result = refl;
 	}
 	
+	special15is.actualSelectedPdf=*pdfW;
+	special15is.pdfExpected=(fabsf(special15is.expectedSelectedPdf-*pdfW) <= 2.e-6f) ? 1u : 0u;
+    // 15jb: parent BSDF already finished. Replay native Child Sample with the
+    // SAME valid real HitPoint, local direction and independent TLS wavelength.
+    // Explicit save/restore of every known Sample-owned TLS state is essential.
+    if (!mlHeroChildReentry15jb && mlHeroNativeChildArmed15je &&
+            mlHeroEnabled && mlHeroWavelengthCount>1u) {
+        const MLHeroGlassTIRState15ii savedTIR=mlHeroGlassTIR15ii;
+        const MLHeroNativeLobe15ir savedLobe=mlHeroNativeLobe15ir;
+        const MLHeroNativeSpecial15is savedSpecial=mlHeroNativeSpecial15is;
+        const MLHeroLaneTIR15iw savedLanes=mlHeroLaneTIR15iw;
+        const MLHeroLaneMass15iz savedMass=mlHeroLaneMass15iz;
+        const float savedWavelength=mlDispersionWaveLength;
+        const float savedSampleWeight=mlDispersionSampleWeight;
+        const bool savedUsed=mlDispersionUsed;
+        const bool savedFallback=mlHeroPacketFallbackUsed;
+        const float savedB=mlDispersionCurrentCauchyB;
+        const GlassDispersionModel savedModel=mlDispersionCurrentModel;
+        const GlassSellmeierPreset savedPreset=mlDispersionCurrentSellmeierPreset;
+        const u_int savedActiveLane=mlHeroActiveLane;
+        MLHeroNativeChild15jb audit={};
+        audit.count=Min(savedMass.count,8u);
+        mlHeroChildReentry15jb=true;
+        for (unsigned i=0;i<audit.count;++i) {
+            if (!savedMass.laneValid[i] || !savedLanes.laneValid[i]) continue;
+            mlDispersionWaveLength=savedLanes.wavelength[i];
+            mlHeroActiveLane=i;
+            mlDispersionSampleWeight=mlHeroSampleWeights[i];
+            mlDispersionUsed=false;
+            mlHeroPacketFallbackUsed=false;
+            Vector childDir;
+            float childPdf=0.f;
+            BSDFEvent childEvent=(BSDFEvent)0;
+            const Spectrum childThroughput=this->Sample(hitPoint,localFixedDir,
+                &childDir,u0,u1,passThroughEvent,&childPdf,&childEvent);
+            const unsigned eventCode=childThroughput.Black()?0u:
+                ((childEvent & TRANSMIT)?2u:((childEvent & REFLECT)?1u:0u));
+            const unsigned expected=savedMass.bothBlack[i]?0u:
+                (passThroughEvent<savedMass.transmitMass[i]?2u:1u);
+            const float expectedPdf=expected==0u?0.f:
+                (expected==2u?savedMass.transmitMass[i]:savedMass.reflectMass[i]);
+            const float norm=eventCode?childDir.Length():0.f;
+            // 15jc: independent double-precision local Snell/reflection equation.
+            // No helper direction or sampled direction is used to construct the reference.
+            const double ci15jc=(double)localFixedDir.z;
+            const double ni15jc=(double)savedLanes.nInterior[i];
+            const double ext15jc=(double)savedTIR.nc;
+            const bool enter15jc=ci15jc>0.;
+            const double eta15jc=enter15jc?ext15jc/ni15jc:ni15jc/ext15jc;
+            const double sinI215jc=Max(0.,1.-ci15jc*ci15jc);
+            const double sinT215jc=eta15jc*eta15jc*sinI215jc;
+            const bool tir15jc=sinT215jc>=1.;
+            Vector predicted15jc;
+            if(eventCode==1u)
+                predicted15jc=Vector(-localFixedDir.x,-localFixedDir.y,localFixedDir.z);
+            else if(eventCode==2u && !tir15jc)
+                predicted15jc=Vector((float)(-eta15jc*localFixedDir.x),
+                    (float)(-eta15jc*localFixedDir.y),
+                    (float)(sqrt(Max(0.,1.-sinT215jc))*(enter15jc?-1.:1.)));
+            const double residual15jc=eventCode?
+                sqrt((double)(childDir.x-predicted15jc.x)*(childDir.x-predicted15jc.x)+
+                     (double)(childDir.y-predicted15jc.y)*(childDir.y-predicted15jc.y)+
+                     (double)(childDir.z-predicted15jc.z)*(childDir.z-predicted15jc.z)) : 0.;
+            const double snell15jc=(eventCode==2u && !tir15jc)?
+                fabs((double)(childDir.x*childDir.x+childDir.y*childDir.y)-sinT215jc):0.;
+            const bool directionOk15jc=eventCode==0u ||
+                ((!tir15jc || eventCode!=2u) && std::isfinite(residual15jc) &&
+                 residual15jc<2.e-4 && std::isfinite(snell15jc) && snell15jc<2.e-4);
+            audit.directionResidual[i]=(float)residual15jc;
+            audit.snellResidual[i]=(float)snell15jc;
+            audit.directionPass[i]=directionOk15jc?1u:0u;
+            audit.tirBlocked[i]=(tir15jc && eventCode!=2u)?1u:0u;
+            const bool ok=eventCode==expected &&
+                fabsf(childPdf-expectedPdf)<2.e-5f &&
+                (eventCode==0u || (std::isfinite((double)norm) && fabsf(norm-1.f)<1.e-3f)) &&
+                !(savedLanes.tir[i] && eventCode==2u) && directionOk15jc;
+            audit.sampled[i]=1u;audit.event[i]=eventCode;
+            audit.expectedEvent[i]=expected;audit.match[i]=ok?1u:0u;
+            audit.pdf[i]=childPdf;audit.expectedPdf[i]=expectedPdf;
+            audit.directionNorm[i]=norm;
+            if (!ok) ++audit.fail;
+        }
+        mlHeroChildReentry15jb=false;
+        mlHeroGlassTIR15ii=savedTIR;
+        mlHeroNativeLobe15ir=savedLobe;
+        mlHeroNativeSpecial15is=savedSpecial;
+        mlHeroLaneTIR15iw=savedLanes;
+        mlHeroLaneMass15iz=savedMass;
+        mlDispersionWaveLength=savedWavelength;
+        mlDispersionSampleWeight=savedSampleWeight;
+        mlDispersionUsed=savedUsed;
+        mlHeroPacketFallbackUsed=savedFallback;
+        mlDispersionCurrentCauchyB=savedB;
+        mlDispersionCurrentModel=savedModel;
+        mlDispersionCurrentSellmeierPreset=savedPreset;
+        mlHeroActiveLane=savedActiveLane;
+        audit.valid=1u;
+        mlHeroNativeChild15jb=audit;
+    }
 	return result / *pdfW;
 }
 
@@ -725,3 +1158,75 @@ PropertiesUPtr GlassMaterial::ToProperties(const ImageMapCache &imgMapCache, con
 	return props;
 }
 // vim: autoindent noexpandtab tabstop=4 shiftwidth=4
+
+// 15kt BEGIN: diagnostic evaluation only; the native Sample/Pdf/Evaluate stay unchanged.
+slg::mlhero15kt::Evidence GlassMaterial::EvaluateMLHeroReverseMass15kt(
+        const HitPoint &forwardHit,const HitPoint &reverseHit,
+        const Vector &fixed,const Vector &reverseFixed,
+        const BSDFEvent event,const float nativeForwardMass) const {
+    using namespace slg::mlhero15kt;
+    Evidence a;a.status=INVALID_INPUT;
+    a.reverseFromLight=reverseHit.fromLight;a.forwardIntoObject=forwardHit.intoObject;
+    a.reverseIntoObject=reverseHit.intoObject;a.fixedCosine=fixed.z;a.reverseCosine=reverseFixed.z;
+    const bool transmit=(event&TRANSMIT)!=0,reflect=(event&REFLECT)!=0;
+    if(!mlHeroEnabled||!(event&SPECULAR)||transmit==reflect||
+            !std::isfinite(nativeForwardMass)||nativeForwardMass<=0.f)return a;
+    for(unsigned c=0;c<3;++c)if(!std::isfinite(fixed[c])||!std::isfinite(reverseFixed[c]))return a;
+    if(!(fixed.LengthSquared()>0.f)||!(reverseFixed.LengthSquared()>0.f))return a;
+    // The existing native helpers write only these TLS values. Restore even on early return.
+    struct Restore {
+        MLHeroGlassTIRState15ii tir=mlHeroGlassTIR15ii;
+        bool used=mlDispersionUsed,fallback=mlHeroPacketFallbackUsed;
+        float b=mlDispersionCurrentCauchyB;
+        GlassDispersionModel model=mlDispersionCurrentModel;
+        GlassSellmeierPreset preset=mlDispersionCurrentSellmeierPreset;
+        ~Restore(){mlHeroGlassTIR15ii=tir;mlDispersionUsed=used;mlHeroPacketFallbackUsed=fallback;
+            mlDispersionCurrentCauchyB=b;mlDispersionCurrentModel=model;mlDispersionCurrentSellmeierPreset=preset;}
+    } restore;
+    a.wavelength=mlDispersionWaveLength;
+    struct Lobes {float threshold=0.f,mass=0.f,nc=0.f,nt=0.f;bool tir=false;Vector direction;};
+    auto evaluate=[&](const HitPoint &hp,const Vector &local,Lobes &out)->bool {
+        const Spectrum kr=Kr->GetSpectrumValue(hp).Clamp(0.f,1.f);
+        const Spectrum kt=Kt->GetSpectrumValue(hp).Clamp(0.f,1.f);
+        const float nc=ExtractExteriorIors(hp,exteriorIor),nt=ExtractInteriorIors(hp,interiorIor);
+        const float b=cauchyB?cauchyB->GetFloatValue(hp):0.f;
+        if(!std::isfinite(nc)||!std::isfinite(nt)||nc<=0.f||nt<=0.f||!std::isfinite(b))return false;
+        if((dispersionModel==GLASS_DISPERSION_SELLMEIER||b>0.f)&&
+                !(mlDispersionWaveLength>=380.f&&mlDispersionWaveLength<=780.f)){
+            a.status=INVALID_WAVELENGTH;return false;
+        }
+        mlDispersionCurrentCauchyB=b;mlDispersionCurrentModel=dispersionModel;
+        mlDispersionCurrentSellmeierPreset=sellmeierPreset;
+        Vector transmitted,reflected;
+        // No sampler call: 0.5 is irrelevant with a valid fixed HERO wavelength.
+        const Spectrum t=EvalSpecularTransmission(hp,local,.5f,kt,nc,nt,b,&transmitted);
+        out.tir=!kt.Black()&&mlHeroGlassTIR15ii.reason==1u;
+        const float thickness=filmThickness?filmThickness->GetFloatValue(hp):0.f;
+        const float film=(thickness>0.f&&filmIor)?filmIor->GetFloatValue(hp):1.f;
+        const Spectrum r=EvalSpecularReflection(hp,local,kr,nc,nt,&reflected,thickness,film);
+        for(unsigned c=0;c<3;++c)if(!std::isfinite(r.c[c])||!std::isfinite(t.c[c])||r.c[c]<0.f||t.c[c]<0.f)return false;
+        if(!r.Black()&&!t.Black()&&(!std::isfinite(r.Filter())||!std::isfinite(t.Filter())||
+                !std::isfinite(r.Filter()+t.Filter())||!(r.Filter()+t.Filter()>0.f)))return false;
+        if(!r.Black())out.threshold=!t.Black()?Clamp(t.Filter()/(r.Filter()+t.Filter()),.25f,.75f):0.f;
+        else out.threshold=!t.Black()?1.f:0.f;
+        out.mass=(r.Black()&&t.Black())?0.f:(transmit?out.threshold:1.f-out.threshold);
+        if(transmit&&!t.Black())out.direction=transmitted;
+        else if(reflect&&!r.Black())out.direction=reflected;
+        out.nc=nc;out.nt=nt;
+        return std::isfinite(out.threshold)&&std::isfinite(out.mass)&&out.mass>=0.f&&out.mass<=1.f;
+    };
+    a.status=INVALID_LOBES;Lobes forward,reverse;
+    if(!evaluate(forwardHit,fixed,forward)||!evaluate(reverseHit,reverseFixed,reverse))return a;
+    a.status=EVALUATED;a.forwardMass=forward.mass;a.reverseMass=reverse.mass;
+    a.forwardThreshold=forward.threshold;a.reverseThreshold=reverse.threshold;
+    a.forwardMatches=CloseMass(forward.mass,nativeForwardMass);a.reverseTir=reverse.tir;
+    a.nc=reverse.nc;a.nt=reverse.nt;
+    if(reverse.mass>0.f){
+        const Vector predicted=slg::mlhero15kp::Normalize(reverse.direction);
+        const double x=double(predicted.x)-fixed.x,y=double(predicted.y)-fixed.y,z=double(predicted.z)-fixed.z;
+        a.directionResidual=std::sqrt(x*x+y*y+z*z);
+        a.supported=std::isfinite(a.directionResidual)&&a.directionResidual<=1.e-4;
+    }
+    return a;
+}
+// 15kt END

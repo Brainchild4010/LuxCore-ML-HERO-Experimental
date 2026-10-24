@@ -20,6 +20,7 @@
 #define	_SLG_GLASSMAT_H
 
 #include "slg/materials/material.h"
+#include "slg/engines/mlhero_glass_reverse15kt.h"
 
 namespace slg {
 
@@ -122,6 +123,11 @@ public:
 			float *cosFixedOut = nullptr, float *sinI2Out = nullptr,
 			float *sinT2Out = nullptr, bool *tirOut = nullptr,
 			float *laneEventPdfWOut = nullptr) const;
+
+    slg::mlhero15kt::Evidence EvaluateMLHeroReverseMass15kt(
+            const HitPoint &forwardHit,const HitPoint &reverseHit,
+            const luxrays::Vector &fixed,const luxrays::Vector &reverseFixed,
+            const BSDFEvent event,const float nativeForwardMass) const;
 
 private:
 

@@ -21,6 +21,7 @@
 
 #include "slg/textures/fresnel/fresneltexture.h"
 #include "slg/materials/material.h"
+#include "luxrays/core/geometry/frame.h"
 
 namespace slg {
 
@@ -49,6 +50,9 @@ public:
 		const luxrays::Vector &localFixedDir, luxrays::Vector *localSampledDir,
 		const float u0, const float u1, const float passThroughEvent,
 		float *pdfW, BSDFEvent *event) const;
+    // CPU HERO: PDF and weight refer to the actually emitted world direction.
+    luxrays::Spectrum SampleMLHeroWorld15ky(const HitPoint&,const luxrays::Frame&,
+        luxrays::Vector*,float,float,float,float*,float*,BSDFEvent*)const;
 	virtual void Pdf(const HitPoint &hitPoint,
 		const luxrays::Vector &localLightDir, const luxrays::Vector &localEyeDir,
 		float *directPdfW, float *reversePdfW) const;
