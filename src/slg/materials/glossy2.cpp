@@ -18,10 +18,38 @@
 
 #include "slg/textures/fresnel/fresneltexture.h"
 #include "slg/materials/glossy2.h"
+#include "slg/engines/mlhero_glossy2_pdf_precision15lg.h"
 
 using namespace std;
 using namespace luxrays;
 using namespace slg;
+
+bool GetMLHeroEnabled();
+
+// Phase 15lg: use one double-precision direction pair for half-vector density
+// and reflection Jacobian.  This removes rare sharp-lobe float reconstruction
+// outliers while preserving the 15lf density correction and HERO-off behavior.
+static float MLHeroGlossy2CoatingPdf15lg(const float roughness,
+		const float anisotropy, const Vector &localFixedDir,
+		const Vector &localSampledDir) {
+	if (!GetMLHeroEnabled())
+		return SchlickBSDF_CoatingPdf(roughness, anisotropy,
+				localFixedDir, localSampledDir);
+
+	const slg::mlhero15kk::V fixed = slg::mlhero15kk::Unit(
+			slg::mlhero15kk::V(localFixedDir));
+	const slg::mlhero15kk::V sampled = slg::mlhero15kk::Unit(
+			slg::mlhero15kk::V(localSampledDir));
+	const slg::mlhero15kk::V wh = slg::mlhero15kk::Unit(fixed + sampled);
+	const double jacobianDenominator = 4. * std::fabs(
+			slg::mlhero15kk::Dot(fixed, wh));
+	if (!(jacobianDenominator > 0.))
+		return 0.f;
+
+	const double halfPdf = slg::mlhero15lb::HalfPdf(roughness, anisotropy,
+			wh.x, wh.y, wh.z);
+	return float(halfPdf / jacobianDenominator);
+}
 
 //------------------------------------------------------------------------------
 // Glossy2 material
@@ -91,7 +119,7 @@ Spectrum Glossy2Material::Evaluate(const HitPoint &hitPoint,
 			const float wBase = 1.f - wCoating;
 
 			*directPdfW = wBase * fabsf (localSampledDir.z * INV_PI) +
-				wCoating * SchlickBSDF_CoatingPdf (roughness, anisotropy, localFixedDir, localSampledDir);
+				wCoating * MLHeroGlossy2CoatingPdf15lg(roughness, anisotropy, localFixedDir, localSampledDir);
 
 		}
 	}
@@ -106,7 +134,7 @@ Spectrum Glossy2Material::Evaluate(const HitPoint &hitPoint,
 			const float wBaseR = 1.f - wCoatingR;
 
 			*reversePdfW = wBaseR * fabsf (localFixedDir.z * INV_PI) +
-				wCoatingR * SchlickBSDF_CoatingPdf (roughness, anisotropy, localSampledDir, localFixedDir);
+				wCoatingR * MLHeroGlossy2CoatingPdf15lg(roughness, anisotropy, localSampledDir, localFixedDir);
 		}
 	}
 	if ((!doublesided) && (localFixedDir.z < 0.f)) {
@@ -173,6 +201,10 @@ Spectrum Glossy2Material::Sample(const HitPoint &hitPoint,
 	// Coating is used only on the front face
 	const float wCoating = SchlickBSDF_CoatingWeight(ks, localFixedDir);
 	const float wBase = 1.f - wCoating;
+	const bool sampledBase15lg = passThroughEvent < wBase;
+	slg::mlhero15lg::Attempt audit15lg(hitPoint.fromLight, GetID(), sampledBase15lg,
+		doublesided, roughness, anisotropy, u0, u1, passThroughEvent, wBase, ks.Filter(),
+		slg::mlhero15kk::V(localFixedDir));
 
 	float basePdf, coatingPdf;
 	Spectrum baseF, coatingF;
@@ -182,26 +214,38 @@ Spectrum Glossy2Material::Sample(const HitPoint &hitPoint,
 		*localSampledDir = Sgn(localFixedDir.z) * CosineSampleHemisphere(u0, u1, &basePdf);
 
 		const float absCosSampledDir = fabsf(localSampledDir->z);
-		if (absCosSampledDir < DEFAULT_COS_EPSILON_STATIC)
+		if (absCosSampledDir < DEFAULT_COS_EPSILON_STATIC) {
+			audit15lg.Reject(slg::mlhero15lg::BASE_REJECT);
 			return Spectrum();
+		}
 
 		baseF = Kd->GetSpectrumValue(hitPoint).Clamp(0.f, 1.f) * INV_PI * fabsf(hitPoint.fromLight ? localFixedDir.z : absCosSampledDir);
 
 		// Evaluate coating BSDF (Schlick BSDF)
 		coatingF = SchlickBSDF_CoatingF(hitPoint.fromLight, ks, roughness, anisotropy, multibounce, localFixedDir, *localSampledDir);
-		coatingPdf = SchlickBSDF_CoatingPdf(roughness, anisotropy, localFixedDir, *localSampledDir);
+		coatingPdf = MLHeroGlossy2CoatingPdf15lg(roughness, anisotropy, localFixedDir, *localSampledDir);
 	} else {
 		// Sample coating BSDF (Schlick BSDF)
+		float nativeCoatingPdf15lg;
 		coatingF = SchlickBSDF_CoatingSampleF(hitPoint.fromLight, ks, roughness, anisotropy, multibounce,
-				localFixedDir, localSampledDir, u0, u1, &coatingPdf);
-		if (coatingF.Black())
+				localFixedDir, localSampledDir, u0, u1, &nativeCoatingPdf15lg);
+		if (coatingF.Black()) {
+			audit15lg.Reject(slg::mlhero15lg::COATING_REJECT);
 			return Spectrum();
+		}
 
 		const float absCosSampledDir = fabsf(localSampledDir->z);
-		if (absCosSampledDir < DEFAULT_COS_EPSILON_STATIC)
+		if (absCosSampledDir < DEFAULT_COS_EPSILON_STATIC) {
+			audit15lg.Reject(slg::mlhero15lg::COATING_REJECT);
 			return Spectrum();
+		}
 
-		coatingF *= coatingPdf;
+		// Reconstruct the unchanged coating BSDF with the native density first;
+		// only the estimator probability is replaced by the generated density.
+		coatingF *= nativeCoatingPdf15lg;
+		coatingPdf = GetMLHeroEnabled() ?
+			MLHeroGlossy2CoatingPdf15lg(roughness, anisotropy,
+					localFixedDir, *localSampledDir) : nativeCoatingPdf15lg;
 
 		// Evaluate base BSDF (Matte BSDF)
 		basePdf = absCosSampledDir * INV_PI;
@@ -211,6 +255,11 @@ Spectrum Glossy2Material::Sample(const HitPoint &hitPoint,
 	*event = GLOSSY | REFLECT;
 
 	*pdfW = coatingPdf * wCoating + basePdf * wBase;
+	if (audit15lg.Active()) {
+		const float wCoatingReverse15lg = SchlickBSDF_CoatingWeight(ks, *localSampledDir);
+		audit15lg.Accept(slg::mlhero15kk::V(*localSampledDir), *pdfW, coatingPdf,
+			1.f - wCoatingReverse15lg);
+	}
 
 	// Absorption
 	const float cosi = fabsf(localSampledDir->z);
@@ -327,7 +376,7 @@ void Glossy2Material::Pdf(const HitPoint &hitPoint,
 			const float wBase = 1.f - wCoating;
 
 			*directPdfW = wBase * fabsf (localSampledDir.z * INV_PI) +
-				wCoating * SchlickBSDF_CoatingPdf (roughness, anisotropy, localFixedDir, localSampledDir);
+				wCoating * MLHeroGlossy2CoatingPdf15lg(roughness, anisotropy, localFixedDir, localSampledDir);
 		}
 	}
 
@@ -342,7 +391,7 @@ void Glossy2Material::Pdf(const HitPoint &hitPoint,
 			const float wBaseR = 1.f - wCoatingR;
 
 			*reversePdfW = wBaseR * fabsf (localFixedDir.z * INV_PI) +
-				wCoatingR * SchlickBSDF_CoatingPdf (roughness, anisotropy, localSampledDir, localFixedDir);
+				wCoatingR * MLHeroGlossy2CoatingPdf15lg(roughness, anisotropy, localSampledDir, localFixedDir);
 		}
 	}
 }

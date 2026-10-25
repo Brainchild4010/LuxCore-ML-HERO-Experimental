@@ -18,6 +18,7 @@
 
 #include "luxrays/core/randomgen.h"
 #include "slg/materials/cloth.h"
+#include "slg/engines/mlhero_cloth_audit15ls.h"
 
 using namespace std;
 using namespace luxrays;
@@ -586,16 +587,37 @@ Spectrum ClothMaterial::Sample(const HitPoint &hitPoint,
 	float umax, scale = specularNormalization;
 	const UV hitPountUV = hitPoint.GetUV(0);
 	const slg::ocl::Yarn *yarn = GetYarn(hitPountUV.u, hitPountUV.v, &uv, &umax, &scale);
-	
+
+	const float baseScale = scale;
 	if (!hitPoint.fromLight)
 	    scale = scale * EvalSpecular(yarn, uv, umax, localFixedDir, *localSampledDir);
 	else
 	    scale = scale * EvalSpecular(yarn, uv, umax, *localSampledDir, localFixedDir);
 
+	// Material::Sample() returns Evaluate() / Pdf().  On light subpaths the
+	// cosine carried by Evaluate() belongs to the fixed light direction while
+	// the cosine-hemisphere proposal PDF belongs to the sampled eye direction.
+	// Keep the material-local adjoint factor here, matching MatteMaterial.
+	const float materialFactor = hitPoint.fromLight ?
+		fabsf(localFixedDir.z / localSampledDir->z) : 1.f;
+
+	if (slg::mlhero15ls::Active(hitPoint.fromLight)) {
+		const Vector &localLightDir = hitPoint.fromLight ? localFixedDir : *localSampledDir;
+		const Vector &localEyeDir = hitPoint.fromLight ? *localSampledDir : localFixedDir;
+		const float evaluateOrderScale = baseScale *
+			EvalSpecular(yarn, uv, umax, localLightDir, localEyeDir);
+		slg::mlhero15ls::Capture(hitPoint.fromLight, GetID(), static_cast<unsigned>(Preset),
+			static_cast<unsigned>(yarn->yarn_type), u0, u1, passThroughEvent,
+			hitPountUV.u, hitPountUV.v, uv.u, uv.v, umax,
+			slg::mlhero15kk::V(localFixedDir), slg::mlhero15kk::V(*localSampledDir),
+			*pdfW, scale, evaluateOrderScale, materialFactor);
+	}
+
 	TextureConstPtr ks = (yarn->yarn_type == slg::ocl::WARP ? Warp_Ks :  Weft_Ks);
 	TextureConstPtr kd = (yarn->yarn_type == slg::ocl::WARP ? Warp_Kd :  Weft_Kd);
 	
-	return kd->GetSpectrumValue(hitPoint).Clamp(0.f, 1.f) + ks->GetSpectrumValue(hitPoint).Clamp(0.f, 1.f) * scale;
+	return (kd->GetSpectrumValue(hitPoint).Clamp(0.f, 1.f) +
+		ks->GetSpectrumValue(hitPoint).Clamp(0.f, 1.f) * scale) * materialFactor;
 }
 
 void ClothMaterial::Pdf(const HitPoint &hitPoint,

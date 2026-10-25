@@ -1,4 +1,13 @@
 #include "slg/engines/mlhero_schlick_audit15la.h"
+#include "slg/engines/mlhero_roughglass_pdf_audit15lc.h"
+#include "slg/engines/mlhero_glossy2_pdf_precision15lg.h"
+#include "slg/engines/mlhero_glossycoating_pdf_fix15li.h"
+#include "slg/engines/mlhero_glossytranslucent_pdf_fix15lk.h"
+#include "slg/engines/mlhero_glossytranslucent_material_audit15ll.h"
+#include "slg/engines/mlhero_carpaint_pdf_audit15lo.h"
+#include "slg/engines/mlhero_velvet_audit15lq.h"
+#include "slg/engines/mlhero_cloth_audit15ls.h"
+#include "slg/engines/mlhero_disney_audit15lu.h"
 #include "slg/engines/mlhero_surface_recovery15kx.h"
 #include "slg/engines/mlhero_surface_trace15kv.h"
 /***************************************************************************
@@ -2850,6 +2859,97 @@ static void MLHeroSchlickReport15la(const slg::mlhero15la::Record&r){
     if(fclose(f)!=0)slg::mlhero15la::writeFailures[r.side].fetch_add(1ull,std::memory_order_relaxed);
 }
 // 15la END
+// 15lc BEGIN: bounded read-only RoughGlass proposal audit.
+static void MLHeroRoughPdfReport15lc(const slg::mlhero15lc::Record&r){
+    std::lock_guard<std::recursive_mutex>lock(mlHeroDebugLogMutex);
+    FILE*f=MLHeroOpenAnyLog15gj("a");
+    const unsigned m=r.vndf?1u:0u;
+    if(!f){slg::mlhero15lc::writeFailures[r.side][m].fetch_add(1ull,std::memory_order_relaxed);return;}
+    slg::mlhero15lc::WriteRecord(f,r,mlHeroThread15fw,mlHeroStep15fw);
+    if(ferror(f))slg::mlhero15lc::writeFailures[r.side][m].fetch_add(1ull,std::memory_order_relaxed);
+    if(fclose(f)!=0)slg::mlhero15lc::writeFailures[r.side][m].fetch_add(1ull,std::memory_order_relaxed);
+}
+// 15lc END
+// 15lg BEGIN: bounded post-precision-fix Glossy2 mixture/proposal PDF audit.
+static void MLHeroGlossy2PdfReport15lg(const slg::mlhero15lg::Record&r){
+    std::lock_guard<std::recursive_mutex>lock(mlHeroDebugLogMutex);
+    FILE*f=MLHeroOpenAnyLog15gj("a");
+    if(!f){slg::mlhero15lg::writeFailures[r.side][r.branch].fetch_add(1ull,std::memory_order_relaxed);return;}
+    slg::mlhero15lg::WriteRecord(f,r,mlHeroThread15fw,mlHeroStep15fw);
+    if(ferror(f))slg::mlhero15lg::writeFailures[r.side][r.branch].fetch_add(1ull,std::memory_order_relaxed);
+    if(fclose(f)!=0)slg::mlhero15lg::writeFailures[r.side][r.branch].fetch_add(1ull,std::memory_order_relaxed);
+}
+// 15lg END
+// 15lo BEGIN: bounded diagnostic-only CarPaint four-way proposal audit.
+static void MLHeroCarPaintPdfReport15lo(const slg::mlhero15lo::Record&r){
+    std::lock_guard<std::recursive_mutex>lock(mlHeroDebugLogMutex);
+    FILE*f=MLHeroOpenAnyLog15gj("a");
+    if(!f){slg::mlhero15lo::writeFailures[r.side][r.branch].fetch_add(1ull,std::memory_order_relaxed);return;}
+    slg::mlhero15lo::WriteRecord(f,r,mlHeroThread15fw,mlHeroStep15fw);
+    if(ferror(f))slg::mlhero15lo::writeFailures[r.side][r.branch].fetch_add(1ull,std::memory_order_relaxed);
+    if(fclose(f)!=0)slg::mlhero15lo::writeFailures[r.side][r.branch].fetch_add(1ull,std::memory_order_relaxed);
+}
+// 15lo END
+// 15lq BEGIN: bounded diagnostic-only Velvet transport/PDF audit.
+static void MLHeroVelvetReport15lq(const slg::mlhero15lq::Record&r){
+    std::lock_guard<std::recursive_mutex>lock(mlHeroDebugLogMutex);
+    FILE*f=MLHeroOpenAnyLog15gj("a");
+    if(!f){slg::mlhero15lq::writeFailures[r.side].fetch_add(1ull,std::memory_order_relaxed);return;}
+    slg::mlhero15lq::WriteRecord(f,r,mlHeroThread15fw,mlHeroStep15fw);
+    if(ferror(f))slg::mlhero15lq::writeFailures[r.side].fetch_add(1ull,std::memory_order_relaxed);
+    if(fclose(f)!=0)slg::mlhero15lq::writeFailures[r.side].fetch_add(1ull,std::memory_order_relaxed);
+}
+// 15lq END
+// 15ls BEGIN: bounded diagnostic-only Cloth transport/PDF audit.
+static void MLHeroClothReport15ls(const slg::mlhero15ls::Record&r){
+    std::lock_guard<std::recursive_mutex>lock(mlHeroDebugLogMutex);
+    FILE*f=MLHeroOpenAnyLog15gj("a");
+    if(!f){slg::mlhero15ls::writeFailures[r.side].fetch_add(1ull,std::memory_order_relaxed);return;}
+    slg::mlhero15ls::WriteRecord(f,r,mlHeroThread15fw,mlHeroStep15fw);
+    if(ferror(f))slg::mlhero15ls::writeFailures[r.side].fetch_add(1ull,std::memory_order_relaxed);
+    if(fclose(f)!=0)slg::mlhero15ls::writeFailures[r.side].fetch_add(1ull,std::memory_order_relaxed);
+}
+// 15ls END
+// 15lu BEGIN: bounded diagnostic-only Disney sampling/PDF/weight audit.
+static void MLHeroDisneyReport15lu(const slg::mlhero15lu::Record&r){
+    std::lock_guard<std::recursive_mutex>lock(mlHeroDebugLogMutex);
+    FILE*f=MLHeroOpenAnyLog15gj("a");
+    if(!f){slg::mlhero15lu::writeFailures[r.side].fetch_add(1ull,std::memory_order_relaxed);return;}
+    slg::mlhero15lu::WriteRecord(f,r,mlHeroThread15fw,mlHeroStep15fw);
+    if(ferror(f))slg::mlhero15lu::writeFailures[r.side].fetch_add(1ull,std::memory_order_relaxed);
+    if(fclose(f)!=0)slg::mlhero15lu::writeFailures[r.side].fetch_add(1ull,std::memory_order_relaxed);
+}
+// 15lu END
+// 15li BEGIN: post-fix GlossyCoating base/coating mixture PDF audit.
+static void MLHeroGlossyCoatingPdfReport15li(const slg::mlhero15li::Record&r){
+    std::lock_guard<std::recursive_mutex>lock(mlHeroDebugLogMutex);
+    FILE*f=MLHeroOpenAnyLog15gj("a");
+    if(!f){slg::mlhero15li::writeFailures[r.side][r.branch].fetch_add(1ull,std::memory_order_relaxed);return;}
+    slg::mlhero15li::WriteRecord(f,r,mlHeroThread15fw,mlHeroStep15fw);
+    if(ferror(f))slg::mlhero15li::writeFailures[r.side][r.branch].fetch_add(1ull,std::memory_order_relaxed);
+    if(fclose(f)!=0)slg::mlhero15li::writeFailures[r.side][r.branch].fetch_add(1ull,std::memory_order_relaxed);
+}
+// 15li END
+// 15lk BEGIN: post-fix GlossyTranslucent coating/mixture audit.
+static void MLHeroGlossyTranslucentPdfReport15lk(const slg::mlhero15lk::Record&r){
+    std::lock_guard<std::recursive_mutex>lock(mlHeroDebugLogMutex);
+    FILE*f=MLHeroOpenAnyLog15gj("a");
+    if(!f){slg::mlhero15lk::writeFailures[r.side][r.face][r.branch].fetch_add(1ull,std::memory_order_relaxed);return;}
+    slg::mlhero15lk::WriteRecord(f,r,mlHeroThread15fw,mlHeroStep15fw);
+    if(ferror(f))slg::mlhero15lk::writeFailures[r.side][r.face][r.branch].fetch_add(1ull,std::memory_order_relaxed);
+    if(fclose(f)!=0)slg::mlhero15lk::writeFailures[r.side][r.face][r.branch].fetch_add(1ull,std::memory_order_relaxed);
+}
+// 15lk END
+// 15ll BEGIN: material-local GlossyTranslucent nonfinite and boundary audit.
+static void MLHeroGlossyTranslucentMaterialReport15ll(const slg::mlhero15ll::Record&r){
+    std::lock_guard<std::recursive_mutex>lock(mlHeroDebugLogMutex);
+    FILE*f=MLHeroOpenAnyLog15gj("a");
+    if(!f){slg::mlhero15ll::writeFailures[r.kind].fetch_add(1ull,std::memory_order_relaxed);return;}
+    slg::mlhero15ll::WriteRecord(f,r,mlHeroThread15fw,mlHeroStep15fw);
+    if(ferror(f))slg::mlhero15ll::writeFailures[r.kind].fetch_add(1ull,std::memory_order_relaxed);
+    if(fclose(f)!=0)slg::mlhero15ll::writeFailures[r.kind].fetch_add(1ull,std::memory_order_relaxed);
+}
+// 15ll END
 
 // 15kv BEGIN logger
 static const char*MLHeroSurfaceKind15kv(unsigned kind){
@@ -4535,6 +4635,16 @@ static std::atomic<unsigned long long> mlHero15etCalls[5];
 static std::atomic<unsigned long long> mlHero15etRejected[5];
 static std::atomic<unsigned long long> mlHero15etLogTickets[5];
 static std::atomic<unsigned long long> mlHero15etApplied[5];
+
+// ML HERO phase 15ln: a non-dispersive RoughGlass packet shares the sampled
+// microfacet event and therefore the native Sample() estimator weight across
+// all wavelength lanes.  Re-evaluating the rounded direction and dividing by
+// the original Sample() PDF is not equivalent in the near-delta limit: the
+// reconstructed half vector can move by a few ULPs while D (and the queried
+// PDF) changes by many orders of magnitude.  Keep the native estimator as the
+// owner and only reconstruct its RGB material colour at each wavelength.
+static std::atomic<unsigned long long> mlHero15lnAnchoredEvents(0ull);
+static std::atomic<unsigned long long> mlHero15lnAnchoredLanes(0ull);
 
 static bool MLHeroRoughValue15et(const BSDF &bsdf, const Vector &dir,
         const BSDFEvent event, const float lambda, Spectrum *value, const u_int stage) {
@@ -7651,12 +7761,28 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
     MLHeroSetNativeGlassChildArmed15je(arm15je);
     slg::mlhero15ki::Begin(MLHeroCurrentDiagnosticsEnabled15cq() &&
         pathVertex->bsdf.GetMaterialType()==ROUGHGLASS);
+    slg::mlhero15lo::Begin(MLHeroCurrentDiagnosticsEnabled15cq() &&
+        pathVertex->bsdf.GetMaterialType()==CARPAINT);
+    slg::mlhero15lq::Begin(MLHeroCurrentDiagnosticsEnabled15cq() &&
+        pathVertex->bsdf.GetMaterialType()==VELVET);
+    slg::mlhero15ls::Begin(MLHeroCurrentDiagnosticsEnabled15cq() &&
+        pathVertex->bsdf.GetMaterialType()==CLOTH);
+    slg::mlhero15lu::Begin(MLHeroCurrentDiagnosticsEnabled15cq() &&
+        pathVertex->bsdf.GetMaterialType()==DISNEY);
     const bool directionAudit15ko=engine->GetType()==slg::BIDIRCPU && engine->mlHeroEnabled && MLHeroCurrentDiagnosticsEnabled15cq();
     slg::mlhero15ko::Begin(directionAudit15ko);
 	const Spectrum bsdfSample = pathVertex->bsdf.Sample(&sampledDir,
 			sampler->GetSample(sampleOffset),
 			sampler->GetSample(sampleOffset + 1),
 			&bsdfPdfW, &cosSampledDir, &event);
+    slg::mlhero15lo::LastSample carPaintLast15lo;
+    const bool hasCarPaintLast15lo = slg::mlhero15lo::Consume(&carPaintLast15lo);
+    slg::mlhero15lq::LastSample velvetLast15lq;
+    const bool hasVelvetLast15lq = slg::mlhero15lq::Consume(&velvetLast15lq);
+    slg::mlhero15ls::LastSample clothLast15ls;
+    const bool hasClothLast15ls = slg::mlhero15ls::Consume(&clothLast15ls);
+    slg::mlhero15lu::LastSample disneyLast15lu;
+    const bool hasDisneyLast15lu = slg::mlhero15lu::Consume(&disneyLast15lu);
     slg::mlhero15ko::armed=false;
     slg::mlhero15ki::armed=false;
     MLHeroSetNativeGlassChildArmed15je(false);
@@ -7740,6 +7866,137 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 	MLHeroGlassSampleAudit15ih(pathVertex->bsdf, bsdfSample, event, bsdfPdfW, cosSampledDir);
 	if (bsdfSample.Black())
 		return false;
+
+	// ML HERO phase 15lo: compare the accepted native CarPaint sample with
+	// both public evaluation paths. This is read-only and consumes no sampler
+	// dimensions; the material-local audit independently checks the true
+	// inverse-CDF proposal density for all four mixture branches.
+	if (hasCarPaintLast15lo && carPaintLast15lo.status == slg::mlhero15lo::ACCEPT) {
+		BSDFEvent evalEvent15lo = NONE;
+		float evalPdf15lo = 0.f, evalRevPdf15lo = 0.f;
+		const Spectrum eval15lo = pathVertex->bsdf.Evaluate(sampledDir,
+			&evalEvent15lo, &evalPdf15lo, &evalRevPdf15lo);
+		float queryPdf15lo = 0.f, queryRevPdf15lo = 0.f;
+		pathVertex->bsdf.Pdf(sampledDir, &queryPdf15lo, &queryRevPdf15lo);
+		const bool evalBlack15lo = eval15lo.Black() || !(evalPdf15lo > 0.f);
+		const bool eventMismatch15lo =
+			((event & REFLECT) != (evalEvent15lo & REFLECT)) ||
+			((event & TRANSMIT) != (evalEvent15lo & TRANSMIT));
+		double weightError15lo = 0.;
+		if (!evalBlack15lo && evalPdf15lo > 0.f) {
+			const Spectrum reconstructed15lo = eval15lo / evalPdf15lo;
+			const double denominator15lo = Max(1e-12,
+				Max(fabs((double)bsdfSample.c[0]),
+					Max(fabs((double)bsdfSample.c[1]), fabs((double)bsdfSample.c[2]))));
+			weightError15lo = Max(
+				fabs((double)bsdfSample.c[0] - (double)reconstructed15lo.c[0]),
+				Max(fabs((double)bsdfSample.c[1] - (double)reconstructed15lo.c[1]),
+					fabs((double)bsdfSample.c[2] - (double)reconstructed15lo.c[2]))) / denominator15lo;
+		}
+		slg::mlhero15lo::RecordQuery(carPaintLast15lo, evalBlack15lo,
+			eventMismatch15lo, bsdfPdfW, evalPdf15lo, queryPdf15lo, weightError15lo);
+	}
+
+	// ML HERO phase 15lq: compare the accepted native Velvet cosine sample
+	// against Evaluate(), Pdf(), the independent cosine density and the
+	// adjoint/reciprocity reconstruction captured in VelvetMaterial::Sample().
+	if (hasVelvetLast15lq && velvetLast15lq.status == slg::mlhero15lq::ACCEPT) {
+		BSDFEvent evalEvent15lq = NONE;
+		float evalPdf15lq = 0.f, evalRevPdf15lq = 0.f;
+		const Spectrum eval15lq = pathVertex->bsdf.Evaluate(sampledDir,
+			&evalEvent15lq, &evalPdf15lq, &evalRevPdf15lq);
+		float queryPdf15lq = 0.f, queryRevPdf15lq = 0.f;
+		pathVertex->bsdf.Pdf(sampledDir, &queryPdf15lq, &queryRevPdf15lq);
+		const bool evalBlack15lq = eval15lq.Black() || !(evalPdf15lq > 0.f);
+		const bool eventMismatch15lq =
+			((event & REFLECT) != (evalEvent15lq & REFLECT)) ||
+			((event & TRANSMIT) != (evalEvent15lq & TRANSMIT));
+		double weightError15lq = 0.;
+		if (!evalBlack15lq && evalPdf15lq > 0.f) {
+			const Spectrum reconstructed15lq = eval15lq / evalPdf15lq;
+			const double denominator15lq = Max(1e-12,
+				Max(fabs((double)bsdfSample.c[0]),
+					Max(fabs((double)bsdfSample.c[1]), fabs((double)bsdfSample.c[2]))));
+			weightError15lq = Max(
+				fabs((double)bsdfSample.c[0] - (double)reconstructed15lq.c[0]),
+				Max(fabs((double)bsdfSample.c[1] - (double)reconstructed15lq.c[1]),
+					fabs((double)bsdfSample.c[2] - (double)reconstructed15lq.c[2]))) / denominator15lq;
+		}
+		slg::mlhero15lq::RecordQuery(velvetLast15lq, evalBlack15lq,
+			eventMismatch15lq, bsdfPdfW, evalPdf15lq, queryPdf15lq,
+			evalRevPdf15lq, queryRevPdf15lq, weightError15lq);
+	}
+
+	// ML HERO phase 15ls: compare the accepted native Cloth cosine sample
+	// against Evaluate(), Pdf(), the independent cosine density and the
+	// material-local light-path/reciprocity reconstruction.
+	if (hasClothLast15ls) {
+		BSDFEvent evalEvent15ls = NONE;
+		float evalPdf15ls = 0.f, evalRevPdf15ls = 0.f;
+		const Spectrum eval15ls = pathVertex->bsdf.Evaluate(sampledDir,
+			&evalEvent15ls, &evalPdf15ls, &evalRevPdf15ls);
+		float queryPdf15ls = 0.f, queryRevPdf15ls = 0.f;
+		pathVertex->bsdf.Pdf(sampledDir, &queryPdf15ls, &queryRevPdf15ls);
+		const bool evalBlack15ls = eval15ls.Black() || !(evalPdf15ls > 0.f);
+		const bool eventMismatch15ls =
+			((event & REFLECT) != (evalEvent15ls & REFLECT)) ||
+			((event & TRANSMIT) != (evalEvent15ls & TRANSMIT));
+		double weightError15ls = 0.;
+		if (!evalBlack15ls && evalPdf15ls > 0.f) {
+			const Spectrum reconstructed15ls = eval15ls / evalPdf15ls;
+			const double denominator15ls = Max(1e-12,
+				Max(fabs((double)bsdfSample.c[0]),
+					Max(fabs((double)bsdfSample.c[1]), fabs((double)bsdfSample.c[2]))));
+			weightError15ls = Max(
+				fabs((double)bsdfSample.c[0] - (double)reconstructed15ls.c[0]),
+				Max(fabs((double)bsdfSample.c[1] - (double)reconstructed15ls.c[1]),
+					fabs((double)bsdfSample.c[2] - (double)reconstructed15ls.c[2]))) / denominator15ls;
+		}
+		slg::mlhero15ls::RecordQuery(clothLast15ls, evalBlack15ls,
+			eventMismatch15ls, bsdfPdfW, evalPdf15ls, queryPdf15ls,
+			evalRevPdf15ls, queryRevPdf15ls, weightError15ls);
+	}
+
+	// ML HERO phase 15lu: compare Disney's accepted three-lobe mixture sample
+	// against Evaluate(), public Pdf(), an independent correct mixture PDF and
+	// the legacy SpecularTint-as-Clearcoat replay.  The second weight residual
+	// now rejects the removed extra-light-cosine behavior.
+	if (hasDisneyLast15lu) {
+		BSDFEvent evalEvent15lu = NONE;
+		float evalPdf15lu = 0.f, evalRevPdf15lu = 0.f;
+		const Spectrum eval15lu = pathVertex->bsdf.Evaluate(sampledDir,
+			&evalEvent15lu, &evalPdf15lu, &evalRevPdf15lu);
+		float queryPdf15lu = 0.f, queryRevPdf15lu = 0.f;
+		pathVertex->bsdf.Pdf(sampledDir, &queryPdf15lu, &queryRevPdf15lu);
+		const bool evalBlack15lu = eval15lu.Black() || !(evalPdf15lu > 0.f);
+		const bool eventMismatch15lu =
+			((event & REFLECT) != (evalEvent15lu & REFLECT)) ||
+			((event & TRANSMIT) != (evalEvent15lu & TRANSMIT));
+		double weightError15lu = 0., doubleCosineError15lu = 0.;
+		if (!evalBlack15lu && evalPdf15lu > 0.f) {
+			const Spectrum reconstructed15lu = eval15lu / evalPdf15lu;
+			const Spectrum predictedDoubleCosine15lu = bsdfSample * disneyLast15lu.lightCos;
+			const double denominator15lu = Max(1e-12,
+				Max(fabs((double)bsdfSample.c[0]),
+					Max(fabs((double)bsdfSample.c[1]), fabs((double)bsdfSample.c[2]))));
+			weightError15lu = Max(
+				fabs((double)bsdfSample.c[0] - (double)reconstructed15lu.c[0]),
+				Max(fabs((double)bsdfSample.c[1] - (double)reconstructed15lu.c[1]),
+					fabs((double)bsdfSample.c[2] - (double)reconstructed15lu.c[2]))) / denominator15lu;
+			const double predictedDenominator15lu = Max(1e-12,
+				Max(fabs((double)predictedDoubleCosine15lu.c[0]),
+					Max(fabs((double)predictedDoubleCosine15lu.c[1]),
+						fabs((double)predictedDoubleCosine15lu.c[2]))));
+			doubleCosineError15lu = Max(
+				fabs((double)predictedDoubleCosine15lu.c[0] - (double)reconstructed15lu.c[0]),
+				Max(fabs((double)predictedDoubleCosine15lu.c[1] - (double)reconstructed15lu.c[1]),
+					fabs((double)predictedDoubleCosine15lu.c[2] - (double)reconstructed15lu.c[2]))) /
+				predictedDenominator15lu;
+		}
+		slg::mlhero15lu::RecordQuery(disneyLast15lu, evalBlack15lu,
+			eventMismatch15lu, bsdfPdfW, evalPdf15lu, queryPdf15lu,
+			weightError15lu, doubleCosineError15lu);
+	}
 
 	// ML HERO phase 15ct: validate continuous RoughGlass at the active HERO
 	// wavelength. For a non-delta BSDF sample, Sample() should match
@@ -13614,7 +13871,24 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
             (event & GLOSSY) && !(event & SPECULAR);
         float roughFactor15et[8] = {};
         const u_int roughStage15et = pathVertex->bsdf.hitPoint.fromLight ? 1u : 0u;
-        if (roughSpectralActive15et) {
+        const bool roughNativePacketAnchor15ln = engine->mlHeroEnabled &&
+            roughSpectralActive15et &&
+            (pathVertex->mlHeroLaneCount > 1u) &&
+            !pathVertex->bsdf.HasMLHeroRoughGlassDispersion();
+        if (roughNativePacketAnchor15ln) {
+            // Sample() already returned the correct f/p estimator for the
+            // exact sampled microfacet.  For a non-dispersive interface only
+            // the RGB material response can vary spectrally; preserve the
+            // native weight and reconstruct that response per lane.  This is
+            // also exact for neutral RoughGlass, where every lane receives the
+            // same scalar.  No PDF query or random draw is added.
+            for (u_int lane = 0; lane < pathVertex->mlHeroLaneCount; ++lane)
+                roughFactor15et[lane] = MLHeroGlassLaneColorSample15df(
+                    bsdfSample, pathVertex->mlHeroLaneWaveLength[lane]);
+            mlHero15lnAnchoredEvents.fetch_add(1ull, std::memory_order_relaxed);
+            mlHero15lnAnchoredLanes.fetch_add(pathVertex->mlHeroLaneCount,
+                std::memory_order_relaxed);
+        } else if (roughSpectralActive15et) {
             const u_int evaluateCount15et = ((event & TRANSMIT) &&
                 pathVertex->bsdf.HasMLHeroRoughGlassDispersion()) ? 1u : pathVertex->mlHeroLaneCount;
             for (u_int lane = 0; lane < evaluateCount15et; ++lane) {
@@ -13912,9 +14186,10 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
                 std::lock_guard<std::recursive_mutex> lock(mlHeroDebugLogMutex);
                 FILE *f = MLHeroOpenAnyLog15gj("a");
                 if (f) {
-                    fprintf(f, "phase15et ROUGHGLASS_BOUNCE stage=%u materialID=%u name=\"%s\" event=%u dispersion=%u collapsed=%u activeCount=%u rrProb=%.9g helperFactor0=%.9g preRR0=%.9g postRRBefore0=%.9g after0=%.9g packetScale=%u colorTransport=SPECTRAL\n",
+                    fprintf(f, "phase15et ROUGHGLASS_BOUNCE stage=%u materialID=%u name=\"%s\" event=%u dispersion=%u nativePacketAnchor15ln=%u collapsed=%u activeCount=%u rrProb=%.9g packetFactor0=%.9g preRR0=%.9g postRRBefore0=%.9g after0=%.9g packetScale=%u colorTransport=SPECTRAL\n",
                         roughStage15et, pathVertex->bsdf.GetMaterialID(), pathVertex->bsdf.GetMaterialName().c_str(),
                         (u_int)event, pathVertex->bsdf.HasMLHeroRoughGlassDispersion() ? 1u : 0u,
+                        roughNativePacketAnchor15ln ? 1u : 0u,
                         pathVertex->mlHeroSecondaryWavelengthsTerminated ? 1u : 0u,
                         pathVertex->mlHeroActiveWavelengthCount, mlHeroRrProb15et, roughFactor15et[0],
                         mlHeroBeforeTP[0].c[0], lanePreGlassSpectrum15dm[0].c[0],
@@ -15226,6 +15501,8 @@ void BiDirCPURenderEngine::PrepareMLHeroDiagnostics15kd() {
             mlHero15etLogTickets[stage].store(0ull, std::memory_order_relaxed);
             mlHero15etApplied[stage].store(0ull, std::memory_order_relaxed);
         }
+        mlHero15lnAnchoredEvents.store(0ull, std::memory_order_relaxed);
+        mlHero15lnAnchoredLanes.store(0ull, std::memory_order_relaxed);
         for (u_int side = 0u; side < 2u; ++side) {
             mlHero15evEvents[side].store(0ull, std::memory_order_relaxed);
             mlHero15evCalls[side].store(0ull, std::memory_order_relaxed);
@@ -15255,6 +15532,15 @@ void BiDirCPURenderEngine::PrepareMLHeroDiagnostics15kd() {
         slg::mlhero15kv::Reset();
         slg::mlhero15kx::Reset();
         slg::mlhero15la::Reset();
+        slg::mlhero15lc::Reset();
+        slg::mlhero15lg::Reset();
+        slg::mlhero15lo::Reset();
+		slg::mlhero15lq::Reset();
+		slg::mlhero15ls::Reset();
+		slg::mlhero15lu::Reset();
+        slg::mlhero15li::Reset();
+        slg::mlhero15lk::Reset();
+		slg::mlhero15ll::Reset();
         MLHeroReset15kq();
         MLHeroReset15ex();
         MLHeroReset15ey();
@@ -15335,6 +15621,26 @@ void BiDirCPURenderEngine::PrepareMLHeroDiagnostics15kd() {
             fprintf(f,"phase15lb METAL_PDF_FIX enabled=%u scope=CPU_HERO_METAL2 halfMeasure=SOLID_ANGLE directionJacobian=4_ABS_DOT_FIXED_HALF sampleWeight=D_OVER_GENERATED_DENSITY rejectionRenormalization=0 brdfDChanged=0 spectralHelpersCorrected=1\n",engine->mlHeroEnabled?1u:0u);
             fprintf(f,"phase15la SCHLICK_AUDIT_CONFIG scope=CPU_HERO_BIDIR_CURRENT_METAL2 selectedAttemptsPerWorkerSide=256 detailsPerSide=16 measure=HALF_VECTOR_SOLID_ANGLE reference=ANALYTIC_INVERSE_MAP_JACOBIAN independentClaimReplay=1 rejectedSamples=INCLUDED conditionalRenormalization=NONE comparisonToleranceRelative=0.0002 histograms=16_BINS_NOT_IID_TEST status0=PRE_DRAW_REJECT status1=HEMISPHERE_REJECT status2=PDF_REJECT status3=GEOMETRY_PDF_ACCEPTED reset=engine_before_workers workerTLS=RESET_SCOPED extraTextureQueries=0 extraSampling=0 independentReferenceNeverApplied=1 productionPdf=GENERATED_HALF_DENSITY physicsChanged=15LB_METAL2_PDF_WEIGHT\n");
             slg::mlhero15la::WriteFixtures(f);
+            fprintf(f,"phase15lc ROUGH_PDF_AUDIT_CONFIG scope=CPU_HERO_BIDIR_CURRENT_ROUGHGLASS selectedDrawsPerWorkerSide=256 detailsPerSideSampler=16 samplers=VNDF_AND_SCHLICK_NDF events=REFLECT_AND_TRANSMIT halfMeasure=SOLID_ANGLE directionMeasure=SOLID_ANGLE reference=INDEPENDENT_ANALYTIC_DENSITY_AND_JACOBIAN rejectedSamples=INCLUDED conditionalRenormalization=NONE comparisonToleranceRelative=0.0002 extraTextureQueries=0 extraSampling=0 physicsChanged=0 reset=engine_before_workers workerTLS=RESET_SCOPED\n");
+            fprintf(f,"phase15ld ROUGHGLASS_PDF_FIX enabled=%u scope=CPU_HERO_ROUGHGLASS sampler=ANISOTROPIC_SCHLICK_NDF halfMeasure=SOLID_ANGLE directionJacobians=REFLECT_AND_TRANSMIT sampleWeight=D_OVER_GENERATED_DENSITY fresnelImportance=PRESERVED forwardAndReversePdf=CORRECTED spectralHelpers=CORRECTED rejectionRenormalization=0 brdfDChanged=0 vndfChanged=0 randomSequenceChanged=0 physicsChanged=SAMPLING_PDF_AND_ESTIMATOR_WEIGHT\n",engine->mlHeroEnabled?1u:0u);
+            fprintf(f,"phase15lf GLOSSY2_PDF_FIX enabled=%u scope=CPU_HERO_GLOSSY2_COATING_CAPABLE_PATH branches=BASE_AND_COATING sampler=SCHLICK_NDF halfMeasure=SOLID_ANGLE directionJacobian=4_ABS_DOT_FIXED_HALF mixtureWeights=NATIVE_COATING_WEIGHT forwardAndReversePdf=CORRECTED sampleWeight=FULL_MIXTURE_BSDF_OVER_CORRECTED_MIXTURE_PDF brdfDChanged=0 fresnelChanged=0 lobeSelectionChanged=0 randomSequenceChanged=0 rejectionRenormalization=0 physicsChanged=SAMPLING_PDF_AND_ESTIMATOR_WEIGHT\n",engine->mlHeroEnabled?1u:0u);
+            fprintf(f,"phase15lg GLOSSY2_PDF_PRECISION_FIX enabled=%u scope=CPU_HERO_GLOSSY2_COATING_CAPABLE_PATH halfReconstruction=DOUBLE_UNIT_DIRECTION_PAIR directionJacobian=DOUBLE_4_ABS_DOT_FIXED_HALF correctedDensity=15LF_RETAINED sampleDirectionChanged=0 randomSequenceChanged=0 brdfChanged=0 fresnelChanged=0 lobeSelectionChanged=0 heroOffChanged=0 physicsChanged=PDF_NUMERICAL_PRECISION\n",engine->mlHeroEnabled?1u:0u);
+            fprintf(f,"phase15lg GLOSSY2_PDF_AUDIT_CONFIG scope=CPU_HERO_BIDIR_CURRENT_GLOSSY2_COATING_CAPABLE_PATH branches=BASE_AND_COATING selectedAttemptsPerWorkerSideBranch=256 detailsPerSideBranch=16 proposal=BASE_COSINE_PLUS_COATING_SCHLICK_NDF mixtureWeights=NATIVE_COATING_WEIGHT forwardAndReverse=1 reference=INDEPENDENT_SCHLICK_INVERSE_CDF_PLUS_COSINE_MIXTURE rejectedSamples=INCLUDED conditionalRenormalization=NONE comparisonToleranceRelative=0.0002 extraTextureQueries=0 extraSampling=0 rendererPdfQueries=0 expectedMismatches=ZERO physicsChanged=1 reset=engine_before_workers workerTLS=RESET_SCOPED\n");
+            fprintf(f,"phase15li GLOSSYCOATING_PDF_FIX enabled=%u scope=CPU_HERO_GLOSSYCOATING_FRONT_CONTINUOUS_REFLECTION branches=BASE_AND_COATING sampler=SCHLICK_NDF halfMeasure=SOLID_ANGLE directionJacobian=DOUBLE_4_ABS_DOT_FIXED_HALF mixtureWeights=NATIVE_COATING_WEIGHT basePdf=NATIVE forwardAndReversePdf=CORRECTED sampleWeight=FULL_LAYERED_BSDF_OVER_CORRECTED_MIXTURE_PDF brdfDChanged=0 baseBSDFChanged=0 fresnelChanged=0 absorptionChanged=0 lobeSelectionChanged=0 randomSequenceChanged=0 transmissionChanged=0 backfaceChanged=0 rejectionRenormalization=0 heroOffChanged=0 physicsChanged=SAMPLING_PDF_AND_ESTIMATOR_WEIGHT\n",engine->mlHeroEnabled?1u:0u);
+            fprintf(f,"phase15li GLOSSYCOATING_PDF_AUDIT_CONFIG scope=CPU_HERO_BIDIR_CURRENT_GLOSSYCOATING_FRONT_CONTINUOUS_REFLECTION branches=BASE_AND_COATING selectedAttemptsPerWorkerSideBranch=256 detailsPerSideBranch=16 proposal=NATIVE_BASE_PLUS_COATING_SCHLICK_NDF mixtureWeights=NATIVE_COATING_WEIGHT forwardAndReverse=1 baseReference=NATIVE_SAMPLE_OR_EVALUATE_PDF baseReplay=BOUNDED_MATERIAL_PDF_QUERY coatingReference=INDEPENDENT_SCHLICK_INVERSE_CDF rejectedSamples=INCLUDED outOfScope=TRANSMISSION_BACKFACE_OR_SPECULAR_BASE conditionalRenormalization=NONE comparisonToleranceRelative=0.0002 extraSamplerDraws=0 extraBasePdfQueries=BOUNDED_ACCEPTED_SELECTED_ONLY extraCoatingTextureQueries=0 expectedMismatches=ZERO rendererPhysicsChanged=1 reset=engine_before_workers workerTLS=RESET_SCOPED\n");
+            fprintf(f,"phase15lk GLOSSYTRANSLUCENT_PDF_FIX enabled=%u scope=CPU_HERO_GLOSSYTRANSLUCENT_REFLECTION faces=FRONT_AND_BACK branches=BASE_AND_COATING sampler=SCHLICK_NDF halfMeasure=SOLID_ANGLE directionJacobian=DOUBLE_4_ABS_DOT_FIXED_HALF mixtureWeights=OUTER_REFLECT_0.5_TIMES_NATIVE_COATING_WEIGHT forwardAndReversePdf=CORRECTED sampleWeight=FULL_LAYERED_BSDF_OVER_CORRECTED_MIXTURE_PDF backfaceCoatingHalf=FLIPPED_TO_FIXED_HEMISPHERE transmissionDegenerateHalf=ZERO_FRESNEL_TERMS brdfDChanged=0 baseBSDFChanged=0 fresnelChanged=0 absorptionChanged=0 lobeSelectionChanged=0 randomSequenceChanged=0 rejectionRenormalization=0 heroOffPdfAndSamplingChanged=0 transmissionChanged=DEGENERATE_NAN_GUARD_ONLY physicsChanged=SAMPLING_PDF_ESTIMATOR_WEIGHT_BACKFACE_SUPPORT_AND_NAN_GUARD\n",engine->mlHeroEnabled?1u:0u);
+            fprintf(f,"phase15lk GLOSSYTRANSLUCENT_PDF_AUDIT_CONFIG scope=CPU_HERO_BIDIR_CURRENT_GLOSSYTRANSLUCENT_REFLECTION faces=FRONT_AND_BACK branches=BASE_AND_COATING selectedAttemptsPerWorkerSideFaceBranch=256 detailsPerSideFaceBranch=8 proposal=HALF_BASE_COSINE_PLUS_HALF_COATING_SCHLICK_NDF mixtureWeights=OUTER_REFLECT_0.5_TIMES_NATIVE_COATING_WEIGHT forwardAndReverse=1 coatingReference=INDEPENDENT_SCHLICK_INVERSE_CDF faceOrientationReference=GENERATED_HALF_ORIENTED_TO_FIXED directionComparison=FRONT_AND_BACK_COATING rejectedSamples=INCLUDED transmission=CONTROL_DEGENERATE_HALF_GUARDED conditionalRenormalization=NONE comparisonToleranceRelative=0.0002 extraSamplerDraws=0 extraTextureQueries=0 expectedMismatches=ZERO rendererPhysicsChanged=1 reset=engine_before_workers workerTLS=RESET_SCOPED\n");
+			fprintf(f,"phase15ll GLOSSYTRANSLUCENT_MATERIAL_AUDIT_CONFIG scope=CPU_HERO_BIDIR_CURRENT_GLOSSYTRANSLUCENT_EVALUATE_POST_15LM events=REFLECTION_AND_TRANSMISSION captures=LOCAL_DIRECTIONS_RAW_AND_NORMALIZED_HALF_COSINES_D_G_FRESNEL_ABSORPTION_BASE_COATING_RESULT_DIRECT_AND_REVERSE_PDF expectedNonfinite=ZERO previousFrontBoundaryAudit=SUPERSEDED_BY_15LM_PRECISE_SAMPLER nonfiniteDetailsPerEvent=32 extraSamplerDraws=0 extraTextureQueries=0 rendererPhysicsChanged=0 reset=engine_before_workers workerTLS=RESET_SCOPED\n");
+			fprintf(f,"phase15lm GLOSSYTRANSLUCENT_TANGENT_AND_FRONT_DIRECTION_FIX enabled=%u tangentSupport=ABS_LOCAL_LIGHT_AND_EYE_Z_AT_LEAST_DEFAULT_COS_EPSILON EvaluateAndPdf=TANGENT_RETURNS_ZERO SampleSupport=UNCHANGED transmissionAbsorptionZeroOverZeroPrevented=1 reflectionSchlickZeroOverZeroPrevented=1 heroCoatingSampler=DOUBLE_SCHLICK_INVERSE_CDF_BOTH_FACES halfOrientation=TO_FIXED_SIDE sameU01=1 extraSamplerDraws=0 lobeSelectionChanged=0 brdfChanged=0 fresnelChanged=0 absorptionChanged=0 rejectionRenormalization=0 heroOffCoatingSamplerChanged=0 physicsChanged=TANGENT_SUPPORT_AND_HERO_FRONT_DIRECTION_PRECISION\n",engine->mlHeroEnabled?1u:0u);
+			fprintf(f,"phase15ln ROUGHGLASS_NONDISPERSIVE_PACKET_ANCHOR_FIX enabled=%u scope=CPU_HERO_BIDIR_WAVELENGTH_COUNT_GT_1_CONTINUOUS_NONDISPERSIVE_ROUGHGLASS estimatorOwner=NATIVE_SAMPLE_WEIGHT laneColor=COMPENSATED_SPECTRAL_RECONSTRUCTION reevaluatedRoundedHalfVector=NOT_USED samplePdfDivision=NOT_USED dispersionChanged=0 hero1Changed=0 heroOffChanged=0 extraSamplerDraws=0 extraPdfQueries=0 eventSelectionChanged=0 directionChanged=0 misPdfChanged=0 physicsChanged=NONDISPERSIVE_MULTILANE_ROUGHGLASS_ESTIMATOR_WEIGHT\n",engine->mlHeroEnabled?1u:0u);
+			fprintf(f,"phase15lo CARPAINT_PDF_AUDIT_CONFIG scope=CPU_HERO_BIDIR_CURRENT_CARPAINT branches=BASE_LAYER1_LAYER2_LAYER3 selectedAttemptsPerWorkerSideBranch=256 detailsPerSideBranch=16 proposal=EQUAL_WEIGHT_ACTIVE_COMPONENT_MIXTURE halfReference=INDEPENDENT_SCHLICK_INVERSE_CDF directionReference=HALF_DENSITY_OVER_4_ABS_DOT_FIXED_HALF baseReference=COSINE_HEMISPHERE checks=NATIVE_SAMPLE_VS_EVALUATE_VS_PDF_QUERY_AND_GENERATED_PROPOSAL inactiveLayerSelectionChecked=1 rejectedSamplesIncluded=1 conditionalRenormalization=NONE comparisonToleranceRelative=0.0002 extraSamplerDraws=0 rendererPhysicsChanged=0 reset=engine_before_workers workerTLS=RESET_SCOPED\n");
+			fprintf(f,"phase15lp CARPAINT_PDF_FIX enabled=%u scope=CPU_HERO_CARPAINT branches=BASE_LAYER1_LAYER2_LAYER3 branchSelection=COMPACT_EQUAL_WEIGHT_ACTIVE_COMPONENT_SLOTS sampler=SCHLICK_INVERSE_CDF halfMeasure=SOLID_ANGLE directionJacobian=DOUBLE_4_ABS_DOT_FIXED_HALF mixturePdf=GENERATED_COSINE_PLUS_ACTIVE_GLOSSY_DENSITIES sampleWeight=FULL_BSDF_AT_EMITTED_DIRECTION_OVER_CORRECTED_MIXTURE_PDF lightPathCosines=BSDF_LIGHT_DIRECTION_AND_PROPOSAL_SAMPLED_DIRECTION_SEPARATED forwardAndReversePdf=CORRECTED brdfDChanged=0 fresnelChanged=0 absorptionChanged=0 randomSequenceChanged=0 rejectionRenormalization=0 heroOffChanged=0 physicsChanged=LOBE_SELECTION_SAMPLING_PDF_AND_ESTIMATOR_WEIGHT\n",engine->mlHeroEnabled?1u:0u);
+			fprintf(f,"phase15lr VELVET_RECIPROCAL_CLAMP_FIX enabled=%u scope=CPU_VELVET_ALL_RENDER_MODES clampTarget=PHYSICAL_BRDF_BEFORE_LIGHT_COSINE symmetry=LIGHT_EYE_PRODUCT lowerAndUpperClamp=RETAINED phasePolynomialChanged=0 thicknessChanged=0 samplerChanged=0 pdfChanged=0 randomSequenceChanged=0 heroOffChanged=1 physicsChanged=RECIPROCAL_BRDF_CLAMP\n",engine->mlHeroEnabled?1u:0u);
+			fprintf(f,"phase15lq VELVET_AUDIT_CONFIG scope=CPU_HERO_BIDIR_CURRENT_VELVET sampler=COSINE_HEMISPHERE measure=SOLID_ANGLE selectedAttemptsPerWorkerSide=256 detailsPerSide=24 checks=SAMPLE_VS_EVALUATE_VS_PDF_QUERY_FORWARD_AND_REVERSE_PLUS_INDEPENDENT_COSINE_DENSITY phaseReference=DOUBLE_LEGENDRE_P1_P2_P3_THICKNESS clampAudit=SYMMETRIC_PHYSICAL_BRDF_LOWER_AND_UPPER reciprocityReference=SWAPPED_PHYSICAL_BSDF_AFTER_15LR_CLAMP comparisonToleranceRelative=0.0002 extraSamplerDraws=0 acceptedSamplePdfQueries=2 rendererPhysicsChanged=RECIPROCAL_BRDF_CLAMP reset=engine_before_workers workerTLS=RESET_SCOPED\n");
+			fprintf(f,"phase15lt CLOTH_LIGHT_TRANSPORT_WEIGHT_FIX enabled=%u scope=CPU_CLOTH_ALL_RENDER_MODES factor=ABS_FIXED_LIGHT_COS_OVER_ABS_SAMPLED_EYE_COS placement=MATERIAL_SAMPLE_BEFORE_PUBLIC_BSDF_ADJOINT_WRAPPER reference=MATTE_MATERIAL samplerChanged=0 pdfChanged=0 brdfChanged=0 yarnSpecularChanged=0 randomSequenceChanged=0 heroOffChanged=1 physicsChanged=LIGHT_SUBPATH_ESTIMATOR_WEIGHT\n",engine->mlHeroEnabled?1u:0u);
+			fprintf(f,"phase15ls CLOTH_AUDIT_CONFIG scope=CPU_HERO_BIDIR_CURRENT_CLOTH presets=DENIM_SILKSHANTUNG_SILKCHARMEUSE_COTTONTWILL_WOOLGABARDINE_POLYESTER sampler=COSINE_HEMISPHERE measure=SOLID_ANGLE selectedAcceptedSamplesPerWorkerSide=256 detailsPerSide=24 checks=INDEPENDENT_COSINE_PDF_PLUS_SAMPLE_VS_EVALUATE_VS_PDF_FORWARD_AND_REVERSE_PLUS_SAMPLE_EVALUATE_SPECULAR_ORDER_PLUS_LIGHT_PATH_MATERIAL_FACTOR comparisonToleranceRelative=0.0002 fixedLightMaterialFactor=ABS_LIGHT_COS_OVER_ABS_EYE_COS extraSamplerDraws=0 acceptedSamplePdfQueries=2 extraSpecularEvaluations=BOUNDED_SELECTED_ONLY rendererPhysicsChanged=LIGHT_SUBPATH_ESTIMATOR_WEIGHT reset=engine_before_workers workerTLS=RESET_SCOPED\n");
+			fprintf(f,"phase15lv DISNEY_TRANSPORT_PDF_TINT_FIX enabled=%u scope=CPU_AND_OPENCL_DISNEY evaluateCosine=SINGLE publicPdfClearcoatSource=CLEARCOAT tintLuminanceCoefficients=0.3_0.6_0.1 samplerChanged=0 lobeSelectionChanged=0 randomSequenceChanged=0 physicsChanged=TRANSPORT_PDF_AND_TINT\n",engine->mlHeroEnabled?1u:0u);
+			fprintf(f,"phase15lv DISNEY_AUDIT_CONFIG scope=CPU_HERO_BIDIR_CURRENT_DISNEY branches=METALLIC_CLEARCOAT_DIFFUSE selectedAcceptedSamplesPerWorkerSide=256 detailsPerSide=24 checks=SAMPLE_VS_EVALUATE_VS_PUBLIC_PDF_PLUS_INDEPENDENT_CORRECT_MIXTURE_PLUS_LEGACY_SPECULARTINT_AS_CLEARCOAT_REPLAY_PLUS_OLD_DOUBLE_LIGHT_COSINE_REPLAY comparisonToleranceRelative=0.0002 expectedEvaluate=SINGLE_LIGHT_COSINE expectedPublicPdf=CLEARCOAT_READS_CLEARCOAT extraSamplerDraws=0 acceptedSamplePdfQueries=2 extraLegacyPdfEvaluations=1_PER_SELECTED rendererPhysicsChanged=DISNEY_TRANSPORT_PDF_AND_TINT reset=engine_before_workers workerTLS=RESET_SCOPED\n");
             fprintf(f,"phase15kz RR_RUNTIME_CONFIG engine=BIDIRCPU source=ENGINE_FIELDS heroEnabled=%u wavelengths=%u spectralMaterialRR=%u spectralGlassRR=%u rrStartDepth=%u rrMinimumSurvival=%.9g maxEyePathDepth=%u maxLightPathDepth=%u materialScope=EyeMatteMetal2Glossy2 glassScope=EyeIdealGlass flagsAreRequestedSettings=1 eligibilityRequiresHeroAndMultipleWavelengths=1 decisionCounts=NOT_REPORTED rendererPhysicsChanged=0\n",
                 engine->mlHeroEnabled?1u:0u,static_cast<unsigned>(engine->mlHeroWavelengthCount),
                 engine->mlHeroRRMaterialExperiment?1u:0u,engine->mlHeroRRGlassEtaExperiment?1u:0u,
@@ -15675,6 +15981,7 @@ void BiDirCPURenderEngine::PrepareMLHeroDiagnostics15kd() {
             fprintf(f, "ML HERO phase 15du CONFIG: diagnosticOnly=1 roughGlassRenderer=15et_SPECTRAL legacyBlend25Removed=1 audit=microfacet_ownership heroOwnsSampledMicrofacet=1 compare=sameMicrofacetNaturalDirection_vs_sharedHeroDirection split=NDF_vs_refractionJacobian rendererPhysicsChanged=0\n");
             fprintf(f, "ML HERO phase 15er CONFIG: roughGlassAllModesDispersiveTransmit=HERO_ONLY_ONE_SHOT nonDispersiveRoughGlass=PACKET heroLane=unblended_f_over_p packetToSingleScale=N_once postCollapse=ordinary_single_hero modes=0,1,2 sampleFallback=unblended_f_over_p rendererPhysicsChanged=1 heroOffUntouched=1 reflectionUntouched=1 idealGlassUntouched=1\n");
 			fprintf(f, "ML HERO phase 15et CONFIG: RoughGlass=ALL_MODES_CONTINUOUS_SPECTRAL stages=0_eyeBounce,1_lightBounce,2_DLS,3_ConnectVertices,4_ConnectToEye color=MATCH_PATH_15ES sharedSamplePdf=HERO rr=ONCE collapse=TX_ONLY_xN_ONCE nonDispersive=PACKET mode2Blend25=BYPASSED_FOR_CONTINUOUS_ROUGHGLASS PATH=UNCHANGED_15ES\n");
+			fprintf(f, "phase15ln ROUGHGLASS_PACKET_ANCHOR_CONFIG nonDispersivePacket=NATIVE_SAMPLE_WEIGHT laneCounts=2_TO_8 nearDeltaSafe=1 coloredKrKt=PER_LANE_COMPENSATED_RECONSTRUCTION dispersivePath=UNCHANGED diagnosticsCountersOnly=1\n");
             fprintf(f, "------------------------------------------------------------\n");
 			fclose(f);
 		}
@@ -15703,6 +16010,24 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
         MLHeroCurrentDiagnosticsEnabled15cq(),MLHeroSurfaceReport15kv);
     slg::mlhero15la::WorkerScope schlickScope15la(engine->GetType()==BIDIRCPU&&engine->mlHeroEnabled&&
         MLHeroCurrentDiagnosticsEnabled15cq(),MLHeroSchlickReport15la);
+    slg::mlhero15lc::WorkerScope roughPdfScope15lc(engine->GetType()==BIDIRCPU&&engine->mlHeroEnabled&&
+        MLHeroCurrentDiagnosticsEnabled15cq(),MLHeroRoughPdfReport15lc);
+    slg::mlhero15lg::WorkerScope glossy2PdfScope15lg(engine->GetType()==BIDIRCPU&&engine->mlHeroEnabled&&
+        MLHeroCurrentDiagnosticsEnabled15cq(),MLHeroGlossy2PdfReport15lg);
+    slg::mlhero15lo::WorkerScope carPaintPdfScope15lo(engine->GetType()==BIDIRCPU&&engine->mlHeroEnabled&&
+        MLHeroCurrentDiagnosticsEnabled15cq(),MLHeroCarPaintPdfReport15lo);
+    slg::mlhero15lq::WorkerScope velvetScope15lq(engine->GetType()==BIDIRCPU&&engine->mlHeroEnabled&&
+        MLHeroCurrentDiagnosticsEnabled15cq(),MLHeroVelvetReport15lq);
+    slg::mlhero15ls::WorkerScope clothScope15ls(engine->GetType()==BIDIRCPU&&engine->mlHeroEnabled&&
+        MLHeroCurrentDiagnosticsEnabled15cq(),MLHeroClothReport15ls);
+    slg::mlhero15lu::WorkerScope disneyScope15lu(engine->GetType()==BIDIRCPU&&engine->mlHeroEnabled&&
+        MLHeroCurrentDiagnosticsEnabled15cq(),MLHeroDisneyReport15lu);
+    slg::mlhero15li::WorkerScope glossyCoatingPdfScope15li(engine->GetType()==BIDIRCPU&&engine->mlHeroEnabled&&
+        MLHeroCurrentDiagnosticsEnabled15cq(),MLHeroGlossyCoatingPdfReport15li);
+    slg::mlhero15lk::WorkerScope glossyTranslucentPdfScope15lk(engine->GetType()==BIDIRCPU&&engine->mlHeroEnabled&&
+        MLHeroCurrentDiagnosticsEnabled15cq(),MLHeroGlossyTranslucentPdfReport15lk);
+    slg::mlhero15ll::WorkerScope glossyTranslucentMaterialScope15ll(engine->GetType()==BIDIRCPU&&engine->mlHeroEnabled&&
+        MLHeroCurrentDiagnosticsEnabled15cq(),MLHeroGlossyTranslucentMaterialReport15ll);
     slg::mlhero15kg::ResetThread(engine->GetType() == BIDIRCPU &&
         MLHeroCurrentDiagnosticsEnabled15cq());
 
@@ -16266,6 +16591,15 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
                     mlHero15kqArrivals[side15kq].load(std::memory_order_relaxed),mlHero15kqInvalid[side15kq].load(std::memory_order_relaxed),
                     mlHero15kqTruncated[side15kq].load(std::memory_order_relaxed),mlHero15kqWriteFailures[side15kq].load(std::memory_order_relaxed));
             slg::mlhero15la::WriteSummary(f15cq);
+            slg::mlhero15lc::WriteSummary(f15cq);
+            slg::mlhero15lg::WriteSummary(f15cq);
+            slg::mlhero15lo::WriteSummary(f15cq);
+			slg::mlhero15lq::WriteSummary(f15cq);
+			slg::mlhero15ls::WriteSummary(f15cq);
+			slg::mlhero15lu::WriteSummary(f15cq);
+            slg::mlhero15li::WriteSummary(f15cq);
+            slg::mlhero15lk::WriteSummary(f15cq);
+			slg::mlhero15ll::WriteSummary(f15cq);
             for(unsigned s15kx=0;s15kx<2;++s15kx)
                 fprintf(f15cq,"phase15kx SURFACE_RECOVERY_SUMMARY side=%s attempts=%llu recovered=%llu unrecoverable=%llu scope=DIAGNOSTIC_WORKERS_ONLY\n",
                     s15kx?"LIGHT":"EYE",slg::mlhero15kx::counters[s15kx][0].load(std::memory_order_relaxed),
@@ -16881,6 +17215,9 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
                     stage, mlHero15etCalls[stage].load(std::memory_order_relaxed),
                     mlHero15etRejected[stage].load(std::memory_order_relaxed),
                     mlHero15etApplied[stage].load(std::memory_order_relaxed));
+            fprintf(f15cq, "phase15ln ROUGHGLASS_PACKET_ANCHOR_SUMMARY anchoredEvents=%llu anchoredLanes=%llu expectedLaneCounts=2_TO_8 nonDispersiveOnly=1\n",
+                    mlHero15lnAnchoredEvents.load(std::memory_order_relaxed),
+                    mlHero15lnAnchoredLanes.load(std::memory_order_relaxed));
             for (u_int side = 0u; side < 2u; ++side)
                 fprintf(f15cq, "phase15ev GLASS_SUMMARY side=%u events=%llu helperCalls=%llu helperRejected=%llu firstCollapses=%llu\n",
                     side, mlHero15evEvents[side].load(std::memory_order_relaxed),

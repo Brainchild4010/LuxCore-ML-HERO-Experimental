@@ -19,6 +19,7 @@
 #include "slg/materials/disney.h"
 #include "slg/materials/thinfilmcoating.h"
 #include "slg/textures/fresnel/fresneltexture.h"
+#include "slg/engines/mlhero_disney_audit15lu.h"
 
 using namespace std;
 using namespace luxrays;
@@ -111,9 +112,7 @@ Spectrum DisneyMaterial::Evaluate(
 
 	return DisneyEvaluate(hitPoint.fromLight, color, subsurface, roughness, metallic, specular, specularTint,
 			clearcoat, clearcoatGloss, anisotropicGloss, sheen, sheenTint, localFilmAmount, localFilmThickness, 
-			localFilmIor, localLightDir, localEyeDir, event, directPdfW, reversePdfW)
-			// Evaluate() follows LuxRender habit to return the result multiplied by cosThetaToLight
-			* fabsf(CosTheta(localLightDir));
+			localFilmIor, localLightDir, localEyeDir, event, directPdfW, reversePdfW);
 }
 
 Spectrum DisneyMaterial::DisneyEvaluate(
@@ -281,13 +280,17 @@ Spectrum DisneyMaterial::Sample(
 	float ratioGlossy, ratioDiffuse, ratioClearcoat;
 	ComputeRatio(metallic, clearcoat, ratioGlossy, ratioDiffuse, ratioClearcoat);
 
-	if (passThroughEvent <= ratioGlossy)
+	unsigned auditBranch15lu;
+	if (passThroughEvent <= ratioGlossy) {
+		auditBranch15lu = slg::mlhero15lu::METALLIC;
 		*localSampledDir = DisneyMetallicSample(anisotropicGloss, roughness, wo, u0, u1);
-	else if (passThroughEvent > ratioGlossy &&  passThroughEvent <= ratioGlossy + ratioClearcoat)
+	} else if (passThroughEvent > ratioGlossy &&  passThroughEvent <= ratioGlossy + ratioClearcoat) {
+		auditBranch15lu = slg::mlhero15lu::CLEARCOAT;
 		*localSampledDir = DisneyClearcoatSample(clearcoatGloss, wo, u0, u1);
-	else if (passThroughEvent > ratioGlossy + ratioClearcoat && passThroughEvent <= ratioGlossy + ratioClearcoat + ratioDiffuse)
+	} else if (passThroughEvent > ratioGlossy + ratioClearcoat && passThroughEvent <= ratioGlossy + ratioClearcoat + ratioDiffuse) {
+		auditBranch15lu = slg::mlhero15lu::DIFFUSE;
 		*localSampledDir = DisneyDiffuseSample(wo, u0, u1);
-	else
+	} else
 		return Spectrum();
 
 	const Vector &localLightDir = hitPoint.fromLight ? localFixedDir : *localSampledDir;
@@ -305,6 +308,18 @@ Spectrum DisneyMaterial::Sample(
 	
 	DisneyPdf(hitPoint.fromLight, roughness, metallic, clearcoat, clearcoatGloss, anisotropicGloss,
 			localLightDir, localEyeDir, pdfW, nullptr);
+
+	if (slg::mlhero15lu::Active(hitPoint.fromLight)) {
+		float legacySpecularTintAsClearcoatPdf15lu = 0.f;
+		DisneyPdf(hitPoint.fromLight, roughness, metallic, specularTint,
+			clearcoatGloss, anisotropicGloss, localLightDir, localEyeDir,
+			&legacySpecularTintAsClearcoatPdf15lu, nullptr);
+		slg::mlhero15lu::Capture(hitPoint.fromLight, GetID(), auditBranch15lu,
+			u0, u1, passThroughEvent, roughness, metallic, specularTint,
+			clearcoat, clearcoatGloss, anisotropicGloss,
+			slg::mlhero15kk::V(localFixedDir), slg::mlhero15kk::V(*localSampledDir),
+			*pdfW, legacySpecularTintAsClearcoatPdf15lu);
+	}
 
 	const float localFilmAmount = filmAmount ? Clamp(filmAmount->GetFloatValue(hitPoint), 0.0f, 1.0f) : 1.f;
 	const float localFilmThickness = filmThickness ? filmThickness->GetFloatValue(hitPoint) : 0.f;
@@ -369,7 +384,7 @@ void DisneyMaterial::Pdf(
 		float *reversePdfW) const {
 	const float roughness = Clamp(Roughness->GetFloatValue(hitPoint), 0.0f, 1.0f);
 	const float metallic = Clamp(Metallic->GetFloatValue(hitPoint), 0.0f, 1.0f);
-	const float clearcoat = Clamp(SpecularTint->GetFloatValue(hitPoint), 0.0f, 1.0f);
+	const float clearcoat = Clamp(Clearcoat->GetFloatValue(hitPoint), 0.0f, 1.0f);
 	const float clearcoatGloss = Clamp(ClearcoatGloss->GetFloatValue(hitPoint), 0.0f, 1.0f);
 	const float anisotropicGloss = Clamp(Anisotropic->GetFloatValue(hitPoint), 0.0f, 1.0f);
 
@@ -473,7 +488,7 @@ void DisneyMaterial::ClearcoatPdf(const bool fromLight, const float clearcoatGlo
 }
 
 Spectrum DisneyMaterial::CalculateTint(const Spectrum &color) const {
-	const float luminance = color.c[0] * 0.3f + color.c[1] * 0.6f + color.c[2] * 1.0f;
+	const float luminance = color.c[0] * 0.3f + color.c[1] * 0.6f + color.c[2] * 0.1f;
 
 	return (luminance > 0.0f) ? color * (1.0f / luminance) : Spectrum(1.0f);
 }

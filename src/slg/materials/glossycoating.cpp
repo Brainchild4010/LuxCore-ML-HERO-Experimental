@@ -18,10 +18,43 @@
 
 #include "slg/textures/fresnel/fresneltexture.h"
 #include "slg/materials/glossycoating.h"
+#include "slg/engines/mlhero_glossycoating_pdf_fix15li.h"
 
 using namespace std;
 using namespace luxrays;
 using namespace slg;
+
+bool GetMLHeroEnabled();
+
+// Phase 15li: SchlickBSDF_CoatingSampleF draws the coating half vector from
+// the inverse-CDF density audited in 15lh.  The legacy CoatingPdf reports a
+// different density, so HERO uses the generated density for reflection while
+// retaining the native function for HERO-off and non-reflection directions.
+// Double-precision direction normalization also carries forward the sharp-lobe
+// precision hardening validated for Glossy2 in phase 15lg.
+static float MLHeroGlossyCoatingPdf15li(const float roughness,
+		const float anisotropy, const Vector &localFixedDir,
+		const Vector &localSampledDir) {
+	const float nativePdf = SchlickBSDF_CoatingPdf(roughness, anisotropy,
+			localFixedDir, localSampledDir);
+	if (!GetMLHeroEnabled() || !(localFixedDir.z > 0.f) ||
+			!(localSampledDir.z > 0.f))
+		return nativePdf;
+
+	const slg::mlhero15kk::V fixed = slg::mlhero15kk::Unit(
+			slg::mlhero15kk::V(localFixedDir));
+	const slg::mlhero15kk::V sampled = slg::mlhero15kk::Unit(
+			slg::mlhero15kk::V(localSampledDir));
+	const slg::mlhero15kk::V wh = slg::mlhero15kk::Unit(fixed + sampled);
+	const double jacobianDenominator = 4. * std::fabs(
+			slg::mlhero15kk::Dot(fixed, wh));
+	if (!(jacobianDenominator > 0.))
+		return 0.f;
+
+	const double halfPdf = slg::mlhero15lb::HalfPdf(roughness, anisotropy,
+			wh.x, wh.y, wh.z);
+	return float(halfPdf / jacobianDenominator);
+}
 
 //------------------------------------------------------------------------------
 // GlossyCoating material
@@ -90,6 +123,8 @@ Spectrum GlossyCoatingMaterial::Evaluate(const HitPoint &hitPoint,
 	const Vector &localLightDir, const Vector &localEyeDir, BSDFEvent *event,
 	float *directPdfW, float *reversePdfW) const {
 	const Frame frame(hitPoint.GetFrame());
+	const Vector &localFixedDir = hitPoint.fromLight ? localLightDir : localEyeDir;
+	const Vector &localSampledDir = hitPoint.fromLight ? localEyeDir : localLightDir;
 	const float cosi = fabsf(localLightDir.z);
 	const float coso = fabsf(localEyeDir.z);
 
@@ -137,19 +172,19 @@ Spectrum GlossyCoatingMaterial::Evaluate(const HitPoint &hitPoint,
 		const float roughness = u * v;
 
 		if (directPdfW) {
-			const float wCoating = SchlickBSDF_CoatingWeight(ks, hitPoint.fromLight ? localLightDir : localEyeDir);
+			const float wCoating = SchlickBSDF_CoatingWeight(ks, localFixedDir);
 			const float wBase = 1.f - wCoating;
 
 			*directPdfW = wBase * *directPdfW +
-				wCoating * SchlickBSDF_CoatingPdf(roughness, anisotropy, localLightDir, localEyeDir);
+				wCoating * MLHeroGlossyCoatingPdf15li(roughness, anisotropy, localFixedDir, localSampledDir);
 		}
 
 		if (reversePdfW) {
-			const float wCoatingR = SchlickBSDF_CoatingWeight(ks, hitPoint.fromLight ? localEyeDir : localLightDir);
+			const float wCoatingR = SchlickBSDF_CoatingWeight(ks, localSampledDir);
 			const float wBaseR = 1.f - wCoatingR;
 
 			*reversePdfW = wBaseR * *reversePdfW +
-				wCoatingR * SchlickBSDF_CoatingPdf(roughness, anisotropy, localEyeDir, localLightDir);
+				wCoatingR * MLHeroGlossyCoatingPdf15li(roughness, anisotropy, localSampledDir, localFixedDir);
 		}
 
 		// Absorption
@@ -257,6 +292,11 @@ Spectrum GlossyCoatingMaterial::Sample(const HitPoint &hitPoint,
 	const float v2 = v * v;
 	const float anisotropy = (u2 < v2) ? (1.f - u2 / v2) : u2 > 0.f ? (v2 / u2 - 1.f) : 0.f;
 	const float roughness = u * v;
+	const bool sampledBase15li = passThroughEvent < wBase;
+	slg::mlhero15li::Attempt audit15li(localFixedDir.z > DEFAULT_COS_EPSILON_STATIC,
+		hitPoint.fromLight, GetID(), matBase->GetType(), sampledBase15li,
+		roughness, anisotropy, u0, u1, passThroughEvent, wBase, ks.Filter(),
+		slg::mlhero15kk::V(localFixedDir));
 
 	float basePdf, coatingPdf;
 	Spectrum baseF, coatingF;
@@ -271,8 +311,10 @@ Spectrum GlossyCoatingMaterial::Sample(const HitPoint &hitPoint,
 			&basePdf, event);
 		assert (baseF.IsValid());
 
-		if (baseF.Black())
+		if (baseF.Black()) {
+			audit15li.Reject(slg::mlhero15li::BASE_REJECT);
 			return Spectrum();
+		}
 
 		baseF *= basePdf;
 		*localSampledDir = frame.ToLocal(frameBase.ToWorld(*localSampledDir));
@@ -284,24 +326,35 @@ Spectrum GlossyCoatingMaterial::Sample(const HitPoint &hitPoint,
 				localFixedDir, *localSampledDir);
 			assert (coatingF.IsValid());
 
-			coatingPdf = SchlickBSDF_CoatingPdf(roughness, anisotropy, localFixedDir, *localSampledDir);
+			coatingPdf = MLHeroGlossyCoatingPdf15li(roughness, anisotropy,
+				localFixedDir, *localSampledDir);
 			assert (IsValid(coatingPdf));
 		} else
 			coatingPdf = 0.f;
 	} else {
 		// Sample coating BxDF
+		float nativeCoatingPdf15li;
 		coatingF = SchlickBSDF_CoatingSampleF(hitPoint.fromLight, ks, roughness, anisotropy, multibounce,
-			localFixedDir, localSampledDir, u0, u1, &coatingPdf);
+			localFixedDir, localSampledDir, u0, u1, &nativeCoatingPdf15li);
 		assert (coatingF.IsValid());
 
-		if (coatingF.Black())
+		if (coatingF.Black()) {
+			audit15li.Reject(slg::mlhero15li::COATING_REJECT);
 			return Spectrum();
+		}
+		assert (IsValid(nativeCoatingPdf15li));
+
+		if (fabsf(CosTheta(*localSampledDir)) < DEFAULT_COS_EPSILON_STATIC) {
+			audit15li.Reject(slg::mlhero15li::COATING_REJECT);
+			return Spectrum();
+		}
+
+		// Recover the unchanged coating BSDF from the native f/pdf sample;
+		// only the estimator density is replaced by the generated density.
+		coatingF *= nativeCoatingPdf15li;
+		coatingPdf = MLHeroGlossyCoatingPdf15li(roughness, anisotropy,
+			localFixedDir, *localSampledDir);
 		assert (IsValid(coatingPdf));
-
-		if (fabsf(CosTheta(*localSampledDir)) < DEFAULT_COS_EPSILON_STATIC)
-			return Spectrum();
-
-		coatingF *= coatingPdf;
 
 		HitPoint hitPointBase(hitPoint);
 		matBase->Bump(&hitPointBase);
@@ -369,10 +422,32 @@ Spectrum GlossyCoatingMaterial::Sample(const HitPoint &hitPoint,
 		// of 1-S like a reflection
 		result = absorption * Sqrt(Spectrum(1.f) - S) * baseF;
 		assert (!result.IsNaN() && !result.IsInf() && !result.IsNeg());
-	} else
+	} else {
+		audit15li.OutOfScopeEvent();
 		return Spectrum();
+	}
 
 	*pdfW = coatingPdf * wCoating + basePdf * wBase;
+	if (audit15li.Active()) {
+		if ((sideTest > DEFAULT_COS_EPSILON_STATIC) && (cosWo > 0.f) && !(*event & SPECULAR)) {
+			// Bounded diagnostic-only replay of the wrapped base material PDFs.
+			HitPoint hitPointBase15li(hitPoint);
+			matBase->Bump(&hitPointBase15li);
+			const Frame frameBase15li(hitPointBase15li.GetFrame());
+			const Vector localLightDir15li = frameBase15li.ToLocal(frame.ToWorld(
+				hitPoint.fromLight ? localFixedDir : *localSampledDir));
+			const Vector localEyeDir15li = frameBase15li.ToLocal(frame.ToWorld(
+				hitPoint.fromLight ? *localSampledDir : localFixedDir));
+			float queriedBasePdf15li = 0.f, queriedBasePdfReverse15li = 0.f;
+			matBase->Pdf(hitPointBase15li, localLightDir15li, localEyeDir15li,
+				&queriedBasePdf15li, &queriedBasePdfReverse15li);
+			const float wCoatingReverse15li = SchlickBSDF_CoatingWeight(ks, *localSampledDir);
+			audit15li.Accept(slg::mlhero15kk::V(*localSampledDir), *pdfW, coatingPdf,
+				basePdf, queriedBasePdf15li, queriedBasePdfReverse15li,
+				1.f - wCoatingReverse15li);
+		} else
+			audit15li.OutOfScopeEvent();
+	}
 
 	result /= *pdfW;
 	assert (!result.IsNaN() && !result.IsInf() && !result.IsNeg());
@@ -391,6 +466,7 @@ void GlossyCoatingMaterial::Pdf(const HitPoint &hitPoint,
 	const Vector eyeDirBase = frameBase.ToLocal(frame.ToWorld(localEyeDir));
 	matBase->Pdf(hitPointBase, lightDirBase, eyeDirBase, directPdfW, reversePdfW);
 	const Vector localFixedDir = hitPoint.fromLight ? localLightDir : localEyeDir;
+	const Vector localSampledDir = hitPoint.fromLight ? localEyeDir : localLightDir;
 	if (!(localFixedDir.z > 0.f))
 		return;
 
@@ -414,15 +490,15 @@ void GlossyCoatingMaterial::Pdf(const HitPoint &hitPoint,
 		const float wBase = 1.f - wCoating;
 
 		*directPdfW = wBase * *directPdfW +
-			wCoating * SchlickBSDF_CoatingPdf(roughness, anisotropy, localLightDir, localEyeDir);
+			wCoating * MLHeroGlossyCoatingPdf15li(roughness, anisotropy, localFixedDir, localSampledDir);
 	}
 
 	if (reversePdfW) {
-		const float wCoatingR = SchlickBSDF_CoatingWeight(ks, hitPoint.fromLight ? localEyeDir : localLightDir);
+		const float wCoatingR = SchlickBSDF_CoatingWeight(ks, localSampledDir);
 		const float wBaseR = 1.f - wCoatingR;
 
 		*reversePdfW = wBaseR * *reversePdfW +
-			wCoatingR * SchlickBSDF_CoatingPdf(roughness, anisotropy, localEyeDir, localLightDir);
+			wCoatingR * MLHeroGlossyCoatingPdf15li(roughness, anisotropy, localSampledDir, localFixedDir);
 	}
 }
 

@@ -17,10 +17,32 @@
  ***************************************************************************/
 
 #include "slg/materials/velvet.h"
+#include "slg/engines/mlhero_velvet_audit15lq.h"
 
 using namespace std;
 using namespace luxrays;
 using namespace slg;
+
+namespace {
+
+// Material::Evaluate() returns f(light, eye) * |cos(light)|.  Clamp the
+// physical BRDF before applying that transport cosine so the result remains
+// reciprocal when light and eye directions are exchanged.
+static inline float VelvetCosWeightedValue(const float phaseThickness,
+		const float absLightCos, const float absEyeCos) {
+	const float cosineProduct = absLightCos * absEyeCos;
+	if (!(cosineProduct > 0.f))
+		return 0.f;
+
+	float brdf = phaseThickness / cosineProduct;
+	if (brdf > 1.f)
+		brdf = 1.f;
+	else if (brdf < 0.f)
+		brdf = 0.f;
+	return brdf * absLightCos;
+}
+
+}
 
 //------------------------------------------------------------------------------
 // Velvet material
@@ -63,16 +85,14 @@ Spectrum VelvetMaterial::Evaluate(const HitPoint &hitPoint,
 
 	const float B = 3.0f * cosv;
 
-	float p = 1.0f + A1 * cosv + A2 * 0.5f * (B * cosv - 1.0f) + A3 * 0.5 * (5.0f * cosv * cosv * cosv - B);
-	p = p / (4.0f * M_PI);
- 
-	p = (p * delta) / fabsf(localEyeDir.z);
+	const float polynomial = 1.0f + A1 * cosv + A2 * 0.5f * (B * cosv - 1.0f) +
+		A3 * 0.5f * (5.0f * cosv * cosv * cosv - B);
+	const float phaseThickness = polynomial * delta / (4.0f * M_PI);
 
-	// Clamp the BRDF (page 7)
-	if (p > 1.0f)
-		p = 1.0f;
-	else if (p < 0.0f)
-		p = 0.0f;
+	// Clamp the physical BRDF (page 7), not the direction-dependent
+	// cosine-weighted transport value.
+	const float p = VelvetCosWeightedValue(phaseThickness,
+		fabsf(localLightDir.z), fabsf(localEyeDir.z));
 
 	return Kd->GetSpectrumValue(hitPoint).Clamp(0.f, 1.f) * p;
 }
@@ -94,6 +114,8 @@ Spectrum VelvetMaterial::Sample(const HitPoint &hitPoint,
 	float A2 = P2->GetFloatValue(hitPoint);
 	float A3 = P3->GetFloatValue(hitPoint);
 	float delta = Thickness->GetFloatValue(hitPoint);
+	slg::mlhero15lq::Attempt audit15lq(hitPoint.fromLight, GetID(), A1, A2, A3,
+		delta, u0, u1, passThroughEvent, slg::mlhero15kk::V(localFixedDir));
 	
 	const float cosv = -Dot(localFixedDir, *localSampledDir);
 
@@ -101,17 +123,20 @@ Spectrum VelvetMaterial::Sample(const HitPoint &hitPoint,
 
 	const float B = 3.0f * cosv;
 
-	float p = 1.0f + A1 * cosv + A2 * 0.5f * (B * cosv - 1.0f) + A3 * 0.5 * (5.0f * cosv * cosv * cosv - B);
-	p = p / (4.0f * M_PI);
- 
-	p = (p * delta) / (hitPoint.fromLight ? fabsf(localSampledDir->z) : fabsf(localFixedDir.z));
-	
-	// Clamp the BRDF (page 7)
-	if (p > 1.0f)
-		p = 1.0f;
-	else if (p < 0.0f)
-		p = 0.0f;
-	
+	const float polynomial = 1.0f + A1 * cosv + A2 * 0.5f * (B * cosv - 1.0f) +
+		A3 * 0.5f * (5.0f * cosv * cosv * cosv - B);
+	const float phaseThickness = polynomial * delta / (4.0f * M_PI);
+	const float absLightCos = hitPoint.fromLight ? fabsf(localFixedDir.z) :
+		fabsf(localSampledDir->z);
+	const float absEyeCos = hitPoint.fromLight ? fabsf(localSampledDir->z) :
+		fabsf(localFixedDir.z);
+
+	// Use the same reciprocal BRDF clamp as Evaluate().
+	const float p = VelvetCosWeightedValue(phaseThickness, absLightCos, absEyeCos);
+
+	if (audit15lq.Active())
+		audit15lq.Accept(slg::mlhero15kk::V(*localSampledDir), *pdfW, p);
+
 	return Kd->GetSpectrumValue(hitPoint).Clamp(0.f, 1.f) * (p / *pdfW);
 }
 

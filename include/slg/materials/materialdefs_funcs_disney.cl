@@ -62,7 +62,7 @@ OPENCL_FORCE_INLINE void DisneyMaterial_GetEmittedRadiance(__global const Materi
 //------------------------------------------------------------------------------
 
 OPENCL_FORCE_INLINE float3 DisneyMaterial_CalculateTint(const float3 color) {
-	float luminance = color.x * 0.3f + color.y * 0.6f + color.z * 1.0f;
+	float luminance = color.x * 0.3f + color.y * 0.6f + color.z * 0.1f;
 	return (luminance > 0.0f) ? color * (1.0f / luminance) : WHITE;
 }
 
@@ -356,9 +356,7 @@ OPENCL_FORCE_INLINE void DisneyMaterial_Evaluate(__global const Material* restri
 		Texture_GetFloatValue(material->disney.anisotropicTexIndex, hitPoint TEXTURES_PARAM),
 		Texture_GetFloatValue(material->disney.sheenTexIndex, hitPoint TEXTURES_PARAM),
 		Texture_GetFloatValue(material->disney.sheenTintTexIndex, hitPoint TEXTURES_PARAM),
-		localFilmAmount, localFilmThickness, localFilmIor)
-		// Evaluate() follows LuxRender habit to return the result multiplied by cosThetaToLight
-		* fabs(CosTheta(lightDir));
+		localFilmAmount, localFilmThickness, localFilmIor);
 
 	if (Spectrum_IsBlack(result)) {
 		MATERIAL_EVALUATE_RETURN_BLACK;
