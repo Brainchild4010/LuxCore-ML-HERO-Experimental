@@ -40,6 +40,8 @@ public:
 	virtual float Filter() const;
 
 	virtual luxrays::Spectrum Evaluate(const HitPoint &hitPoint, const float cosi) const;
+	virtual bool EvaluateAtWaveLength(const HitPoint &hitPoint, const float cosi,
+			const float waveLength, luxrays::Spectrum *fresnel) const;
 
 	virtual void AddReferencedTextures(
 		std::unordered_set<const Texture *>  &referencedTexs

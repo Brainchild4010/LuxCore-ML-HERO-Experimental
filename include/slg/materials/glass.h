@@ -48,6 +48,10 @@ void SetMLDispersionWaveLength(const float waveLength);
 void SetMLDispersionWaveLength(const float waveLength, const float sampleWeight);
 float GetMLCurrentWaveLength();
 void MarkMLDispersionUsed();
+// 15lx: isolate a bounded shadow-child Bounce from the worker's production
+// spectral TLS. These are a strict single-level pair used only by BIDIR audit.
+void PushMLHeroTransportTLS15lx();
+void PopMLHeroTransportTLS15lx();
 
 //------------------------------------------------------------------------------
 // Glass material

@@ -35,6 +35,13 @@ public:
 
 	virtual luxrays::Spectrum Evaluate(const HitPoint &hitPoint, const float cosi) const = 0;
 
+	// Optional explicit wavelength-domain evaluation for CPU ML-HERO.  The
+	// default implementation uses measured/interpolated n/k when the concrete
+	// texture provides it.  RGB-authored Fresnel textures can override this
+	// without pretending that their reconstructed values are measured data.
+	virtual bool EvaluateAtWaveLength(const HitPoint &hitPoint, const float cosi,
+			const float waveLength, luxrays::Spectrum *fresnel) const;
+
 	// Optional explicit spectral n/k access for measured-data Fresnel textures.
 	// Multi-HERO can query companion wavelengths without changing the active lane.
 	virtual bool GetNKAtWaveLength(const HitPoint &hitPoint, const float waveLength,

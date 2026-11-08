@@ -17,10 +17,14 @@
  ***************************************************************************/
 
 #include "slg/materials/mix.h"
+#include "slg/engines/mlhero_mix_direction_trace15nr.h"
 
 using namespace std;
 using namespace luxrays;
 using namespace slg;
+
+bool GetMLHeroEnabled();
+thread_local slg::mlhero15nr::Capture slg::mlhero15nr::lastCapture;
 
 //------------------------------------------------------------------------------
 // Mix material
@@ -249,6 +253,8 @@ Spectrum MixMaterial::Sample(const HitPoint &hitPoint,
 	const Vector &localFixedDir, Vector *localSampledDir,
 	const float u0, const float u1, const float passThroughEvent,
 	float *pdfW, BSDFEvent *event) const {
+	if (GetMLHeroEnabled())
+		mlhero15nr::Reset(this, passThroughEvent);
 	const Frame frame(hitPoint.GetFrame());
 
 	HitPoint hitPointA(hitPoint);
@@ -288,9 +294,22 @@ Spectrum MixMaterial::Sample(const HitPoint &hitPoint,
 	if (result.Black())
 		return Spectrum();
 
-	*localSampledDir = frame1.ToWorld(*localSampledDir);
+	// Preserve the exact selected-child direction before the native frame
+	// conversion. Phase 15ns reuses both child-local directions below instead
+	// of reconstructing them later through child/world/Mix frames.
+	const Vector sampledDir1 = *localSampledDir;
+	*localSampledDir = frame1.ToWorld(sampledDir1);
 	const Vector sampledDir2 = frame2.ToLocal(*localSampledDir);
 	*localSampledDir = frame.ToLocal(*localSampledDir);
+	if (GetMLHeroEnabled()) {
+		const Vector &sampledDirA = sampleMatA ? sampledDir1 : sampledDir2;
+		const Vector &sampledDirB = sampleMatA ? sampledDir2 : sampledDir1;
+		mlhero15nr::Record(this, &(*matFirst), sampleMatA ? 0u : 1u,
+			(u_int)*event, hitPoint.fromLight, passThroughEvent,
+			passThroughEventFirst, weightFirst, *pdfW, fixedDir1,
+			sampledDir1, fixedDirA, sampledDirA, fixedDirB, sampledDirB,
+			result);
+	}
 
 	*pdfW *= weightFirst;
 

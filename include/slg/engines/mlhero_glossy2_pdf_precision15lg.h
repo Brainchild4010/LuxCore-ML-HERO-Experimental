@@ -7,6 +7,7 @@
 
 #include "slg/engines/mlhero_metal_pdf15lb.h"
 #include "slg/engines/mlhero_rough_optics15kk.h"
+#include "slg/engines/mlhero_glossy2_weight_capture15na.h"
 
 namespace slg { namespace mlhero15lg {
 using V = mlhero15kk::V;
@@ -19,15 +20,18 @@ struct Record {
     unsigned long long detail = 0;
     bool doubleSided = false;
     double rough = 0., anis = 0., u0 = 0., u1 = 0., branchU = 0.;
-    double ksFilter = 0., wBase = 0., wCoating = 0., referenceWBase = 0.;
+    double ks0 = 0., ks1 = 0., ks2 = 0., ksFilter = 0.;
+    double wBase = 0., wCoating = 0., referenceWBase = 0.;
     double wBaseReverse = 0., wCoatingReverse = 0., referenceWBaseReverse = 0.;
-    V fixed, sampled, h;
+    V fixed, rawSampled, sampled, h;
     double reportedHalfPdf = 0., referenceHalfPdf = 0.;
     double reportedCoatingPdf = 0., referenceCoatingPdf = 0.;
     double reportedCoatingPdfReverse = 0., referenceCoatingPdfReverse = 0.;
     double reportedMixturePdf = 0., referenceMixturePdf = 0.;
     double reportedMixturePdfReverse = 0., referenceMixturePdfReverse = 0.;
     double reportedMixtureReplay = 0.;
+    mlhero15na::Replay reverseWeightReplay = {};
+    bool weightMismatchDetail = false;
 };
 
 using Reporter = void (*)(const Record &);
@@ -39,7 +43,8 @@ inline std::atomic<unsigned long long> attempts[2][BranchCount]{}, status[2][Bra
     halfMismatch[2][BranchCount]{}, coatingMismatch[2][BranchCount]{},
     coatingReverseMismatch[2][BranchCount]{}, mixtureMismatch[2][BranchCount]{},
     mixtureReverseMismatch[2][BranchCount]{}, replayMismatch[2][BranchCount]{},
-    details[2][BranchCount]{}, writeFailures[2][BranchCount]{};
+    details[2][BranchCount]{}, weightMismatchDetails[2][BranchCount]{},
+    writeFailures[2][BranchCount]{};
 
 inline double Relative(double a, double b) {
     return std::fabs(a - b) /
@@ -53,7 +58,8 @@ inline void Reset() {
         halfMismatch[s][b] = 0; coatingMismatch[s][b] = 0;
         coatingReverseMismatch[s][b] = 0; mixtureMismatch[s][b] = 0;
         mixtureReverseMismatch[s][b] = 0; replayMismatch[s][b] = 0;
-        details[s][b] = 0; writeFailures[s][b] = 0;
+        details[s][b] = 0; weightMismatchDetails[s][b] = 0;
+        writeFailures[s][b] = 0;
         for (unsigned k = 0; k < StatusCount; ++k) status[s][b][k] = 0;
     }
 }
@@ -77,17 +83,19 @@ struct Attempt {
 
     Attempt(bool fromLight, unsigned material, bool sampledBase, bool doubleSided,
             double rough, double anis, double u0, double u1, double branchU,
-            double wBase, double ksFilter, V fixed) {
+            double wBase, double ks0, double ks1, double ks2, V fixed) {
         const unsigned s = fromLight ? 1u : 0u;
         const unsigned b = sampledBase ? BASE : COATING;
         if (!reporter || used[s][b] >= Budget) return;
         ++used[s][b]; active = true;
         r.side = s; r.branch = b; r.material = material; r.doubleSided = doubleSided;
         r.rough = rough; r.anis = anis; r.u0 = u0; r.u1 = u1; r.branchU = branchU;
-        r.ksFilter = ksFilter; r.wBase = wBase; r.wCoating = 1. - wBase;
+        r.ks0 = ks0; r.ks1 = ks1; r.ks2 = ks2;
+        r.ksFilter = (ks0 + ks1 + ks2) / 3.;
+        r.wBase = wBase; r.wCoating = 1. - wBase;
         r.fixed = mlhero15kk::Unit(fixed);
         const double directTail = std::pow(1. - std::fabs(r.fixed.z), 5.);
-        const double directS = ksFilter + (1. - ksFilter) * directTail;
+        const double directS = r.ksFilter + (1. - r.ksFilter) * directTail;
         r.referenceWBase = 1. - .5 * (1. + directS);
         attempts[s][b].fetch_add(1ull, std::memory_order_relaxed);
         if (sampledBase != (branchU < wBase))
@@ -101,12 +109,15 @@ struct Attempt {
             double wBaseReverse) {
         if (!active) return;
         r.status = ACCEPT;
+        r.rawSampled = sampled;
         r.sampled = mlhero15kk::Unit(sampled);
         r.h = mlhero15kk::Unit(r.fixed + r.sampled);
         r.wBaseReverse = wBaseReverse; r.wCoatingReverse = 1. - wBaseReverse;
         const double reverseTail = std::pow(1. - std::fabs(r.sampled.z), 5.);
         const double reverseS = r.ksFilter + (1. - r.ksFilter) * reverseTail;
         r.referenceWBaseReverse = 1. - .5 * (1. + reverseS);
+        r.reverseWeightReplay = mlhero15na::Analyze(r.ks0, r.ks1, r.ks2,
+            sampled.x, sampled.y, sampled.z, wBaseReverse);
         r.reportedMixturePdf = reportedMixture;
         r.reportedCoatingPdf = reportedCoating;
 
@@ -144,9 +155,13 @@ struct Attempt {
                 std::isfinite(r.referenceMixturePdfReverse);
             if (!valid) invalidReference[s][b].fetch_add(1ull, std::memory_order_relaxed);
             else {
-                if (Relative(r.wBase, r.referenceWBase) > 2e-4)
+                const bool directWeightMismatch =
+                    Relative(r.wBase, r.referenceWBase) > 2e-4;
+                const bool reverseWeightMismatch =
+                    Relative(r.wBaseReverse, r.referenceWBaseReverse) > 2e-4;
+                if (directWeightMismatch)
                     weightMismatch[s][b].fetch_add(1ull, std::memory_order_relaxed);
-                if (Relative(r.wBaseReverse, r.referenceWBaseReverse) > 2e-4)
+                if (reverseWeightMismatch)
                     weightReverseMismatch[s][b].fetch_add(1ull, std::memory_order_relaxed);
                 if (Relative(r.reportedHalfPdf, r.referenceHalfPdf) > 2e-4)
                     halfMismatch[s][b].fetch_add(1ull, std::memory_order_relaxed);
@@ -160,6 +175,16 @@ struct Attempt {
                     mixtureReverseMismatch[s][b].fetch_add(1ull, std::memory_order_relaxed);
                 if (Relative(r.reportedMixturePdf, r.reportedMixtureReplay) > 2e-4)
                     replayMismatch[s][b].fetch_add(1ull, std::memory_order_relaxed);
+                // 15na targets the single observed reverse-weight outlier.
+                // Direct mismatches remain counted by the original 15lg audit.
+                if (reverseWeightMismatch) {
+                    r.weightMismatchDetail = true;
+                    r.detail = weightMismatchDetails[s][b].fetch_add(1ull,
+                        std::memory_order_relaxed);
+                    if (r.detail < 16ull)
+                        reporter(r);
+                    r.weightMismatchDetail = false;
+                }
             }
         }
         r.detail = details[s][b].fetch_add(1ull, std::memory_order_relaxed);
@@ -177,6 +202,24 @@ inline const char *StatusName(unsigned value) {
 }
 
 inline void WriteRecord(FILE *f, const Record &r, unsigned thread, unsigned sample) {
+    if (r.weightMismatchDetail) {
+        const mlhero15na::Replay &p = r.reverseWeightReplay;
+        fprintf(f, "phase15na GLOSSY2_WEIGHT_MISMATCH_DETAIL side=%s branch=%s detail=%llu thread=%u sample=%u materialID=%u status=%s roughness=%.17g anisotropy=%.17g ks=(%.17g,%.17g,%.17g) ksFilter=%.17g rawSampled=(%.17g,%.17g,%.17g) rawNorm=%.17g rawAbsZ=%.17g unitAbsZ=%.17g reportedBaseReverse=%.17g rawNativeFloatReplay=%.17g unitNativeFloatReplay=%.17g rawDoubleReference=%.17g unitDoubleReference=%.17g absErrorRaw=%.17g relErrorRaw=%.17g absErrorUnit=%.17g relErrorUnit=%.17g nativeFloatReplayMatches=%u rawVsUnitCause=%u reportedMixturePdfReverse=%.17g referenceMixturePdfReverse=%.17g mixtureReverseRelError=%.17g extraSamplerDraws=0 extraPdfQueries=0 diagnosticOnly=1 rendererPhysicsChanged=0\n",
+            r.side ? "LIGHT" : "EYE", BranchName(r.branch), r.detail,
+            thread, sample, r.material, StatusName(r.status), r.rough, r.anis,
+            p.ks0, p.ks1, p.ks2, p.ksFilter,
+            r.rawSampled.x, r.rawSampled.y, r.rawSampled.z,
+            p.rawNorm, p.rawAbsZ, p.unitAbsZ, p.reportedBase,
+            p.rawNativeFloatBase, p.unitNativeFloatBase,
+            p.rawDoubleBase, p.unitDoubleBase,
+            p.absErrorRaw, p.relErrorRaw, p.absErrorUnit, p.relErrorUnit,
+            p.reportedBase == p.rawNativeFloatBase ? 1u : 0u,
+            p.relErrorRaw <= 2e-4 && p.relErrorUnit > 2e-4 ? 1u : 0u,
+            r.reportedMixturePdfReverse, r.referenceMixturePdfReverse,
+            Relative(r.reportedMixturePdfReverse,
+                r.referenceMixturePdfReverse));
+        return;
+    }
     fprintf(f, "phase15lg GLOSSY2_PDF_SAMPLE side=%s branch=%s detail=%llu thread=%u sample=%u materialID=%u status=%s doubleSided=%u roughness=%.17g anisotropy=%.17g u=(%.17g,%.17g,%.17g) ksFilter=%.17g weights=(%.17g,%.17g) referenceWBase=%.17g reverseWeights=(%.17g,%.17g) referenceWBaseReverse=%.17g fixed=(%.17g,%.17g,%.17g) sampled=(%.17g,%.17g,%.17g) h=(%.17g,%.17g,%.17g) reportedHalfPdf=%.17g referenceHalfPdf=%.17g halfRatio=%.17g reportedCoatingPdf=%.17g referenceCoatingPdf=%.17g coatingRatio=%.17g reportedMixturePdf=%.17g referenceMixturePdf=%.17g mixtureRatio=%.17g reportedMixturePdfReverse=%.17g referenceMixturePdfReverse=%.17g reverseMixtureRatio=%.17g diagnosticOnly=0 physicsChanged=1\n",
         r.side ? "LIGHT" : "EYE", BranchName(r.branch), r.detail, thread, sample,
         r.material, StatusName(r.status), r.doubleSided ? 1u : 0u, r.rough, r.anis,
@@ -194,7 +237,7 @@ inline void WriteRecord(FILE *f, const Record &r, unsigned thread, unsigned samp
 }
 
 inline void WriteSummary(FILE *f) {
-    for (unsigned s = 0; s < 2; ++s) for (unsigned b = 0; b < BranchCount; ++b)
+    for (unsigned s = 0; s < 2; ++s) for (unsigned b = 0; b < BranchCount; ++b) {
         fprintf(f, "phase15lg GLOSSY2_PDF_SUMMARY side=%s branch=%s selectedAttempts=%llu drawOnly=%llu baseRejected=%llu coatingRejected=%llu accepted=%llu selectionMismatches=%llu directWeightMismatches=%llu reverseWeightMismatches=%llu invalidReference=%llu halfPdfMismatches=%llu coatingPdfMismatches=%llu coatingReversePdfMismatches=%llu mixturePdfMismatches=%llu mixtureReversePdfMismatches=%llu reportedMixtureReplayMismatches=%llu detailsSelected=%llu writeFailures=%llu toleranceRelative=0.0002 reference=INDEPENDENT_SCHLICK_INVERSE_CDF_PLUS_COSINE_MIXTURE rejectedSamplesIncluded=1 conditionalRenormalization=NONE diagnosticOnly=0 physicsChanged=1\n",
             s ? "LIGHT" : "EYE", BranchName(b), attempts[s][b].load(),
             status[s][b][DRAW_ONLY].load(), status[s][b][BASE_REJECT].load(),
@@ -206,6 +249,15 @@ inline void WriteSummary(FILE *f) {
             mixtureReverseMismatch[s][b].load(), replayMismatch[s][b].load(),
             details[s][b].load() < 16ull ? details[s][b].load() : 16ull,
             writeFailures[s][b].load());
+        fprintf(f, "phase15na GLOSSY2_WEIGHT_CAPTURE_SUMMARY side=%s branch=%s directWeightMismatches=%llu reverseWeightMismatches=%llu mismatchRecords=%llu detailsCaptured=%llu failureSpecificCapture=1 floatReplay=1 rawVsUnitReplay=1 absoluteAndRelativeErrors=1 extraSamplerDraws=0 extraPdfQueries=0 diagnosticOnly=1 rendererPhysicsChanged=0 pass=%u\n",
+            s ? "LIGHT" : "EYE", BranchName(b), weightMismatch[s][b].load(),
+            weightReverseMismatch[s][b].load(),
+            weightMismatchDetails[s][b].load(),
+            weightMismatchDetails[s][b].load() < 16ull ?
+                weightMismatchDetails[s][b].load() : 16ull,
+            weightReverseMismatch[s][b].load() ==
+                weightMismatchDetails[s][b].load() ? 1u : 0u);
+    }
 }
 
 } }

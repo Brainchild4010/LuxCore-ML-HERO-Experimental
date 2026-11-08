@@ -380,8 +380,10 @@ set(SLG_CORE_SRCS
   ${PROJECT_SOURCE_DIR}/src/slg/samplers/rtpathcpusampler.cpp
   ${PROJECT_SOURCE_DIR}/src/slg/samplers/tilepathsampler.cpp
   ${PROJECT_SOURCE_DIR}/src/slg/samplers/sobol.cpp
+  ${PROJECT_SOURCE_DIR}/src/slg/samplers/zsobol.cpp
   ${PROJECT_SOURCE_DIR}/src/slg/samplers/soboldata.cpp
   ${PROJECT_SOURCE_DIR}/src/slg/samplers/sobolsequence.cpp
+  ${PROJECT_SOURCE_DIR}/src/slg/samplers/zsobolsequence.cpp
   ${PROJECT_SOURCE_DIR}/src/slg/samplers/metropolis.cpp
   ${PROJECT_SOURCE_DIR}/src/slg/scene/colorspaceconverters.cpp
   ${PROJECT_SOURCE_DIR}/src/slg/scene/extmeshcache.cpp

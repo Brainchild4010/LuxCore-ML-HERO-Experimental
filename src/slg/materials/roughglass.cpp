@@ -28,6 +28,8 @@
 #include <cstdio>
 #include "slg/engines/mlhero_rough_precision15ki.h"
 #include "slg/engines/mlhero_rough_optics15kk.h"
+#include "slg/engines/mlhero_roughglass_ggx_vndf15nx.h"
+#include "slg/engines/mlhero_roughglass_ggx_production15ny.h"
 
 using namespace std;
 using namespace luxrays;
@@ -303,7 +305,8 @@ struct MLHeroRoughEvaluation15kk {
 };
 static MLHeroRoughEvaluation15kk MLHeroEvaluateRough15kk(
         bool fromLight,const slg::mlhero15kk::V &light,const slg::mlhero15kk::V &eye,float nc,float nt,
-        float roughness,float anisotropy,bool vndf,const Spectrum &kr,const Spectrum &kt) {
+        float roughness,float anisotropy,bool vndf,const Spectrum &kr,const Spectrum &kt,
+        bool ggx15ny=false,float alphaX15ny=0.f,float alphaY15ny=0.f) {
     using namespace slg::mlhero15kk;
     MLHeroRoughEvaluation15kk e;
     e.pair=MakePair(nc,nt,V(light),V(eye));const auto &p=e.pair;
@@ -313,13 +316,17 @@ static MLHeroRoughEvaluation15kk MLHeroEvaluateRough15kk(
     const bool rb=kr.Black(),tb=kt.Black();if(rb&&tb)return e;
     const double transmitProbability=Probability(p.transmission,rb,tb,RoughGlassML15ghEnabled());
     e.directProbability=p.transmit?transmitProbability:1.-transmitProbability;
-    e.d=RoughGlassMLDistributionD15kj(roughness,h,anisotropy);
-    const double g=RoughGlassMLGeometry15ga(roughness,anisotropy,l,o);
+    e.d=ggx15ny ? slg::mlhero15ny::D(alphaX15ny,alphaY15ny,p.h) :
+        RoughGlassMLDistributionD15kj(roughness,h,anisotropy);
+    const double g=ggx15ny ? slg::mlhero15ny::G2(alphaX15ny,alphaY15ny,p.light,p.eye) :
+        RoughGlassMLGeometry15ga(roughness,anisotropy,l,o);
     const V fixed=fromLight?p.light:p.eye,generated=fromLight?p.eye:p.light;
-    const double spec=vndf ?
+    const double spec=ggx15ny ?
+        slg::mlhero15ny::HalfPdf(alphaX15ny,alphaY15ny,fixed,p.h) : vndf ?
         e.d*G1(roughness,fixed)*std::fabs(Dot(fixed,p.h))/std::fabs(fixed.z) :
         slg::mlhero15lb::HalfPdf(roughness,anisotropy,p.h.x,p.h.y,p.h.z);
-    const double reverseSpec=vndf ?
+    const double reverseSpec=ggx15ny ?
+        slg::mlhero15ny::HalfPdf(alphaX15ny,alphaY15ny,generated,p.h) : vndf ?
         e.d*G1(roughness,generated)*std::fabs(Dot(generated,p.h))/std::fabs(generated.z) :
         slg::mlhero15lb::HalfPdf(roughness,anisotropy,p.h.x,p.h.y,p.h.z);
     e.directSpec=spec;
@@ -334,8 +341,12 @@ static MLHeroRoughEvaluation15kk MLHeroEvaluateRough15kk(
         e.value=weight*kt;e.event=GLOSSY|TRANSMIT;
     }else{
         e.directJacobian=1./(4.*std::fabs(p.cosLight));
-        e.directPdf=e.directProbability*(vndf?e.d*G1(roughness,fixed)/(4.*std::fabs(fixed.z)):spec*e.directJacobian);
-        e.reversePdf=e.directProbability*(vndf?e.d*G1(roughness,generated)/(4.*std::fabs(generated.z)):reverseSpec*e.directJacobian);
+        e.directPdf=e.directProbability*(ggx15ny?
+            slg::mlhero15ny::ReflectionPdf(alphaX15ny,alphaY15ny,fixed,p.h):
+            (vndf?e.d*G1(roughness,fixed)/(4.*std::fabs(fixed.z)):spec*e.directJacobian));
+        e.reversePdf=e.directProbability*(ggx15ny?
+            slg::mlhero15ny::ReflectionPdf(alphaX15ny,alphaY15ny,generated,p.h):
+            (vndf?e.d*G1(roughness,generated)/(4.*std::fabs(generated.z)):reverseSpec*e.directJacobian));
         e.value=(e.d*g*(1.-p.transmission)/(4.*std::fabs(p.eye.z)))*kr;
         e.event=GLOSSY|REFLECT;
     }
@@ -343,9 +354,10 @@ static MLHeroRoughEvaluation15kk MLHeroEvaluateRough15kk(
 }
 static MLHeroRoughEvaluation15kk MLHeroEvaluateRough15kk(
         bool fromLight,const Vector &light,const Vector &eye,float nc,float nt,
-        float roughness,float anisotropy,bool vndf,const Spectrum &kr,const Spectrum &kt) {
+        float roughness,float anisotropy,bool vndf,const Spectrum &kr,const Spectrum &kt,
+        bool ggx15ny=false,float alphaX15ny=0.f,float alphaY15ny=0.f) {
     return MLHeroEvaluateRough15kk(fromLight,slg::mlhero15kk::V(light),slg::mlhero15kk::V(eye),
-        nc,nt,roughness,anisotropy,vndf,kr,kt);
+        nc,nt,roughness,anisotropy,vndf,kr,kt,ggx15ny,alphaX15ny,alphaY15ny);
 }
 
 
@@ -439,23 +451,6 @@ Spectrum RoughGlassMaterial::Evaluate(const HitPoint &hitPoint,
 	const float v2 = v * v;
 	const float anisotropy = (u2 < v2) ? (1.f - u2 / v2) : u2 > 0.f ? (v2 / u2 - 1.f) : 0.f;
 	const float roughness = u * v;
-
-
-    if(mlHeroEnabled) {
-        const auto e=MLHeroEvaluateRough15kk(hitPoint.fromLight,localLightDir,localEyeDir,
-            nc,nt,roughness,anisotropy,fineRoughGlass && RoughGlassMLUseVNDF(anisotropy),kr,kt);
-        if(directPdfW)*directPdfW=e.directPdf;
-        if(reversePdfW)*reversePdfW=e.reversePdf;
-        *event=e.event;
-        if((e.event & REFLECT) && !e.value.Black()) {
-            const float thickness=filmThickness?filmThickness->GetFloatValue(hitPoint):0.f;
-            if(thickness>0.f) {
-                const float film=filmIor?filmIor->GetFloatValue(hitPoint):1.f;
-                return e.value*CalcFilmColor(localEyeDir,thickness,film);
-            }
-        }
-        return e.value;
-    }
 
 	const float legacyThreshold = isKrBlack ? 1.f : (isKtBlack ? 0.f : .5f);
 	if (localLightDir.z * localEyeDir.z < 0.f) {
@@ -602,11 +597,14 @@ Spectrum RoughGlassMaterial::EvaluateMLHeroPrecise15kl(const HitPoint &hitPoint,
 	const float v2 = v * v;
 	const float anisotropy = (u2 < v2) ? (1.f - u2 / v2) : u2 > 0.f ? (v2 / u2 - 1.f) : 0.f;
 	const float roughness = u * v;
+	const bool ggx15ny = slg::mlhero15ny::Active(mlHeroEnabled,
+			fineRoughGlass, anisotropy);
 
 
 
         const auto e=MLHeroEvaluateRough15kk(hitPoint.fromLight,localLightDir,localEyeDir,
-            nc,nt,roughness,anisotropy,fineRoughGlass && RoughGlassMLUseVNDF(anisotropy),kr,kt);
+            nc,nt,roughness,anisotropy,fineRoughGlass && RoughGlassMLUseVNDF(anisotropy),kr,kt,
+			ggx15ny,u,v);
         if(directPdfW)*directPdfW=e.directPdf;
         if(reversePdfW)*reversePdfW=e.reversePdf;
         *event=e.event;
@@ -903,6 +901,8 @@ Spectrum RoughGlassMaterial::SampleMLHeroPrecise15kl(const HitPoint &hitPoint,
 	const float v2 = v * v;
 	const float anisotropy = (u2 < v2) ? (1.f - u2 / v2) : u2 > 0.f ? (v2 / u2 - 1.f) : 0.f;
 	const float roughness = u * v;
+	const bool ggx15ny = slg::mlhero15ny::Active(mlHeroEnabled,
+			fineRoughGlass, anisotropy);
 
 	const float nc = ExtractExteriorIors(hitPoint, exteriorIor);
 	const float nt = RoughGlassMLGetInteriorIOR(hitPoint, interiorIor, cauchyB, dispersionModel, sellmeierPreset);
@@ -915,7 +915,14 @@ Spectrum RoughGlassMaterial::SampleMLHeroPrecise15kl(const HitPoint &hitPoint,
         MLHeroVector15kk(slg::mlhero15kk::Unit(localFixedPrecise15kl)):localFixedDir;
 	Vector wh;
 	float d, specPdf;
-	if (fineRoughGlass && RoughGlassMLUseVNDF(anisotropy))
+	if (ggx15ny) {
+		const auto sampledH15ny = slg::mlhero15ny::Sample(u, v,
+				localFixedPrecise15kl, roughU0, u1);
+		wh = MLHeroVector15kk(sampledH15ny);
+		d = float(slg::mlhero15ny::D(u, v, sampledH15ny));
+		specPdf = float(slg::mlhero15ny::HalfPdf(u, v,
+				localFixedPrecise15kl, sampledH15ny));
+	} else if (fineRoughGlass && RoughGlassMLUseVNDF(anisotropy))
 		RoughGlassMLSampleVisibleNormal(roughness, samplingFixed15kk,
 				roughU0, u1, &wh, &d, &specPdf);
 	else
@@ -925,26 +932,41 @@ Spectrum RoughGlassMaterial::SampleMLHeroPrecise15kl(const HitPoint &hitPoint,
 		wh = -wh;
     // The legacy NDF sampler reports D as its PDF.  Preserve the stable BRDF
     // D, but use the actual inverse-CDF density for the sampled half-vector.
-    if(mlHeroEnabled && !(fineRoughGlass && RoughGlassMLUseVNDF(anisotropy))) {
+    if(mlHeroEnabled && !ggx15ny &&
+			!(fineRoughGlass && RoughGlassMLUseVNDF(anisotropy))) {
         d=RoughGlassMLDistributionD15kj(roughness,wh,anisotropy);
         specPdf=RoughGlassMLSchlickHalfPdf15ld(roughness,anisotropy,wh);
     }
+	// 15ny: the green 15nx candidate is now the live anisotropic GGX sample.
+	// The audit below independently checks its half- and direction-space PDFs.
 	slg::mlhero15lc::Attempt audit15lc(hitPoint.fromLight, GetID(),
-		fineRoughGlass && RoughGlassMLUseVNDF(anisotropy), u, v, roughness,
+		ggx15ny ? slg::mlhero15lc::ANISOTROPIC_GGX_VNDF :
+			(fineRoughGlass && RoughGlassMLUseVNDF(anisotropy) ?
+				slg::mlhero15lc::ISOTROPIC_VNDF : slg::mlhero15lc::SCHLICK_NDF),
+		u, v, roughness,
 		anisotropy, roughU0, u1, passThroughEvent,
 		slg::mlhero15kk::V(samplingFixed15kk), slg::mlhero15kk::V(wh), d, specPdf);
 	const float cosThetaOH = Dot(localFixedDir, wh);
 
     const auto optics15kk=slg::mlhero15kk::MakeInterface(nc,nt,
         localFixedPrecise15kl,slg::mlhero15kk::V(wh));
+    const unsigned ggxSide15ny = ggx15ny ?
+		slg::mlhero15ny::Begin(hitPoint.fromLight, localFixedPrecise15kl) : 0u;
     if(mlHeroEnabled && !optics15kk.valid) {
+		if (ggx15ny) slg::mlhero15ny::Rejected(ggxSide15ny,
+			slg::mlhero15ny::INVALID_INTERFACE);
 		audit15lc.SetStatus(slg::mlhero15lc::INVALID_INTERFACE);
 		return Spectrum();
 	}
     if(mlHeroEnabled) {
-        d=RoughGlassMLDistributionD15kj(roughness,wh,anisotropy);
-        specPdf=RoughGlassMLHalfPdf15ld(roughness,anisotropy,
-            localFixedDir,wh,fineRoughGlass && RoughGlassMLUseVNDF(anisotropy));
+		if (ggx15ny) {
+			d=float(slg::mlhero15ny::D(u,v,optics15kk.h));
+			specPdf=float(slg::mlhero15ny::HalfPdf(u,v,optics15kk.fixed,optics15kk.h));
+		} else {
+            d=RoughGlassMLDistributionD15kj(roughness,wh,anisotropy);
+            specPdf=RoughGlassMLHalfPdf15ld(roughness,anisotropy,
+                localFixedDir,wh,fineRoughGlass && RoughGlassMLUseVNDF(anisotropy));
+		}
     }
     const float coso=mlHeroEnabled?std::fabs(optics15kk.fixed.z):fabsf(localFixedDir.z);
 
@@ -976,6 +998,8 @@ Spectrum RoughGlassMaterial::SampleMLHeroPrecise15kl(const HitPoint &hitPoint,
         const double probability=transmit?threshold:1.f-threshold;
 		audit15lc.Branch(transmit, probability);
         if(transmit && optics15kk.tir) {
+			if (ggx15ny) slg::mlhero15ny::Rejected(ggxSide15ny,
+				slg::mlhero15ny::TIR_TRANSMISSION);
 			audit15lc.SetStatus(slg::mlhero15lc::TIR_TRANSMISSION);
 			return Spectrum();
 		}
@@ -985,15 +1009,20 @@ Spectrum RoughGlassMaterial::SampleMLHeroPrecise15kl(const HitPoint &hitPoint,
         const double ci=std::fabs(generated.z),co=std::fabs(optics15kk.fixed.z);
         if(ci<DEFAULT_COS_EPSILON_STATIC ||
                 (transmit?(optics15kk.fixed.z*generated.z>=0.):(optics15kk.fixed.z*generated.z<0.))) {
+			if (ggx15ny) slg::mlhero15ny::Rejected(ggxSide15ny,
+				slg::mlhero15ny::HEMISPHERE);
 			audit15lc.SetStatus(slg::mlhero15lc::HEMISPHERE_REJECT);
 			return Spectrum();
 		}
         if(!(probability>0.)||!(specPdf>0.f)) {
+			if (ggx15ny) slg::mlhero15ny::Rejected(ggxSide15ny,
+				slg::mlhero15ny::ZERO_DENSITY);
 			audit15lc.SetStatus(slg::mlhero15lc::ZERO_DENSITY);
 			return Spectrum();
 		}
         const Vector normalizedFixed=MLHeroVector15kk(optics15kk.fixed);
-        const float g=RoughGlassMLGeometry15ga(roughness,anisotropy,normalizedFixed,*localSampledDir);
+		const float g=ggx15ny ? float(slg::mlhero15ny::G2(u,v,optics15kk.fixed,generated)) :
+			RoughGlassMLGeometry15ga(roughness,anisotropy,normalizedFixed,*localSampledDir);
         const double factor=(double(d)/specPdf)*g*std::fabs(optics15kk.cosine)/probability;
         if(transmit) {
             const double ctSigned=optics15kk.fixed.z>0.?-optics15kk.cosTransmitted:optics15kk.cosTransmitted;
@@ -1003,9 +1032,11 @@ Spectrum RoughGlassMaterial::SampleMLHeroPrecise15kl(const HitPoint &hitPoint,
             MLHero15gkAuditTransmission(hitPoint,localFixedDir,*localSampledDir,*pdfW,result);
             *event=GLOSSY|TRANSMIT;
         }else{
-            *pdfW=(fineRoughGlass && RoughGlassMLUseVNDF(anisotropy))?
-                probability*d*G1(roughness,optics15kk.fixed)/(4.*co):
-                probability*specPdf/(4.*std::fabs(optics15kk.cosine));
+			*pdfW=ggx15ny ? probability*slg::mlhero15ny::ReflectionPdf(u,v,
+				optics15kk.fixed,optics15kk.h) :
+				((fineRoughGlass && RoughGlassMLUseVNDF(anisotropy))?
+				probability*d*G1(roughness,optics15kk.fixed)/(4.*co):
+				probability*specPdf/(4.*std::fabs(optics15kk.cosine)));
             result=(factor*(1.-optics15kk.transmission)/(hitPoint.fromLight?ci:co))*kr;
             *event=GLOSSY|REFLECT;
             const float thickness=filmThickness?filmThickness->GetFloatValue(hitPoint):0.f;
@@ -1015,11 +1046,15 @@ Spectrum RoughGlassMaterial::SampleMLHeroPrecise15kl(const HitPoint &hitPoint,
             }
         }
         if(!(*pdfW>0.f)||!std::isfinite(*pdfW)) {
+			if (ggx15ny) slg::mlhero15ny::Rejected(ggxSide15ny,
+				slg::mlhero15ny::PDF_REJECT);
 			audit15lc.SetStatus(slg::mlhero15lc::PDF_REJECT);
 			return Spectrum();
 		}
 		audit15lc.Accept(generated, *pdfW, optics15kk.cosine,
 			optics15kk.cosTransmitted, optics15kk.eta);
+		if (ggx15ny) slg::mlhero15ny::Accepted(ggxSide15ny, transmit,
+			*pdfW, result.Filter());
     }else {
 	if (passThroughEvent < threshold) {
 		// Transmit
@@ -1105,7 +1140,8 @@ Spectrum RoughGlassMaterial::SampleMLHeroPrecise15kl(const HitPoint &hitPoint,
         s.precise15kl=true;s.fixedPrecise15kl=localFixedPrecise15kl;
         s.sampledPrecise15kl=*localSampledPrecise15kl;s.whPrecise15kl=optics15kk.h;
         s.transmit=(*event & TRANSMIT)!=0;
-        s.vndf=fineRoughGlass && RoughGlassMLUseVNDF(anisotropy);
+		s.vndf=fineRoughGlass && RoughGlassMLUseVNDF(anisotropy);
+		s.ggx=ggx15ny;s.alphaX=u;s.alphaY=v;
         s.importance=RoughGlassML15ghEnabled();s.krBlack=isKrBlack;s.ktBlack=isKtBlack;
         s.nc=nc;s.nt=nt;s.roughness=roughness;s.anisotropy=anisotropy;
         s.sampleD=d;s.sampleSpecPdf=specPdf;
@@ -1336,7 +1372,23 @@ bool RoughGlassMaterial::EvaluateMLHeroMicrofacetOwnershipPrecise15kl(const HitP
 		float *heroMicrofacetPdf, float *laneSharedMicrofacetPdf,
 		float *naturalJacobian, float *sharedJacobian,
 		float *naturalDirPdf, float *sharedDirPdf,
-		float *naturalDirDelta, float *sharedWhDelta, bool *naturalTir) const  {
+		float *naturalDirDelta, float *sharedWhDelta, bool *naturalTir,
+		slg::mlhero15kk::V *naturalChildDir,
+		BSDFEvent *naturalChildEvent, Spectrum *naturalChildValue,
+		float *naturalChildDirectPdf, float *naturalChildReversePdf,
+		bool *naturalChildPairValid, bool *naturalChildPairTransmit,
+		float *naturalChildAbsLightZ, float *naturalChildAbsEyeZ,
+		bool *naturalChildHemisphereZero) const  {
+	if (naturalChildDir) *naturalChildDir = slg::mlhero15kk::V();
+	if (naturalChildEvent) *naturalChildEvent = NONE;
+	if (naturalChildValue) *naturalChildValue = Spectrum();
+	if (naturalChildDirectPdf) *naturalChildDirectPdf = 0.f;
+	if (naturalChildReversePdf) *naturalChildReversePdf = 0.f;
+	if (naturalChildPairValid) *naturalChildPairValid = false;
+	if (naturalChildPairTransmit) *naturalChildPairTransmit = false;
+	if (naturalChildAbsLightZ) *naturalChildAbsLightZ = 0.f;
+	if (naturalChildAbsEyeZ) *naturalChildAbsEyeZ = 0.f;
+	if (naturalChildHemisphereZero) *naturalChildHemisphereZero = false;
     if(!mlHeroEnabled)return EvaluateMLHeroMicrofacetOwnershipDebug(hitPoint,MLHeroVector15kk(localFixedPrecise15kl),MLHeroVector15kk(localSharedPrecise15kl),sampledEvent,heroWaveLength,laneWaveLength,heroEta,laneEta,heroMicrofacetPdf,laneSharedMicrofacetPdf,naturalJacobian,sharedJacobian,naturalDirPdf,sharedDirPdf,naturalDirDelta,sharedWhDelta,naturalTir);
     const Vector localFixedDir=MLHeroVector15kk(localFixedPrecise15kl),localSharedDir=MLHeroVector15kk(localSharedPrecise15kl);
 
@@ -1363,6 +1415,8 @@ bool RoughGlassMaterial::EvaluateMLHeroMicrofacetOwnershipPrecise15kl(const HitP
 	const float v2 = v * v;
 	const float anisotropy = (u2 < v2) ? (1.f - u2 / v2) : u2 > 0.f ? (v2 / u2 - 1.f) : 0.f;
 	const float roughness = u * v;
+	const bool ggx15ny = slg::mlhero15ny::Active(mlHeroEnabled,
+			fineRoughGlass, anisotropy);
 
 	const float nc = ExtractExteriorIors(hitPoint, exteriorIor);
 	const float ntBase = ExtractInteriorIors(hitPoint, interiorIor);
@@ -1393,9 +1447,11 @@ bool RoughGlassMaterial::EvaluateMLHeroMicrofacetOwnershipPrecise15kl(const HitP
         const auto natural=MakeInterface(nc,ntLane,fixed,hero.h);
         const bool tir=!natural.valid||natural.tir;
         const Vector h=MLHeroVector15kk(hero.h);
-        const double hd=RoughGlassMLDistributionD15kj(roughness,h,anisotropy);
-        const double spec=hd*((fineRoughGlass&&RoughGlassMLUseVNDF(anisotropy))?
-            G1(roughness,fixed)*std::fabs(Dot(fixed,hero.h))/std::fabs(fixed.z):1.);
+		const double hd=ggx15ny ? slg::mlhero15ny::D(u,v,hero.h) :
+			RoughGlassMLDistributionD15kj(roughness,h,anisotropy);
+		const double spec=ggx15ny ? slg::mlhero15ny::HalfPdf(u,v,fixed,hero.h) :
+			hd*((fineRoughGlass&&RoughGlassMLUseVNDF(anisotropy))?
+			G1(roughness,fixed)*std::fabs(Dot(fixed,hero.h))/std::fabs(fixed.z):1.);
         double nj=0.,np=0.;V nd;
         if(!tir) {
             nd=Refract(natural);
@@ -1403,11 +1459,29 @@ bool RoughGlassMaterial::EvaluateMLHeroMicrofacetOwnershipPrecise15kl(const HitP
             const double length=natural.eta*natural.cosine+ct;
             nj=natural.cosTransmitted/(length*length);
             np=Probability(natural.transmission,isKrBlack,isKtBlack,RoughGlassML15ghEnabled())*spec*nj;
-        }
+        } else
+            nd=Reflect(natural);
+		const auto child15nz=MLHeroEvaluateRough15kk(hitPoint.fromLight,
+			hitPoint.fromLight?fixed:nd, hitPoint.fromLight?nd:fixed,
+			nc,ntLane,roughness,anisotropy,
+			fineRoughGlass&&RoughGlassMLUseVNDF(anisotropy),kr,kt,
+			ggx15ny,u,v);
+		// 15oa: the sampled microfacet owns the branch. A refracted direction
+		// that remains in the fixed macro hemisphere (or a reflected direction
+		// that crosses it) has zero support for that branch; it must terminate
+		// this wavelength lane instead of being re-labelled as the opposite lobe.
+		const bool childCosineSupported15oa =
+			std::fabs(fixed.z) >= DEFAULT_COS_EPSILON_STATIC &&
+			std::fabs(nd.z) >= DEFAULT_COS_EPSILON_STATIC;
+		const bool childHemisphereSupported15oa = tir ?
+			(fixed.z * nd.z > 0.) : (fixed.z * nd.z < 0.);
+		const bool childHemisphereZero15oa =
+			!childCosineSupported15oa || !childHemisphereSupported15oa;
         const auto qe=MLHeroEvaluateRough15kk(hitPoint.fromLight,
             hitPoint.fromLight?localFixedPrecise15kl:localSharedPrecise15kl,
             hitPoint.fromLight?localSharedPrecise15kl:localFixedPrecise15kl,
-            nc,ntLane,roughness,anisotropy,fineRoughGlass&&RoughGlassMLUseVNDF(anisotropy),kr,kt);
+            nc,ntLane,roughness,anisotropy,fineRoughGlass&&RoughGlassMLUseVNDF(anisotropy),kr,kt,
+			ggx15ny,u,v);
         if(heroEta)*heroEta=fixed.z>0.?double(nc)/ntHero:double(ntHero)/nc;
         if(laneEta)*laneEta=fixed.z>0.?double(nc)/ntLane:double(ntLane)/nc;
         if(heroMicrofacetPdf)*heroMicrofacetPdf=spec;
@@ -1419,6 +1493,20 @@ bool RoughGlassMaterial::EvaluateMLHeroMicrofacetOwnershipPrecise15kl(const HitP
         if(naturalTir)*naturalTir=tir;
         if(naturalDirDelta)*naturalDirDelta=tir?2.:1.-std::fmax(-1.,std::fmin(1.,Dot(nd,shared)));
         if(sharedWhDelta)*sharedWhDelta=1.-std::fmax(-1.,std::fmin(1.,Dot(hero.h,lane.h)));
+		if(naturalChildDir)*naturalChildDir=nd;
+		if(naturalChildEvent)*naturalChildEvent=childHemisphereZero15oa ?
+			(GLOSSY | (tir ? REFLECT : TRANSMIT)) : child15nz.event;
+		if(naturalChildValue)*naturalChildValue=childHemisphereZero15oa ?
+			Spectrum() : child15nz.value;
+		if(naturalChildDirectPdf)*naturalChildDirectPdf=childHemisphereZero15oa ?
+			0.f : child15nz.directPdf;
+		if(naturalChildReversePdf)*naturalChildReversePdf=childHemisphereZero15oa ?
+			0.f : child15nz.reversePdf;
+		if(naturalChildPairValid)*naturalChildPairValid=child15nz.pair.valid;
+		if(naturalChildPairTransmit)*naturalChildPairTransmit=child15nz.pair.transmit;
+		if(naturalChildAbsLightZ)*naturalChildAbsLightZ=std::fabs(child15nz.pair.light.z);
+		if(naturalChildAbsEyeZ)*naturalChildAbsEyeZ=std::fabs(child15nz.pair.eye.z);
+		if(naturalChildHemisphereZero)*naturalChildHemisphereZero=childHemisphereZero15oa;
         return true;
     }
 
@@ -1664,11 +1752,14 @@ void RoughGlassMaterial::PdfMLHeroPrecise15kl(const HitPoint &hitPoint,
 	const float v2 = v * v;
 	const float anisotropy = (u2 < v2) ? (1.f - u2 / v2) : u2 > 0.f ? (v2 / u2 - 1.f) : 0.f;
 	const float roughness = u * v;
+	const bool ggx15ny = slg::mlhero15ny::Active(mlHeroEnabled,
+			fineRoughGlass, anisotropy);
 
 
 
         const auto e=MLHeroEvaluateRough15kk(hitPoint.fromLight,localLightDir,localEyeDir,
-            nc,nt,roughness,anisotropy,fineRoughGlass && RoughGlassMLUseVNDF(anisotropy),kr,kt);
+            nc,nt,roughness,anisotropy,fineRoughGlass && RoughGlassMLUseVNDF(anisotropy),kr,kt,
+			ggx15ny,u,v);
         if(directPdfW)*directPdfW=e.directPdf;
         if(reversePdfW)*reversePdfW=e.reversePdf;
         return;
@@ -1795,7 +1886,8 @@ static slg::mlhero15ki::Factors MLHeroRoughFactors15ki(
     if(mlHeroEnabled) {
         const auto e=MLHeroEvaluateRough15kk(s.fromLight,s.fromLight?fixed:sampled,
             s.fromLight?sampled:fixed,s.nc,s.nt,s.roughness,s.anisotropy,s.vndf,
-            Spectrum(s.krBlack?0.f:1.f),Spectrum(s.ktBlack?0.f:1.f));
+            Spectrum(s.krBlack?0.f:1.f),Spectrum(s.ktBlack?0.f:1.f),
+			s.ggx,s.alphaX,s.alphaY);
         out.wh=Vec(MLHeroVector15kk(e.pair.h));out.d=e.d;out.referenceD=e.d;
         out.specPdf=e.directSpec;out.probability=e.directProbability;
         out.jacobian=e.directJacobian;out.pdf=e.directPdf;
@@ -1850,7 +1942,8 @@ slg::mlhero15ki::Comparison MLHeroCompareRoughGlass15ki(
             const auto l=s.fromLight?fixed:generated,e=s.fromLight?generated:fixed;
             float p,r;material->PdfMLHeroPrecise15kl(hitPoint,l,e,&p,&r);
             const auto q=MLHeroEvaluateRough15kk(s.fromLight,l,e,s.nc,s.nt,s.roughness,s.anisotropy,
-                s.vndf,Spectrum(s.krBlack?0.f:1.f),Spectrum(s.ktBlack?0.f:1.f));
+                s.vndf,Spectrum(s.krBlack?0.f:1.f),Spectrum(s.ktBlack?0.f:1.f),
+				s.ggx,s.alphaX,s.alphaY);
             f.wh=Vec(MLHeroVector15kk(q.pair.h));f.d=q.d;f.referenceD=q.d;
             f.specPdf=q.directSpec;f.probability=q.directProbability;f.jacobian=q.directJacobian;f.pdf=q.directPdf;
             f.angles=MLHeroCriticalAngles15kj(s,f.wh);return p;

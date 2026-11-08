@@ -29,6 +29,7 @@
 extern thread_local bool mlHeroEnabled;
 #include <memory>
 #include <cmath>
+#include <limits>
 
 // 15fe BEGIN
 #include <cmath>
@@ -38,6 +39,10 @@ extern thread_local bool mlHeroEnabled;
 #include "slg/materials/mattetranslucent.h"
 // 15fd END diagnostic-only
 #include "slg/materials/glossy2.h"
+#include "slg/materials/mix.h"
+#include "slg/engines/mlhero_mix_spectral15nm.h"
+#include "slg/engines/mlhero_mix_closure15nm.h"
+#include "slg/engines/mlhero_mix_sample_boundary15np.h"
 
 // Explicit wavelength evaluation must preserve the renderer's sampled state.
 extern thread_local float mlDispersionWaveLength;
@@ -521,6 +526,726 @@ Spectrum BSDF::Evaluate(const Vector &generatedDir,
 	return result;
 }
 
+bool BSDF::GetMLHeroMixMetadata15nl(MaterialType *typeA, MaterialType *typeB,
+		u_int *idA, u_int *idB, float *mixFactor) const {
+	if (!typeA || !typeB || !idA || !idB || !mixFactor ||
+			!material || material->GetType() != MIX)
+		return false;
+
+	const MixMaterial &mix = static_cast<const MixMaterial &>(*material);
+	const Material &matA = mix.GetMaterialA();
+	const Material &matB = mix.GetMaterialB();
+	*typeA = matA.GetType();
+	*typeB = matB.GetType();
+	*idA = matA.GetID();
+	*idB = matB.GetID();
+	*mixFactor = Clamp(mix.GetMixFactor().GetFloatValue(hitPoint), 0.f, 1.f);
+	return std::isfinite(*mixFactor);
+}
+
+bool BSDF::EvaluateMLHeroMixComponents15nl(const Vector &generatedDir,
+		Spectrum *weightedA, Spectrum *weightedB, Spectrum *combinedResult,
+		BSDFEvent *eventA, BSDFEvent *eventB,
+		float *directPdfA, float *directPdfB,
+		float *reversePdfA, float *reversePdfB) const {
+	if (!weightedA || !weightedB || !combinedResult || !eventA || !eventB ||
+			!directPdfA || !directPdfB || !reversePdfA || !reversePdfB ||
+			!material || material->GetType() != MIX)
+		return false;
+
+	*weightedA = Spectrum();
+	*weightedB = Spectrum();
+	*combinedResult = Spectrum();
+	*eventA = NONE;
+	*eventB = NONE;
+	*directPdfA = *directPdfB = 0.f;
+	*reversePdfA = *reversePdfB = 0.f;
+
+	const MixMaterial &mix = static_cast<const MixMaterial &>(*material);
+	const Material &matA = mix.GetMaterialA();
+	const Material &matB = mix.GetMaterialB();
+	const float weightB = Clamp(mix.GetMixFactor().GetFloatValue(hitPoint), 0.f, 1.f);
+	const float weightA = 1.f - weightB;
+
+	const Vector &eyeDir = hitPoint.fromLight ? generatedDir : hitPoint.fixedDir;
+	const Vector &lightDir = hitPoint.fromLight ? hitPoint.fixedDir : generatedDir;
+	const Vector localLightDir = frame.ToLocal(lightDir);
+	const Vector localEyeDir = frame.ToLocal(eyeDir);
+	const Frame mixFrame(hitPoint.GetFrame());
+	const bool transmit = Sgn(localLightDir.z) != Sgn(localEyeDir.z);
+
+	if (weightA > 0.f && ((!transmit && (matA.GetEventTypes() & REFLECT)) ||
+			(transmit && (matA.GetEventTypes() & TRANSMIT)))) {
+		HitPoint childHitPoint(hitPoint);
+		matA.Bump(&childHitPoint);
+		const Frame childFrame(childHitPoint.GetFrame());
+		const Vector childLight = childFrame.ToLocal(mixFrame.ToWorld(localLightDir));
+		const Vector childEye = childFrame.ToLocal(mixFrame.ToWorld(localEyeDir));
+		const Spectrum childValue = matA.Evaluate(childHitPoint, childLight, childEye,
+			eventA, directPdfA, reversePdfA);
+		*weightedA = weightA * childValue;
+	}
+
+	if (weightB > 0.f && ((!transmit && (matB.GetEventTypes() & REFLECT)) ||
+			(transmit && (matB.GetEventTypes() & TRANSMIT)))) {
+		HitPoint childHitPoint(hitPoint);
+		matB.Bump(&childHitPoint);
+		const Frame childFrame(childHitPoint.GetFrame());
+		const Vector childLight = childFrame.ToLocal(mixFrame.ToWorld(localLightDir));
+		const Vector childEye = childFrame.ToLocal(mixFrame.ToWorld(localEyeDir));
+		const Spectrum childValue = matB.Evaluate(childHitPoint, childLight, childEye,
+			eventB, directPdfB, reversePdfB);
+		*weightedB = weightB * childValue;
+	}
+
+	*combinedResult = *weightedA + *weightedB;
+	return !weightedA->IsNaN() && !weightedA->IsInf() &&
+		!weightedB->IsNaN() && !weightedB->IsInf() &&
+		!combinedResult->IsNaN() && !combinedResult->IsInf();
+}
+
+// 15nm BEGIN: exact, fail-closed wavelength evaluation behind MixMaterial.
+static bool MLHeroPrepareMixChild15nm(const Material &childMaterial,
+		const float weight, const HitPoint &outerHitPoint,
+		const Frame &outerFrame, const Vector &outerLocalLightDir,
+		const Vector &outerLocalEyeDir, const bool transmit,
+		const Vector *anchoredLocalLightDir15ns,
+		const Vector *anchoredLocalEyeDir15ns,
+		MLHeroMixChildSpectral15nm *child, u_int *failure15no) {
+	if (failure15no)
+		*failure15no = MLHERO_MIX_CHILD_OK15NO;
+	if (!child || !std::isfinite(weight) || weight < 0.f) {
+		if (failure15no)
+			*failure15no = MLHERO_MIX_CHILD_INVALID_INPUT15NO;
+		return false;
+	}
+
+	child->material = &childMaterial;
+	child->weight = weight;
+	child->nativeValue = Spectrum(0.f);
+	child->event = NONE;
+	child->directPdfW = 0.f;
+	child->reversePdfW = 0.f;
+	child->route = MLHERO_MIX_CHILD_INACTIVE15NM;
+	if (!(weight > 0.f))
+		return true;
+
+	// Nested MIX needs a recursive endpoint representation.  Do not silently
+	// flatten it as an achromatic value in this first visible fix.
+	if (childMaterial.GetType() == MIX) {
+		if (failure15no)
+			*failure15no = MLHERO_MIX_CHILD_NESTED_MIX15NO;
+		return false;
+	}
+
+	child->hitPoint = outerHitPoint;
+	childMaterial.Bump(&child->hitPoint);
+	const Frame childFrame(child->hitPoint.GetFrame());
+	if (anchoredLocalLightDir15ns && anchoredLocalEyeDir15ns) {
+		child->localLightDir = *anchoredLocalLightDir15ns;
+		child->localEyeDir = *anchoredLocalEyeDir15ns;
+	} else {
+		child->localLightDir = childFrame.ToLocal(
+			outerFrame.ToWorld(outerLocalLightDir));
+		child->localEyeDir = childFrame.ToLocal(
+			outerFrame.ToWorld(outerLocalEyeDir));
+	}
+	// Native Mix::Sample classifies its evaluated second child in the child's
+	// exact local frame. Preserve that rule for an anchored sampled endpoint;
+	// Evaluate-only endpoints retain Mix::Evaluate's outer-side policy.
+	const bool routeTransmit15ns = anchoredLocalLightDir15ns ?
+		(Sgn(child->localLightDir.z) != Sgn(child->localEyeDir.z)) : transmit;
+	const BSDFEvent childEvents = childMaterial.GetEventTypes();
+	if ((!routeTransmit15ns && !(childEvents & REFLECT)) ||
+			(routeTransmit15ns && !(childEvents & TRANSMIT)))
+		return true;
+	child->nativeValue = childMaterial.Evaluate(child->hitPoint,
+		child->localLightDir, child->localEyeDir, &child->event,
+		&child->directPdfW, &child->reversePdfW);
+	if (child->nativeValue.IsNaN() || child->nativeValue.IsInf()) {
+		if (failure15no)
+			*failure15no = MLHERO_MIX_CHILD_NATIVE_NONFINITE15NO;
+		return false;
+	}
+
+	if (child->nativeValue.Black()) {
+		child->route = MLHERO_MIX_CHILD_SCALAR15NM;
+		return true;
+	}
+
+	switch (childMaterial.GetType()) {
+		case METAL2:
+			child->route = MLHERO_MIX_CHILD_METAL215NM;
+			return true;
+		case GLOSSY2: {
+			const Glossy2Material &glossy2 =
+				static_cast<const Glossy2Material &>(childMaterial);
+			if (!glossy2.PrepareMLHeroSpectralEndpoint15nk(child->hitPoint,
+					child->localLightDir, child->localEyeDir,
+					&child->glossy2)) {
+				if (failure15no)
+					*failure15no = MLHERO_MIX_CHILD_GLOSSY2_PREPARE15NO;
+				return false;
+			}
+			if (child->glossy2.event != child->event) {
+				if (failure15no)
+					*failure15no = MLHERO_MIX_CHILD_EVENT_MISMATCH15NO;
+				return false;
+			}
+			child->route = MLHERO_MIX_CHILD_GLOSSY215NM;
+			return true;
+		}
+		case VELVET: {
+			const VelvetMaterial &velvet =
+				static_cast<const VelvetMaterial &>(childMaterial);
+			if (!velvet.PrepareMLHeroSpectralEndpoint15nn(child->hitPoint,
+					child->localLightDir, child->localEyeDir,
+					&child->velvet)) {
+				if (failure15no)
+					*failure15no = MLHERO_MIX_CHILD_VELVET_PREPARE15NO;
+				return false;
+			}
+			if (child->velvet.event != child->event) {
+				if (failure15no)
+					*failure15no = MLHERO_MIX_CHILD_EVENT_MISMATCH15NO;
+				return false;
+			}
+			child->route = MLHERO_MIX_CHILD_VELVET15NN;
+			return true;
+		}
+		default: {
+			// A genuinely scalar native child has no RGB chroma to reconstruct.
+			// Chromatic unsupported children remain on the original RGB path.
+			const float scale = Max(1.f, Max(fabsf(child->nativeValue.c[0]),
+				Max(fabsf(child->nativeValue.c[1]),
+					fabsf(child->nativeValue.c[2]))));
+			if ((fabsf(child->nativeValue.c[0] - child->nativeValue.c[1]) >
+					1e-6f * scale) ||
+					(fabsf(child->nativeValue.c[0] - child->nativeValue.c[2]) >
+					1e-6f * scale)) {
+				if (failure15no)
+					*failure15no = MLHERO_MIX_CHILD_UNSUPPORTED_CHROMATIC15NO;
+				return false;
+			}
+			child->route = MLHERO_MIX_CHILD_SCALAR15NM;
+			return true;
+		}
+	}
+}
+
+bool BSDF::PrepareMLHeroMixSpectralEndpoint15nm(
+		const Vector &generatedDir, const BSDFEvent expectedEvent,
+		const Spectrum &nativeValue, const bool sampled,
+		const float nativePdfW,
+		MLHeroMixSpectralEndpoint15nm *prepared,
+		MLHeroMixDiagnostic15no *diagnostic15no) const {
+	if (diagnostic15no)
+		*diagnostic15no = MLHeroMixDiagnostic15no();
+	if (diagnostic15no)
+		diagnostic15no->sampled = sampled;
+	if (!prepared || !material || material->GetType() != MIX) {
+		if (diagnostic15no)
+			diagnostic15no->prepareFailure =
+				MLHERO_MIX_PREPARE_INVALID_INPUT15NO;
+		return false;
+	}
+	if (expectedEvent & SPECULAR) {
+		if (diagnostic15no)
+			diagnostic15no->prepareFailure =
+				MLHERO_MIX_PREPARE_SPECULAR_EVENT15NO;
+		return false;
+	}
+	if ((sampled && (!std::isfinite(nativePdfW) || !(nativePdfW > 0.f))) ||
+			nativeValue.IsNaN() || nativeValue.IsInf()) {
+		if (diagnostic15no)
+			diagnostic15no->prepareFailure =
+				MLHERO_MIX_PREPARE_INVALID_SAMPLE15NO;
+		return false;
+	}
+	*prepared = MLHeroMixSpectralEndpoint15nm();
+	prepared->sampled = sampled;
+	prepared->nativePdfW = sampled ? nativePdfW : 1.f;
+
+	const Vector &eyeDir = hitPoint.fromLight ? generatedDir : hitPoint.fixedDir;
+	const Vector &lightDir = hitPoint.fromLight ? hitPoint.fixedDir : generatedDir;
+	const float absDotLightDirNG = AbsDot(lightDir, hitPoint.geometryN);
+	const float absDotEyeDirNG = AbsDot(eyeDir, hitPoint.geometryN);
+	if (diagnostic15no) {
+		diagnostic15no->absDotLightDirNG = absDotLightDirNG;
+		diagnostic15no->absDotEyeDirNG = absDotEyeDirNG;
+	}
+	const bool geometryGateWouldReject15np =
+		absDotLightDirNG < DEFAULT_COS_EPSILON_STATIC ||
+		absDotEyeDirNG < DEFAULT_COS_EPSILON_STATIC;
+	if (diagnostic15no)
+		diagnostic15no->geometryGateWouldReject =
+			geometryGateWouldReject15np;
+	const slg::mlhero15np::BoundaryPolicy boundaryPolicy15np =
+		slg::mlhero15np::SelectBoundaryPolicy(sampled);
+	if (boundaryPolicy15np.applyGeometryCosGate &&
+			geometryGateWouldReject15np) {
+		if (diagnostic15no)
+			diagnostic15no->prepareFailure =
+				MLHERO_MIX_PREPARE_GEOMETRY_COS15NO;
+		return false;
+	}
+
+	const BSDFEvent mixEvents = material->GetEventTypes();
+	const float sideTestNG = Dot(eyeDir, hitPoint.geometryN) *
+		Dot(lightDir, hitPoint.geometryN);
+	const float sideTestIS = Dot(eyeDir, hitPoint.interpolatedN) *
+		Dot(lightDir, hitPoint.interpolatedN);
+	if (diagnostic15no) {
+		diagnostic15no->sideTestNG = sideTestNG;
+		diagnostic15no->sideTestIS = sideTestIS;
+	}
+	const bool sideEventGateWouldReject15np =
+		((sideTestNG > 0.f) && !(mixEvents & REFLECT)) ||
+			((sideTestNG < 0.f) && !(mixEvents & TRANSMIT)) ||
+			((sideTestIS > 0.f) && !(mixEvents & REFLECT)) ||
+			((sideTestIS < 0.f) && !(mixEvents & TRANSMIT));
+	if (diagnostic15no)
+		diagnostic15no->sideEventGateWouldReject =
+			sideEventGateWouldReject15np;
+	if (boundaryPolicy15np.applySideEventGate &&
+			sideEventGateWouldReject15np) {
+		if (diagnostic15no)
+			diagnostic15no->prepareFailure =
+				MLHERO_MIX_PREPARE_SIDE_EVENT15NO;
+		return false;
+	}
+
+	const Vector outerLocalLightDir = frame.ToLocal(lightDir);
+	const Vector outerLocalEyeDir = frame.ToLocal(eyeDir);
+	const Frame outerFrame(hitPoint.GetFrame());
+	const bool transmit = Sgn(outerLocalLightDir.z) !=
+		Sgn(outerLocalEyeDir.z);
+	const MixMaterial &mix = static_cast<const MixMaterial &>(*material);
+	const float weightB = Clamp(mix.GetMixFactor().GetFloatValue(hitPoint),
+		0.f, 1.f);
+	const float weightA = 1.f - weightB;
+	// 15ns: a sampled Mix bounce already computed the exact local direction
+	// pair for both children. Reuse that native state so the wavelength endpoint
+	// is evaluated at the same point on sharp lobes. Evaluate-only DLS and
+	// connection endpoints deliberately retain their ordinary frame path.
+	const u_int selectedChild15ns =
+		(hitPoint.passThroughEvent < weightA) ? 0u : 1u;
+	const Material *selectedMaterial15ns = selectedChild15ns == 0u ?
+		&mix.GetMaterialA() : &mix.GetMaterialB();
+	slg::mlhero15nr::Capture capture15ns;
+	bool captureMatched15ns = false;
+	if (sampled) {
+		if (diagnostic15no)
+			diagnostic15no->directionAnchorRequested15ns = true;
+		captureMatched15ns = slg::mlhero15nr::ReadMatching(material,
+			selectedMaterial15ns, selectedChild15ns,
+			hitPoint.passThroughEvent, &capture15ns) &&
+			capture15ns.fromLight == hitPoint.fromLight &&
+			capture15ns.event == (u_int)expectedEvent;
+		if (diagnostic15no) {
+			diagnostic15no->directionCaptureMatched15ns = captureMatched15ns;
+			diagnostic15no->directionAnchorApplied15ns = captureMatched15ns;
+		}
+	}
+	Vector anchoredLight15ns[2];
+	Vector anchoredEye15ns[2];
+	if (captureMatched15ns) {
+		for (u_int i = 0u; i < 2u; ++i) {
+			anchoredLight15ns[i] = hitPoint.fromLight ?
+				capture15ns.childFixedDir[i] : capture15ns.childSampledDir[i];
+			anchoredEye15ns[i] = hitPoint.fromLight ?
+				capture15ns.childSampledDir[i] : capture15ns.childFixedDir[i];
+		}
+	}
+	if (diagnostic15no) {
+		diagnostic15no->passThroughEvent15nq = hitPoint.passThroughEvent;
+		diagnostic15no->childWeight15nq[0] = weightA;
+		diagnostic15no->childWeight15nq[1] = weightB;
+		diagnostic15no->selectedChild15nq =
+			(hitPoint.passThroughEvent < weightA) ? 0u : 1u;
+		diagnostic15no->selectedChildType15nq =
+			(u_int)(diagnostic15no->selectedChild15nq == 0u ?
+				mix.GetMaterialA().GetType() : mix.GetMaterialB().GetType());
+	}
+	u_int childFailure15no = MLHERO_MIX_CHILD_OK15NO;
+	if (!MLHeroPrepareMixChild15nm(mix.GetMaterialA(), weightA, hitPoint,
+			outerFrame, outerLocalLightDir, outerLocalEyeDir, transmit,
+			captureMatched15ns ? &anchoredLight15ns[0] : nullptr,
+			captureMatched15ns ? &anchoredEye15ns[0] : nullptr,
+			&prepared->child[0], &childFailure15no)) {
+		if (diagnostic15no) {
+			diagnostic15no->prepareFailure = MLHERO_MIX_PREPARE_CHILD_A15NO;
+			diagnostic15no->childFailure = childFailure15no;
+			diagnostic15no->childIndex = 0u;
+			diagnostic15no->childType = (u_int)mix.GetMaterialA().GetType();
+		}
+		return false;
+	}
+	if (!MLHeroPrepareMixChild15nm(mix.GetMaterialB(), weightB, hitPoint,
+			outerFrame, outerLocalLightDir, outerLocalEyeDir, transmit,
+			captureMatched15ns ? &anchoredLight15ns[1] : nullptr,
+			captureMatched15ns ? &anchoredEye15ns[1] : nullptr,
+			&prepared->child[1], &childFailure15no)) {
+		if (diagnostic15no) {
+			diagnostic15no->prepareFailure = MLHERO_MIX_PREPARE_CHILD_B15NO;
+			diagnostic15no->childFailure = childFailure15no;
+			diagnostic15no->childIndex = 1u;
+			diagnostic15no->childType = (u_int)mix.GetMaterialB().GetType();
+		}
+		return false;
+	}
+	if (diagnostic15no) {
+		for (u_int i = 0u; i < 2u; ++i) {
+			const MLHeroMixChildSpectral15nm &child = prepared->child[i];
+			diagnostic15no->childRoute15nq[i] = child.route;
+			diagnostic15no->childDirectPdf15nq[i] = child.directPdfW;
+			diagnostic15no->childReversePdf15nq[i] = child.reversePdfW;
+			for (u_int c = 0u; c < 3u; ++c)
+				diagnostic15no->childNative15nq[i][c] = child.nativeValue.c[c];
+		}
+	}
+
+	Spectrum reconstructed(0.f);
+	prepared->combinedEvent = NONE;
+	for (u_int i = 0u; i < 2u; ++i) {
+		const MLHeroMixChildSpectral15nm &child = prepared->child[i];
+		if (child.route != MLHERO_MIX_CHILD_INACTIVE15NM &&
+				!child.nativeValue.Black()) {
+			reconstructed += child.weight * child.nativeValue;
+			prepared->combinedEvent |= child.event;
+		}
+	}
+	if (reconstructed.Black()) {
+		if (diagnostic15no)
+			diagnostic15no->prepareFailure =
+				MLHERO_MIX_PREPARE_RECONSTRUCTED_BLACK15NO;
+		return false;
+	}
+
+	prepared->wrapperFactor = 1.f;
+	if ((expectedEvent & REFLECT) &&
+			(expectedEvent & (DIFFUSE | GLOSSY)) &&
+			(hitPoint.shadeN != hitPoint.interpolatedN))
+		prepared->wrapperFactor *= ShadowTerminatorAvoidanceFactor(
+			hitPoint.GetLandingInterpolatedN(), hitPoint.GetLandingShadeN(),
+			lightDir);
+	if (hitPoint.fromLight)
+		prepared->wrapperFactor *= absDotEyeDirNG / absDotLightDirNG;
+	if (diagnostic15no)
+		diagnostic15no->wrapperFactor = prepared->wrapperFactor;
+	if (!std::isfinite(prepared->wrapperFactor) ||
+			prepared->wrapperFactor < 0.f) {
+		if (diagnostic15no)
+			diagnostic15no->prepareFailure =
+				MLHERO_MIX_PREPARE_WRAPPER_INVALID15NO;
+		return false;
+	}
+
+	reconstructed *= prepared->wrapperFactor / prepared->nativePdfW;
+	prepared->nativeReconstructed = reconstructed;
+	double reconstructed15nm[3], nativeValue15nm[3];
+	for (u_int channel = 0u; channel < 3u; ++channel) {
+		reconstructed15nm[channel] = reconstructed.c[channel];
+		nativeValue15nm[channel] = nativeValue.c[channel];
+	}
+	const slg::mlhero15nm::Closure closure15nm =
+		slg::mlhero15nm::AnalyzeClosure(reconstructed15nm,
+			nativeValue15nm);
+	prepared->closureRelativeError = float(closure15nm.relativeError);
+	if (diagnostic15no)
+		diagnostic15no->closureRelativeError =
+			prepared->closureRelativeError;
+	if (diagnostic15no && sampled) {
+		double childA15nq[3], childB15nq[3];
+		for (u_int channel = 0u; channel < 3u; ++channel) {
+			childA15nq[channel] = prepared->child[0].nativeValue.c[channel];
+			childB15nq[channel] = prepared->child[1].nativeValue.c[channel];
+		}
+		const slg::mlhero15nq::Analysis analysis15nq =
+			slg::mlhero15nq::Analyze(weightA, weightB, childA15nq,
+				childB15nq, prepared->child[0].directPdfW,
+				prepared->child[1].directPdfW,
+				prepared->child[0].reversePdfW,
+				prepared->child[1].reversePdfW,
+				prepared->wrapperFactor, prepared->nativePdfW,
+				nativeValue15nm, hitPoint.passThroughEvent,
+				hitPoint.fromLight);
+		diagnostic15no->analysisFinite15nq = analysis15nq.finite;
+		diagnostic15no->doubleClosureAccepted15nq =
+			analysis15nq.doubleClosureAccepted;
+		diagnostic15no->selectedChild15nq = analysis15nq.selectedChild;
+		diagnostic15no->doubleClosureRelativeError15nq =
+			analysis15nq.doubleClosureRelativeError;
+		diagnostic15no->selectedNumeratorRelativeError15nq =
+			analysis15nq.selectedNumeratorRelativeError;
+		diagnostic15no->comparableMixturePdf15nq =
+			analysis15nq.comparableMixturePdf;
+		diagnostic15no->nativePdfRelativeError15nq =
+			analysis15nq.nativePdfRelativeError;
+		for (u_int channel = 0u; channel < 3u; ++channel) {
+			diagnostic15no->doubleReconstructed15nq[channel] =
+				analysis15nq.doubleReconstructed[channel];
+			diagnostic15no->nativeNumerator15nq[channel] =
+				analysis15nq.nativeNumerator[channel];
+			diagnostic15no->inferredSelectedNumerator15nq[channel] =
+				analysis15nq.inferredSelectedNumerator[channel];
+			diagnostic15no->evaluatedSelectedNumerator15nq[channel] =
+				analysis15nq.evaluatedSelectedNumerator[channel];
+		}
+
+		// 15nr: only a native closure rejection pays for this extra Evaluate.
+		// Re-evaluate the selected child at the exact local direction produced by
+		// its Sample(), before MixMaterial transforms it through world and back.
+		if (!closure15nm.finite || !closure15nm.accepted) {
+			const u_int selected15nr = diagnostic15no->selectedChild15nq;
+			if (selected15nr < 2u) {
+				const MLHeroMixChildSpectral15nm &child15nr =
+					prepared->child[selected15nr];
+				slg::mlhero15nr::Capture capture15nr;
+				if (slg::mlhero15nr::ReadMatching(material,
+						child15nr.material, selected15nr,
+						hitPoint.passThroughEvent, &capture15nr)) {
+					diagnostic15no->captureMatched15nr = true;
+					diagnostic15no->capturedEvent15nr = capture15nr.event;
+					diagnostic15no->roundTripEvent15nr = child15nr.event;
+					diagnostic15no->childSamplePdf15nr = capture15nr.childPdfW;
+
+					const Vector originalLight15nr = hitPoint.fromLight ?
+						capture15nr.originalFixedDir :
+						capture15nr.originalSampledDir;
+					const Vector originalEye15nr = hitPoint.fromLight ?
+						capture15nr.originalSampledDir :
+						capture15nr.originalFixedDir;
+					BSDFEvent originalEvent15nr = NONE;
+					float originalDirectPdf15nr = 0.f;
+					float originalReversePdf15nr = 0.f;
+					const Spectrum originalEvaluate15nr =
+						child15nr.material->Evaluate(child15nr.hitPoint,
+							originalLight15nr, originalEye15nr,
+							&originalEvent15nr, &originalDirectPdf15nr,
+							&originalReversePdf15nr);
+					const float originalPdf15nr = hitPoint.fromLight ?
+						originalReversePdf15nr : originalDirectPdf15nr;
+					diagnostic15no->originalEvent15nr = originalEvent15nr;
+					diagnostic15no->originalEvaluatePdf15nr = originalPdf15nr;
+					diagnostic15no->originalEvaluateFinite15nr =
+						!originalEvaluate15nr.IsNaN() &&
+						!originalEvaluate15nr.IsInf() &&
+						std::isfinite(originalPdf15nr);
+
+					const Vector roundTripFixed15nr = hitPoint.fromLight ?
+						child15nr.localLightDir : child15nr.localEyeDir;
+					const Vector roundTripSampled15nr = hitPoint.fromLight ?
+						child15nr.localEyeDir : child15nr.localLightDir;
+					diagnostic15no->fixedDirectionMaxError15nr =
+						slg::mlhero15nr::VectorMaxAbsDifference(
+							capture15nr.originalFixedDir, roundTripFixed15nr);
+					diagnostic15no->sampledDirectionMaxError15nr =
+						slg::mlhero15nr::VectorMaxAbsDifference(
+							capture15nr.originalSampledDir, roundTripSampled15nr);
+					diagnostic15no->sampledDirectionDot15nr =
+						double(Dot(capture15nr.originalSampledDir,
+							roundTripSampled15nr));
+
+					double sampleNumerator15nr[3];
+					double originalEvaluateArray15nr[3];
+					double roundTripEvaluate15nr[3];
+					for (u_int channel = 0u; channel < 3u; ++channel) {
+						sampleNumerator15nr[channel] =
+							capture15nr.childSampleNumerator.c[channel];
+						originalEvaluateArray15nr[channel] =
+							originalEvaluate15nr.c[channel];
+						roundTripEvaluate15nr[channel] =
+							child15nr.nativeValue.c[channel];
+						diagnostic15no->originalFixedDir15nr[channel] =
+							capture15nr.originalFixedDir[channel];
+						diagnostic15no->originalSampledDir15nr[channel] =
+							capture15nr.originalSampledDir[channel];
+						diagnostic15no->roundTripFixedDir15nr[channel] =
+							roundTripFixed15nr[channel];
+						diagnostic15no->roundTripSampledDir15nr[channel] =
+							roundTripSampled15nr[channel];
+						diagnostic15no->childSampleNumerator15nr[channel] =
+							capture15nr.childSampleNumerator.c[channel];
+						diagnostic15no->originalEvaluate15nr[channel] =
+							originalEvaluate15nr.c[channel];
+						diagnostic15no->roundTripEvaluate15nr[channel] =
+							child15nr.nativeValue.c[channel];
+					}
+					const slg::mlhero15nm::Closure sampleOriginal15nr =
+						slg::mlhero15nm::AnalyzeClosure(sampleNumerator15nr,
+							originalEvaluateArray15nr);
+					const slg::mlhero15nm::Closure originalRoundTrip15nr =
+						slg::mlhero15nm::AnalyzeClosure(originalEvaluateArray15nr,
+							roundTripEvaluate15nr);
+					const slg::mlhero15nm::Closure sampleRoundTrip15nr =
+						slg::mlhero15nm::AnalyzeClosure(sampleNumerator15nr,
+							roundTripEvaluate15nr);
+					diagnostic15no->sampleVsOriginalPass15nr =
+						sampleOriginal15nr.finite && sampleOriginal15nr.accepted;
+					diagnostic15no->originalVsRoundTripPass15nr =
+						originalRoundTrip15nr.finite &&
+						originalRoundTrip15nr.accepted;
+					diagnostic15no->sampleVsRoundTripPass15nr =
+						sampleRoundTrip15nr.finite &&
+						sampleRoundTrip15nr.accepted;
+					diagnostic15no->sampleVsOriginalRelativeError15nr =
+						sampleOriginal15nr.relativeError;
+					diagnostic15no->originalVsRoundTripRelativeError15nr =
+						originalRoundTrip15nr.relativeError;
+					diagnostic15no->sampleVsRoundTripRelativeError15nr =
+						sampleRoundTrip15nr.relativeError;
+					const double pdfScale15nr = Max(1e-12,
+						Max(fabs(double(capture15nr.childPdfW)),
+							fabs(double(originalPdf15nr))));
+					diagnostic15no->sampleVsOriginalPdfRelativeError15nr =
+						fabs(double(capture15nr.childPdfW) -
+							double(originalPdf15nr)) / pdfScale15nr;
+
+					if (child15nr.route == MLHERO_MIX_CHILD_GLOSSY215NM) {
+						const float wCoating15nr = SchlickBSDF_CoatingWeight(
+							child15nr.glossy2.ks,
+							capture15nr.originalFixedDir);
+						diagnostic15no->glossyWBase15nr = 1.f - wCoating15nr;
+						diagnostic15no->glossyBranch15nr =
+							capture15nr.childPassThroughEvent <
+								diagnostic15no->glossyWBase15nr ? 0u : 1u;
+						diagnostic15no->glossyRoughness15nr =
+							child15nr.glossy2.roughness;
+						diagnostic15no->glossyAnisotropy15nr =
+							child15nr.glossy2.anisotropy;
+					}
+				}
+			}
+		}
+	}
+	// The absolute term protects black/near-black endpoints; the relative term
+	// admits only ordinary floating-point differences between Sample/Evaluate.
+	if (!closure15nm.finite || !closure15nm.accepted) {
+		if (diagnostic15no)
+			diagnostic15no->prepareFailure =
+				MLHERO_MIX_PREPARE_CLOSURE_REJECT15NO;
+		return false;
+	}
+
+	prepared->valid = true;
+	return true;
+}
+
+bool BSDF::EvaluateMLHeroMixPrepared15nm(
+		const MLHeroMixSpectralEndpoint15nm &prepared,
+		const float waveLength, const bool glossy2BasisCompensation,
+		const bool velvetBasisCompensation,
+		Spectrum *value, MLHeroMixDiagnostic15no *diagnostic15no) const {
+	if (diagnostic15no) {
+		diagnostic15no->evaluationFailure =
+			MLHERO_MIX_EVALUATE_OK15NO;
+		diagnostic15no->evaluationChildIndex = ~0u;
+	}
+	if (!value || !material || material->GetType() != MIX ||
+			!prepared.valid || !std::isfinite(waveLength)) {
+		if (diagnostic15no)
+			diagnostic15no->evaluationFailure =
+				MLHERO_MIX_EVALUATE_INVALID_INPUT15NO;
+		return false;
+	}
+
+	double spectralValue = 0.0;
+	for (u_int i = 0u; i < 2u; ++i) {
+		const MLHeroMixChildSpectral15nm &child = prepared.child[i];
+		if (child.route == MLHERO_MIX_CHILD_INACTIVE15NM)
+			continue;
+		if (diagnostic15no)
+			diagnostic15no->evaluationChildIndex = i;
+
+		float childValue = 0.f;
+		switch (child.route) {
+			case MLHERO_MIX_CHILD_SCALAR15NM:
+				childValue = (child.nativeValue.c[0] + child.nativeValue.c[1] +
+					child.nativeValue.c[2]) / 3.f;
+				break;
+			case MLHERO_MIX_CHILD_METAL215NM: {
+				Spectrum metalValue;
+				if (!child.material || child.material->GetType() != METAL2) {
+					if (diagnostic15no)
+						diagnostic15no->evaluationFailure =
+							MLHERO_MIX_EVALUATE_MATERIAL_MISMATCH15NO;
+					return false;
+				}
+				const Metal2Material &metal2 =
+					static_cast<const Metal2Material &>(*child.material);
+				if (!metal2.EvaluateAtWaveLength(child.hitPoint,
+						child.localLightDir, child.localEyeDir,
+						waveLength, &metalValue)) {
+					if (diagnostic15no)
+						diagnostic15no->evaluationFailure =
+							MLHERO_MIX_EVALUATE_METAL2_REJECT15NO;
+					return false;
+				}
+				const float metalScale = Max(1.f, Max(fabsf(metalValue.c[0]),
+					Max(fabsf(metalValue.c[1]), fabsf(metalValue.c[2]))));
+				if (fabsf(metalValue.c[0] - metalValue.c[1]) >
+						1e-6f * metalScale ||
+						fabsf(metalValue.c[0] - metalValue.c[2]) >
+						1e-6f * metalScale) {
+					if (diagnostic15no)
+						diagnostic15no->evaluationFailure =
+							MLHERO_MIX_EVALUATE_METAL2_NONSCALAR15NO;
+					return false;
+				}
+				childValue = (metalValue.c[0] + metalValue.c[1] +
+					metalValue.c[2]) / 3.f;
+				break;
+			}
+			case MLHERO_MIX_CHILD_GLOSSY215NM:
+				if (!Glossy2Material::EvaluateMLHeroSpectralEndpoint15nk(
+						child.glossy2, waveLength,
+						glossy2BasisCompensation, &childValue)) {
+					if (diagnostic15no)
+						diagnostic15no->evaluationFailure =
+							MLHERO_MIX_EVALUATE_GLOSSY2_REJECT15NO;
+					return false;
+				}
+				break;
+			case MLHERO_MIX_CHILD_VELVET15NN:
+				if (!VelvetMaterial::EvaluateMLHeroSpectralEndpoint15nn(
+						child.velvet, waveLength,
+						velvetBasisCompensation, &childValue)) {
+					if (diagnostic15no)
+						diagnostic15no->evaluationFailure =
+							MLHERO_MIX_EVALUATE_VELVET_REJECT15NO;
+					return false;
+				}
+				break;
+			default:
+				if (diagnostic15no)
+					diagnostic15no->evaluationFailure =
+						MLHERO_MIX_EVALUATE_UNSUPPORTED_ROUTE15NO;
+				return false;
+		}
+		if (!std::isfinite(childValue) || childValue < 0.f) {
+			if (diagnostic15no)
+				diagnostic15no->evaluationFailure =
+					MLHERO_MIX_EVALUATE_CHILD_VALUE15NO;
+			return false;
+		}
+		spectralValue += double(child.weight) * double(childValue);
+	}
+
+	spectralValue *= double(prepared.wrapperFactor) /
+		double(prepared.nativePdfW);
+	if (!std::isfinite(spectralValue) || spectralValue < 0.0 ||
+			spectralValue > double(std::numeric_limits<float>::max())) {
+		if (diagnostic15no)
+			diagnostic15no->evaluationFailure =
+				MLHERO_MIX_EVALUATE_RESULT15NO;
+		return false;
+	}
+	*value = Spectrum(float(spectralValue));
+	return true;
+}
+// 15nm END
+
 Spectrum BSDF::ShadowCatcherSample(Vector *sampledDir,
 		float *pdfW, float *absCosSampledDir, BSDFEvent *event) const {
 	// Just continue to trace the ray
@@ -819,8 +1544,18 @@ bool BSDF::EvaluateMLHeroGlassDebugAtWaveLength(const Vector &sampledDir,
 		return false;
 
 	const GlassMaterial &glass = static_cast<const GlassMaterial &>(*material);
-	const Vector localFixedDir = frame.ToLocal(hitPoint.fixedDir);
-	const Vector localSampledDir = frame.ToLocal(sampledDir);
+	// 15mv-PDF: Glass::Sample() uses the precise double frame and normalized
+	// local directions above. Reconstruct the audit/production helper inputs
+	// through that identical path; the legacy float Frame::ToLocal() can move
+	// the Fresnel event mass beyond the strict 2e-5 PDF tolerance at rare deep,
+	// grazing-angle vertices.
+	const slg::mlhero15kl::Frame precise15mv(frame);
+	const auto fixed15mv = precise15mv.ToLocal(hitPoint.fixedDir);
+	const auto sampled15mv = precise15mv.ToLocal(sampledDir);
+	const Vector localFixedDir = slg::mlhero15kp::Normalize(Vector(
+		fixed15mv.x, fixed15mv.y, fixed15mv.z));
+	const Vector localSampledDir = slg::mlhero15kp::Normalize(Vector(
+		sampled15mv.x, sampled15mv.y, sampled15mv.z));
 	return glass.EvaluateMLHeroDebugAtWaveLength(hitPoint,
 			localFixedDir, localSampledDir, sampledEvent, samplePdfW, waveLength,
 			exteriorIOR, interiorIORBase, interiorIORLambda,
@@ -890,18 +1625,84 @@ bool BSDF::EvaluateMLHeroRoughGlassMicrofacetOwnershipDebug(
 		float *heroMicrofacetPdf, float *laneSharedMicrofacetPdf,
 		float *naturalJacobian, float *sharedJacobian,
 		float *naturalDirPdf, float *sharedDirPdf,
-		float *naturalDirDelta, float *sharedWhDelta, bool *naturalTir) const {
+		float *naturalDirDelta, float *sharedWhDelta, bool *naturalTir,
+		Vector *naturalChildDir, BSDFEvent *naturalChildEvent,
+		Spectrum *naturalChildValue, float *naturalChildDirectPdf,
+		float *naturalChildReversePdf, bool *naturalChildPairValid,
+		bool *naturalChildPairTransmit, float *naturalChildAbsLightZ,
+		float *naturalChildAbsEyeZ,
+		bool *naturalChildHemisphereZero,
+		Spectrum *naturalChildWrappedValue) const {
 	if (!material || (material->GetType() != ROUGHGLASS))
 		return false;
 
 	const RoughGlassMaterial &roughGlass = static_cast<const RoughGlassMaterial &>(*material);
     if(mlHeroEnabled) {
         const slg::mlhero15kl::Frame precise(frame);
-        return roughGlass.EvaluateMLHeroMicrofacetOwnershipPrecise15kl(hitPoint,
+        slg::mlhero15kk::V localNaturalChild15nz;
+		Spectrum localNaturalChildValue15ob = Spectrum();
+		BSDFEvent localNaturalChildEvent15ob = NONE;
+        const bool ok15nz = roughGlass.EvaluateMLHeroMicrofacetOwnershipPrecise15kl(hitPoint,
             precise.ToLocal(hitPoint.fixedDir),precise.ToLocal(sampledDir),sampledEvent,
             heroWaveLength,laneWaveLength,heroEta,laneEta,heroMicrofacetPdf,laneSharedMicrofacetPdf,
-            naturalJacobian,sharedJacobian,naturalDirPdf,sharedDirPdf,naturalDirDelta,sharedWhDelta,naturalTir);
+            naturalJacobian,sharedJacobian,naturalDirPdf,sharedDirPdf,naturalDirDelta,sharedWhDelta,naturalTir,
+			(naturalChildDir || naturalChildWrappedValue) ?
+				&localNaturalChild15nz : nullptr,
+			(naturalChildEvent || naturalChildWrappedValue) ?
+				&localNaturalChildEvent15ob : nullptr,
+			(naturalChildValue || naturalChildWrappedValue) ?
+				&localNaturalChildValue15ob : nullptr,
+			naturalChildDirectPdf,naturalChildReversePdf,
+			naturalChildPairValid,naturalChildPairTransmit,
+			naturalChildAbsLightZ,naturalChildAbsEyeZ,
+			naturalChildHemisphereZero);
+		if (naturalChildValue)
+			*naturalChildValue = localNaturalChildValue15ob;
+		if (naturalChildEvent)
+			*naturalChildEvent = localNaturalChildEvent15ob;
+        if (ok15nz && naturalChildDir) {
+            const slg::mlhero15kk::V world15nz = precise.ToWorld(localNaturalChild15nz);
+            *naturalChildDir = Vector(world15nz.x, world15nz.y, world15nz.z);
+        }
+		if (naturalChildWrappedValue) {
+			*naturalChildWrappedValue = localNaturalChildValue15ob;
+			if (ok15nz && !naturalChildWrappedValue->Black()) {
+				const slg::mlhero15kk::V world15ob = precise.ToWorld(localNaturalChild15nz);
+				const Vector generated15ob(world15ob.x, world15ob.y, world15ob.z);
+				if ((localNaturalChildEvent15ob & REFLECT) &&
+						(localNaturalChildEvent15ob & (DIFFUSE | GLOSSY)) &&
+						(hitPoint.shadeN != hitPoint.interpolatedN)) {
+					const Vector &lightDir15ob = hitPoint.fromLight ?
+						hitPoint.fixedDir : generated15ob;
+					*naturalChildWrappedValue *= ShadowTerminatorAvoidanceFactor(
+						hitPoint.GetLandingInterpolatedN(),
+						hitPoint.GetLandingShadeN(), lightDir15ob);
+				}
+				if (hitPoint.fromLight) {
+					const float fixedNG15ob = AbsDot(hitPoint.fixedDir,
+						hitPoint.geometryN);
+					const float generatedNG15ob = AbsDot(generated15ob,
+						hitPoint.geometryN);
+					if (fixedNG15ob > 0.f)
+						*naturalChildWrappedValue *= generatedNG15ob / fixedNG15ob;
+					else
+						*naturalChildWrappedValue = Spectrum();
+				}
+			}
+		}
+        return ok15nz;
     }
+	if (naturalChildDir) *naturalChildDir = Vector();
+	if (naturalChildEvent) *naturalChildEvent = NONE;
+	if (naturalChildValue) *naturalChildValue = Spectrum();
+	if (naturalChildDirectPdf) *naturalChildDirectPdf = 0.f;
+	if (naturalChildReversePdf) *naturalChildReversePdf = 0.f;
+	if (naturalChildPairValid) *naturalChildPairValid = false;
+	if (naturalChildPairTransmit) *naturalChildPairTransmit = false;
+	if (naturalChildAbsLightZ) *naturalChildAbsLightZ = 0.f;
+	if (naturalChildAbsEyeZ) *naturalChildAbsEyeZ = 0.f;
+	if (naturalChildHemisphereZero) *naturalChildHemisphereZero = false;
+	if (naturalChildWrappedValue) *naturalChildWrappedValue = Spectrum();
 	const Vector localFixedDir = frame.ToLocal(hitPoint.fixedDir);
 	const Vector localSharedDir = frame.ToLocal(sampledDir);
 	return roughGlass.EvaluateMLHeroMicrofacetOwnershipDebug(hitPoint,
@@ -970,6 +1771,140 @@ bool BSDF::EvaluateMLHeroGlossy2DebugSampleComponents(
 	*wrapperFactor = correction;
 
 	return true;
+}
+
+bool BSDF::EvaluateMLHeroGlossy2Components15nd(
+		const Vector &generatedDir, const BSDFEvent expectedEvent,
+		Spectrum *kdValue, Spectrum *baseContribution,
+		Spectrum *coatingContribution, Spectrum *combinedResult) const {
+	if (!kdValue || !baseContribution || !coatingContribution ||
+			!combinedResult || !material || material->GetType() != GLOSSY2)
+		return false;
+
+	const Vector &eyeDir = hitPoint.fromLight ? generatedDir : hitPoint.fixedDir;
+	const Vector &lightDir = hitPoint.fromLight ? hitPoint.fixedDir : generatedDir;
+	const float absDotLightDirNG = AbsDot(lightDir, hitPoint.geometryN);
+	const float absDotEyeDirNG = AbsDot(eyeDir, hitPoint.geometryN);
+	if (absDotLightDirNG < DEFAULT_COS_EPSILON_STATIC ||
+			absDotEyeDirNG < DEFAULT_COS_EPSILON_STATIC ||
+			Dot(eyeDir, hitPoint.geometryN) *
+				Dot(lightDir, hitPoint.geometryN) <= 0.f ||
+			Dot(eyeDir, hitPoint.interpolatedN) *
+				Dot(lightDir, hitPoint.interpolatedN) <= 0.f)
+		return false;
+
+	const Vector localLightDir = frame.ToLocal(lightDir);
+	const Vector localEyeDir = frame.ToLocal(eyeDir);
+	const Glossy2Material &glossy2 =
+		static_cast<const Glossy2Material &>(*material);
+	BSDFEvent event15nd;
+	Spectrum kd, base, coating, combined;
+	if (!glossy2.EvaluateMLHeroEvaluateComponents15nd(hitPoint,
+			localLightDir, localEyeDir, &event15nd, &kd, &base,
+			&coating, &combined) || event15nd != expectedEvent)
+		return false;
+
+	if ((event15nd & REFLECT) && (event15nd & (DIFFUSE | GLOSSY)) &&
+			(hitPoint.shadeN != hitPoint.interpolatedN)) {
+		const float shadowFactor = ShadowTerminatorAvoidanceFactor(
+			hitPoint.GetLandingInterpolatedN(), hitPoint.GetLandingShadeN(),
+			lightDir);
+		base *= shadowFactor;
+		coating *= shadowFactor;
+		combined *= shadowFactor;
+	}
+	if (hitPoint.fromLight) {
+		const float adjointFactor = absDotEyeDirNG / absDotLightDirNG;
+		base *= adjointFactor;
+		coating *= adjointFactor;
+		combined *= adjointFactor;
+	}
+
+	if (kd.IsNaN() || kd.IsInf() || base.IsNaN() || base.IsInf() ||
+			coating.IsNaN() || coating.IsInf() || combined.IsNaN() ||
+			combined.IsInf())
+		return false;
+	*kdValue = kd;
+	*baseContribution = base;
+	*coatingContribution = coating;
+	*combinedResult = combined;
+	return true;
+}
+
+bool BSDF::EvaluateMLHeroGlossy2AtWaveLength15nj(
+		const Vector &generatedDir, const BSDFEvent expectedEvent,
+		const float waveLength, const bool basisCompensation,
+		Spectrum *value) const {
+	MLHeroGlossy2SpectralEndpoint15nk prepared;
+	return PrepareMLHeroGlossy2SpectralEndpoint15nk(generatedDir,
+			expectedEvent, &prepared) &&
+		EvaluateMLHeroGlossy2Prepared15nk(prepared, waveLength,
+			basisCompensation, value);
+}
+
+bool BSDF::PrepareMLHeroGlossy2SpectralEndpoint15nk(
+		const Vector &generatedDir, const BSDFEvent expectedEvent,
+		MLHeroGlossy2SpectralEndpoint15nk *prepared) const {
+	if (!prepared || !material || material->GetType() != GLOSSY2)
+		return false;
+
+	const Vector &eyeDir = hitPoint.fromLight ? generatedDir : hitPoint.fixedDir;
+	const Vector &lightDir = hitPoint.fromLight ? hitPoint.fixedDir : generatedDir;
+	const float absDotLightDirNG = AbsDot(lightDir, hitPoint.geometryN);
+	const float absDotEyeDirNG = AbsDot(eyeDir, hitPoint.geometryN);
+	const float sideTestIS = Dot(eyeDir, hitPoint.interpolatedN) *
+		Dot(lightDir, hitPoint.interpolatedN);
+	if (absDotLightDirNG < DEFAULT_COS_EPSILON_STATIC ||
+			absDotEyeDirNG < DEFAULT_COS_EPSILON_STATIC ||
+			Dot(eyeDir, hitPoint.geometryN) * Dot(lightDir, hitPoint.geometryN) <= 0.f ||
+			// Match BSDF::Evaluate(): the exactly tangent interpolated-normal
+			// boundary (including signed zero) is not an opposite-side event.
+			// Glossy2 can still evaluate its valid back-face diffuse base there.
+			sideTestIS < 0.f)
+		return false;
+
+	const Vector localLightDir = frame.ToLocal(lightDir);
+	const Vector localEyeDir = frame.ToLocal(eyeDir);
+	const Glossy2Material &glossy2 =
+		static_cast<const Glossy2Material &>(*material);
+	if (!glossy2.PrepareMLHeroSpectralEndpoint15nk(hitPoint,
+			localLightDir, localEyeDir, prepared) ||
+			prepared->event != expectedEvent)
+		return false;
+
+	if ((prepared->event & REFLECT) &&
+			(prepared->event & (DIFFUSE | GLOSSY)) &&
+			(hitPoint.shadeN != hitPoint.interpolatedN))
+		prepared->wrapperFactor *= ShadowTerminatorAvoidanceFactor(
+			hitPoint.GetLandingInterpolatedN(), hitPoint.GetLandingShadeN(),
+			lightDir);
+	if (hitPoint.fromLight)
+		prepared->wrapperFactor *= absDotEyeDirNG / absDotLightDirNG;
+	return std::isfinite(prepared->wrapperFactor) &&
+		prepared->wrapperFactor >= 0.f;
+}
+
+bool BSDF::EvaluateMLHeroGlossy2Prepared15nk(
+		const MLHeroGlossy2SpectralEndpoint15nk &prepared,
+		const float waveLength, const bool basisCompensation,
+		Spectrum *value) const {
+	if (!value || !material || material->GetType() != GLOSSY2)
+		return false;
+	float spectralValue;
+	if (!Glossy2Material::EvaluateMLHeroSpectralEndpoint15nk(prepared,
+			waveLength, basisCompensation, &spectralValue))
+		return false;
+	*value = Spectrum(spectralValue);
+	return true;
+}
+
+bool BSDF::EvaluateMLHeroGlossy2NativeComponentsPrepared15nk(
+		const MLHeroGlossy2SpectralEndpoint15nk &prepared,
+		Spectrum *baseContribution, Spectrum *coatingContribution,
+		Spectrum *combinedResult) const {
+	return material && material->GetType() == GLOSSY2 &&
+		Glossy2Material::EvaluateMLHeroNativeComponentsPrepared15nk(prepared,
+			baseContribution, coatingContribution, combinedResult);
 }
 
 void BSDF::Pdf(const Vector &sampledDir, float *directPdfW, float *reversePdfW) const {

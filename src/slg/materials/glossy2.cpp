@@ -19,6 +19,7 @@
 #include "slg/textures/fresnel/fresneltexture.h"
 #include "slg/materials/glossy2.h"
 #include "slg/engines/mlhero_glossy2_pdf_precision15lg.h"
+#include "slg/engines/mlhero_glossy2_spectral15nj.h"
 
 using namespace std;
 using namespace luxrays;
@@ -203,7 +204,8 @@ Spectrum Glossy2Material::Sample(const HitPoint &hitPoint,
 	const float wBase = 1.f - wCoating;
 	const bool sampledBase15lg = passThroughEvent < wBase;
 	slg::mlhero15lg::Attempt audit15lg(hitPoint.fromLight, GetID(), sampledBase15lg,
-		doublesided, roughness, anisotropy, u0, u1, passThroughEvent, wBase, ks.Filter(),
+		doublesided, roughness, anisotropy, u0, u1, passThroughEvent, wBase,
+		ks.c[0], ks.c[1], ks.c[2],
 		slg::mlhero15kk::V(localFixedDir));
 
 	float basePdf, coatingPdf;
@@ -343,6 +345,229 @@ bool Glossy2Material::EvaluateMLHeroDebugSampleComponents(const HitPoint &hitPoi
 	*combinedResult = coating + base;
 
 	return true;
+}
+
+bool Glossy2Material::EvaluateMLHeroEvaluateComponents15nd(
+		const HitPoint &hitPoint, const Vector &localLightDir,
+		const Vector &localEyeDir, BSDFEvent *event, Spectrum *kdValue,
+		Spectrum *baseContribution, Spectrum *coatingContribution,
+		Spectrum *combinedResult) const {
+	if (!event || !kdValue || !baseContribution || !coatingContribution ||
+			!combinedResult)
+		return false;
+
+	const Vector &localFixedDir = hitPoint.fromLight ? localLightDir : localEyeDir;
+	const Vector &localSampledDir = hitPoint.fromLight ? localEyeDir : localLightDir;
+	const Spectrum kd = Kd->GetSpectrumValue(hitPoint).Clamp(0.f, 1.f);
+	const Spectrum baseF = kd * INV_PI * fabsf(localLightDir.z);
+
+	if ((!doublesided) && (localEyeDir.z <= 0.f)) {
+		*event = DIFFUSE | REFLECT;
+		*kdValue = kd;
+		*baseContribution = baseF;
+		*coatingContribution = Spectrum(0.f);
+		*combinedResult = baseF;
+		return true;
+	}
+
+	*event = GLOSSY | REFLECT;
+	if ((!doublesided) && (localFixedDir.z < 0.f)) {
+		*kdValue = kd;
+		*baseContribution = baseF;
+		*coatingContribution = Spectrum(0.f);
+		*combinedResult = baseF;
+		return true;
+	}
+
+	Spectrum ks = Ks->GetSpectrumValue(hitPoint);
+	const float i = index->GetFloatValue(hitPoint);
+	if (i > 0.f) {
+		const float ti = (i - 1.f) / (i + 1.f);
+		ks *= ti * ti;
+	}
+	ks = ks.Clamp(0.f, 1.f);
+
+	const float u = Clamp(nu->GetFloatValue(hitPoint), 1e-9f, 1.f);
+	const float v = Clamp(nv->GetFloatValue(hitPoint), 1e-9f, 1.f);
+	const float u2 = u * u;
+	const float v2 = v * v;
+	const float anisotropy = (u2 < v2) ? (1.f - u2 / v2) :
+		u2 > 0.f ? (v2 / u2 - 1.f) : 0.f;
+	const float roughness = u * v;
+
+	const float cosi = fabsf(localSampledDir.z);
+	const float coso = fabsf(localFixedDir.z);
+	const Spectrum alpha = Ka->GetSpectrumValue(hitPoint).Clamp(0.f, 1.f);
+	const float d = depth->GetFloatValue(hitPoint);
+	const Spectrum absorption = CoatingAbsorption(cosi, coso, alpha, d);
+	const Vector H(Normalize(localFixedDir + localSampledDir));
+	const Spectrum S = FresnelTexture::SchlickEvaluate(
+		ks, AbsDot(localSampledDir, H));
+	const Spectrum coatingF = SchlickBSDF_CoatingF(hitPoint.fromLight,
+		ks, roughness, anisotropy, multibounce, localFixedDir,
+		localSampledDir);
+	const Spectrum base = absorption * (Spectrum(1.f) - S) * baseF;
+
+	*kdValue = kd;
+	*baseContribution = base;
+	*coatingContribution = coatingF;
+	*combinedResult = coatingF + base;
+	return true;
+}
+
+bool Glossy2Material::EvaluateMLHeroAtWaveLength15nj(
+		const HitPoint &hitPoint, const Vector &localLightDir,
+		const Vector &localEyeDir, const float waveLength,
+		const bool basisCompensation, BSDFEvent *event, float *value) const {
+	if (!event || !value)
+		return false;
+	MLHeroGlossy2SpectralEndpoint15nk prepared;
+	if (!PrepareMLHeroSpectralEndpoint15nk(hitPoint, localLightDir,
+			localEyeDir, &prepared) ||
+			!EvaluateMLHeroSpectralEndpoint15nk(prepared, waveLength,
+				basisCompensation, value))
+		return false;
+	*event = prepared.event;
+	return true;
+}
+
+bool Glossy2Material::PrepareMLHeroSpectralEndpoint15nk(
+		const HitPoint &hitPoint, const Vector &localLightDir,
+		const Vector &localEyeDir,
+		MLHeroGlossy2SpectralEndpoint15nk *prepared) const {
+	if (!prepared)
+		return false;
+
+	const Vector &localFixedDir = hitPoint.fromLight ? localLightDir : localEyeDir;
+	const Vector &localSampledDir = hitPoint.fromLight ? localEyeDir : localLightDir;
+	prepared->kd = Kd->GetSpectrumValue(hitPoint).Clamp(0.f, 1.f);
+	prepared->baseGeometry = INV_PI * fabsf(localLightDir.z);
+	prepared->fromLight = hitPoint.fromLight;
+	prepared->multibounce = multibounce;
+	prepared->localFixedDir = localFixedDir;
+	prepared->localSampledDir = localSampledDir;
+	prepared->wrapperFactor = 1.f;
+
+	if ((!doublesided) && (localEyeDir.z <= 0.f)) {
+		prepared->event = DIFFUSE | REFLECT;
+		prepared->baseOnly = true;
+		return true;
+	}
+
+	prepared->event = GLOSSY | REFLECT;
+	if ((!doublesided) && (localFixedDir.z < 0.f)) {
+		prepared->baseOnly = true;
+		return true;
+	}
+
+	prepared->ks = Ks->GetSpectrumValue(hitPoint);
+	const float i = index->GetFloatValue(hitPoint);
+	if (i > 0.f) {
+		const float ti = (i - 1.f) / (i + 1.f);
+		prepared->ks *= ti * ti;
+	}
+	prepared->ks = prepared->ks.Clamp(0.f, 1.f);
+	prepared->ka = Ka->GetSpectrumValue(hitPoint).Clamp(0.f, 1.f);
+
+	const float u = Clamp(nu->GetFloatValue(hitPoint), 1e-9f, 1.f);
+	const float v = Clamp(nv->GetFloatValue(hitPoint), 1e-9f, 1.f);
+	const float u2 = u * u;
+	const float v2 = v * v;
+	prepared->anisotropy = (u2 < v2) ? (1.f - u2 / v2) :
+		u2 > 0.f ? (v2 / u2 - 1.f) : 0.f;
+	prepared->roughness = u * v;
+
+	prepared->cosi = fabsf(localSampledDir.z);
+	prepared->coso = fabsf(localFixedDir.z);
+	prepared->depth = depth->GetFloatValue(hitPoint);
+	prepared->baseOnly = false;
+	return prepared->kd.IsValid() && prepared->ks.IsValid() &&
+		prepared->ka.IsValid() && std::isfinite(prepared->baseGeometry) &&
+		std::isfinite(prepared->roughness) &&
+		std::isfinite(prepared->anisotropy) &&
+		std::isfinite(prepared->depth) && prepared->cosi > 0.f &&
+		prepared->coso > 0.f;
+}
+
+bool Glossy2Material::EvaluateMLHeroSpectralEndpoint15nk(
+		const MLHeroGlossy2SpectralEndpoint15nk &prepared,
+		const float waveLength, const bool basisCompensation,
+		float *value) {
+	if (!value || !std::isfinite(waveLength) ||
+			!std::isfinite(prepared.wrapperFactor) ||
+			prepared.wrapperFactor < 0.f)
+		return false;
+	const float kd = mlhero15nj::Reflectance(prepared.kd,
+		waveLength, basisCompensation);
+	const float baseF = kd * prepared.baseGeometry;
+	if (prepared.baseOnly) {
+		*value = prepared.wrapperFactor * baseF;
+		return std::isfinite(*value) && *value >= 0.f;
+	}
+
+	const float ks = mlhero15nj::Reflectance(prepared.ks,
+		waveLength, basisCompensation);
+	const float alpha = mlhero15nj::Reflectance(prepared.ka,
+		waveLength, basisCompensation);
+	const Spectrum absorption = CoatingAbsorption(prepared.cosi,
+		prepared.coso, Spectrum(alpha), prepared.depth);
+	const Vector hInput = prepared.localFixedDir + prepared.localSampledDir;
+	if (!(hInput.LengthSquared() > 0.f))
+		return false;
+	const Vector h = Normalize(hInput);
+	if (!std::isfinite(h.x) || !std::isfinite(h.y) || !std::isfinite(h.z))
+		return false;
+	const Spectrum schlick = FresnelTexture::SchlickEvaluate(
+		Spectrum(ks), AbsDot(prepared.localSampledDir, h));
+	const Spectrum coating = SchlickBSDF_CoatingF(prepared.fromLight,
+		Spectrum(ks), prepared.roughness, prepared.anisotropy,
+		prepared.multibounce, prepared.localFixedDir,
+		prepared.localSampledDir);
+	const Spectrum spectralValue = prepared.wrapperFactor *
+		(coating + absorption * (Spectrum(1.f) - schlick) * baseF);
+	if (spectralValue.IsNaN() || spectralValue.IsInf() ||
+		!std::isfinite(spectralValue.c[0]) || spectralValue.c[0] < 0.f)
+		return false;
+	*value = spectralValue.c[0];
+	return true;
+}
+
+bool Glossy2Material::EvaluateMLHeroNativeComponentsPrepared15nk(
+		const MLHeroGlossy2SpectralEndpoint15nk &prepared,
+		Spectrum *baseContribution, Spectrum *coatingContribution,
+		Spectrum *combinedResult) {
+	if (!baseContribution || !coatingContribution || !combinedResult ||
+			!std::isfinite(prepared.wrapperFactor) ||
+			prepared.wrapperFactor < 0.f)
+		return false;
+	const Spectrum baseF = prepared.kd * prepared.baseGeometry;
+	if (prepared.baseOnly) {
+		*baseContribution = baseF * prepared.wrapperFactor;
+		*coatingContribution = Spectrum(0.f);
+		*combinedResult = *baseContribution;
+		return combinedResult->IsValid();
+	}
+
+	const Vector hInput = prepared.localFixedDir + prepared.localSampledDir;
+	if (!(hInput.LengthSquared() > 0.f))
+		return false;
+	const Vector h = Normalize(hInput);
+	if (!std::isfinite(h.x) || !std::isfinite(h.y) || !std::isfinite(h.z))
+		return false;
+	const Spectrum absorption = CoatingAbsorption(prepared.cosi,
+		prepared.coso, prepared.ka, prepared.depth);
+	const Spectrum schlick = FresnelTexture::SchlickEvaluate(prepared.ks,
+		AbsDot(prepared.localSampledDir, h));
+	const Spectrum coating = SchlickBSDF_CoatingF(prepared.fromLight,
+		prepared.ks, prepared.roughness, prepared.anisotropy,
+		prepared.multibounce, prepared.localFixedDir,
+		prepared.localSampledDir);
+	*baseContribution = prepared.wrapperFactor * absorption *
+		(Spectrum(1.f) - schlick) * baseF;
+	*coatingContribution = prepared.wrapperFactor * coating;
+	*combinedResult = *baseContribution + *coatingContribution;
+	return baseContribution->IsValid() && coatingContribution->IsValid() &&
+		combinedResult->IsValid();
 }
 
 void Glossy2Material::Pdf(const HitPoint &hitPoint,

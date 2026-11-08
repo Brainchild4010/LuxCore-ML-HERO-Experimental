@@ -24,6 +24,7 @@
 #include "luxrays/utils/atomic.h"
 #include "slg/samplers/sampler.h"
 #include "slg/samplers/metropolis.h"
+#include "slg/engines/mlhero_mlt_sampler_audit15my.h"
 #include "luxcore/luxcore.h"
 
 using namespace std;
@@ -81,7 +82,7 @@ MetropolisSampler::MetropolisSampler(
 		maxRejects(maxRej),	largeMutationProbability(pLarge), imageMutationRange(imgRange),
 		addOnlyCuastics(addOnlyCstcs),
 		samples(NULL), sampleStamps(NULL), currentSamples(NULL), currentSampleStamps(NULL),
-		largeMutationCount(0) {
+		largeMutationCount(0), mlHeroCurrentPrimaryInitialized15my(false) {
 }
 
 MetropolisSampler::~MetropolisSampler() {
@@ -182,6 +183,7 @@ void MetropolisSampler::RequestSamples(const SampleType smplType, const u_int si
 	stamp = 1;
 	currentStamp = 1;
 	currentSampleResults.resize(0);
+	mlHeroCurrentPrimaryInitialized15my = false;
 }
 
 float MetropolisSampler::GetSample(const u_int index) {
@@ -345,6 +347,7 @@ void MetropolisSampler::NextSample(const vector<SampleResult> &sampleResults) {
 		copy(samples, samples + requestedSamples, currentSamples);
 		copy(sampleStamps, sampleStamps + requestedSamples, currentSampleStamps);
 		currentSampleResults = sampleResults;
+		mlHeroCurrentPrimaryInitialized15my = true;
 
 		consecRejects = 0;
 	} else {
@@ -444,6 +447,43 @@ MetropolisSampleType MetropolisSampler::GetLastSampleAcceptance(float &weight) c
 	weight = lastSampleWeight;
 	
 	return lastSampleAcceptance;
+}
+
+void MetropolisSampler::GetMLHeroProposedPrimaryState15my(
+		u_longlong *hash, u_int *activeDimensions, u_int *mutationStamp,
+		bool *largeMutation) const {
+	const mlhero15my::PrimaryStateDigest digest = mlhero15my::Digest(samples,
+		sampleStamps, requestedSamples, stamp);
+	if (hash)
+		*hash = static_cast<u_longlong>(digest.hash);
+	if (activeDimensions)
+		*activeDimensions = static_cast<u_int>(digest.activeDimensions);
+	if (mutationStamp)
+		*mutationStamp = stamp;
+	if (largeMutation)
+		*largeMutation = isLargeMutation;
+}
+
+void MetropolisSampler::GetMLHeroCurrentPrimaryState15my(
+		u_longlong *hash, u_int *activeDimensions, u_int *acceptedStamp) const {
+	if (!mlHeroCurrentPrimaryInitialized15my) {
+		if (hash)
+			*hash = 0ull;
+		if (activeDimensions)
+			*activeDimensions = 0u;
+		if (acceptedStamp)
+			*acceptedStamp = currentStamp;
+		return;
+	}
+	const mlhero15my::PrimaryStateDigest digest = mlhero15my::Digest(
+		currentSamples, currentSampleStamps,
+		requestedSamples, currentStamp);
+	if (hash)
+		*hash = static_cast<u_longlong>(digest.hash);
+	if (activeDimensions)
+		*activeDimensions = static_cast<u_int>(digest.activeDimensions);
+	if (acceptedStamp)
+		*acceptedStamp = currentStamp;
 }
 
 PropertiesUPtr MetropolisSampler::ToProperties() const {

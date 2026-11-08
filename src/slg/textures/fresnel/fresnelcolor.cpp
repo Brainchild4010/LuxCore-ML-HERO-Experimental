@@ -16,7 +16,10 @@
  * limitations under the License.                                          *
  ***************************************************************************/
 
+#include <cmath>
+
 #include "slg/textures/fresnel/fresnelcolor.h"
+#include "luxrays/core/color/spds/rgbrefl.h"
 
 using namespace std;
 using namespace luxrays;
@@ -49,6 +52,34 @@ Spectrum FresnelColorTexture::Evaluate(const HitPoint &hitPoint, const float cos
 	const Spectrum k = ApproxK(c);
 
 	return GeneralEvaluate(n, k, cosi);
+}
+
+// ML HERO phase 15nu: FresnelColor stores normal-incidence reflectance as an
+// RGB texture, not measured n/k curves.  Reconstruct that authored Kr at the
+// requested wavelength and then apply the exact same ApproxN/ApproxK model as
+// the native RGB Evaluate() above.  Keeping this separate from GetNKAtWaveLength
+// is intentional: these n/k values are reconstructed, not measured metadata.
+bool FresnelColorTexture::EvaluateAtWaveLength(const HitPoint &hitPoint,
+		const float cosi, const float waveLength, Spectrum *fresnel) const {
+	if (!fresnel || !std::isfinite(waveLength) ||
+			(waveLength < 380.f) || (waveLength > 780.f))
+		return false;
+
+	const Spectrum kr = GetKr().GetSpectrumValue(hitPoint).Clamp(0.f, 1.f);
+	if (kr.IsNaN() || kr.IsInf())
+		return false;
+
+	const RGBReflSPD krSPD(RGBColor(kr.c[0], kr.c[1], kr.c[2]));
+	// LuxCore's stock Smits table ends at 720 nm and treats the exact upper
+	// boundary as outside in some builds.  Hold its last interior value through
+	// HERO's 720..780 nm extension, matching the established HERO RGB path.
+	const float krAtWaveLength = Clamp(
+		krSPD.Sample(Clamp(waveLength, 380.f, 719.999f)), 0.f, .999f);
+	const Spectrum eta(ApproxN(krAtWaveLength));
+	const Spectrum k(ApproxK(krAtWaveLength));
+
+	*fresnel = GeneralEvaluate(eta, k, cosi).Clamp(0.f, 1.f);
+	return !fresnel->IsNaN() && !fresnel->IsInf();
 }
 
 PropertiesUPtr FresnelColorTexture::ToProperties(const ImageMapCache &imgMapCache, const bool useRealFileName) const {

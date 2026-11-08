@@ -57,6 +57,10 @@ typedef struct PathVertexVM {
     // 15fs diagnostic only; never read by transport, MIS or sampling.
     double mlHeroRREtaScale15fs[8] = {1.,1.,1.,1.,1.,1.,1.,1.};
     bool mlHeroRREtaValid15fs = true;
+	// 15pi: independent RoughGlass RR candidate history. Diagnostic-only in
+	// this phase; keeping it separate guarantees ideal-Glass RR is unchanged.
+	double mlHeroRoughRREtaScale15pi[8] = {1.,1.,1.,1.,1.,1.,1.,1.};
+	bool mlHeroRoughRREtaValid15pi = true;
     // 15ge: bounded diagnostic history travels with copied BIDIR vertices.
     // Written only with Current+Heavy; never consulted by transport.
     struct MLHeroBounceTrace15ge {
@@ -83,6 +87,21 @@ typedef struct PathVertexVM {
 	float mlHeroLaneWaveLengthPdf[8];
 	bool mlHeroSecondaryWavelengthsTerminated;
 	u_int mlHeroActiveWavelengthCount;
+	// ML HERO phase 15lw: the surviving wavelength keeps its packet slot.
+	// Existing single-HERO transport owns lane 0; physical split children can
+	// later own another lane without relabeling wavelength/PDF/history arrays.
+	u_int mlHeroActiveLaneIndex;
+	// 15lx: 0=production parent, 1=isolated shadow child. The shadow child
+	// executes the real Bounce code but is never queued, connected or filmed.
+	u_int mlHeroSplitGeneration15lx = 0u;
+	// 15mg: the disconnected companion has exchanged the single-HERO collapse
+	// compensation for its explicit deterministic 1/N packet-estimator share.
+	// This state is copied with the shadow vertex but is never enabled on the
+	// production parent in this diagnostic phase.
+	bool mlHeroDeterministicSplitWeight15mg = false;
+	float mlHeroSplitEstimatorWeight15mg = 1.f;
+	float mlHeroSplitRestoredWavelengthPdf15mg = 0.f;
+	u_int mlHeroSplitNormalizationCount15mg = 0u;
 
 	// ML HERO phase 15bp: surviving-HERO scalar / packet-average ratio captured
 	// at the first HERO-only dispersive termination. Diagnostic only.
@@ -195,6 +214,11 @@ protected:
 		std::vector<SampleResult> &sampleResults) const;
 	bool Bounce(const float time, const SamplerUPtr& sampler, const u_int sampleOffset,
 		PathVertexVM *pathVertex, luxrays::Ray *nextEventRay) const;
+	void DrainMLHeroShadowQueue15mb(const float time,
+		const SamplerUPtr& sampler, const PathVertexVM *productionParent15mf,
+		const luxrays::Ray *productionRay15mf,
+		const SampleResult *productionSampleResult15mj,
+		const std::vector<PathVertexVM> *productionLightPathVertices15ni) const;
 
 	float misVmWeightFactor; // Weight of vertex merging (used in VC)
     float misVcWeightFactor; // Weight of vertex connection (used in VM)

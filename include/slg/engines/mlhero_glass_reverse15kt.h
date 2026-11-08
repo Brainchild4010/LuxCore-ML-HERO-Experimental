@@ -8,10 +8,13 @@ enum Status : unsigned { NOT_ATTEMPTED=0,INVALID_INPUT=1,INVALID_LOBES=2,EVALUAT
 struct Evidence {
     unsigned status=NOT_ATTEMPTED;
     bool forwardMatches=false,supported=false,reverseTir=false;
+    bool legacySupported=false,preciseProofValid=false;
     bool reverseFromLight=false,forwardIntoObject=false,reverseIntoObject=false;
     float forwardMass=0.f,reverseMass=0.f,forwardThreshold=0.f,reverseThreshold=0.f;
     float nc=0.f,nt=0.f,wavelength=-1.f,fixedCosine=0.f,reverseCosine=0.f;
-    double directionResidual=-1.;
+    double directionResidual=-1.,legacyDirectionResidual=-1.;
+    double preciseForwardResidual=-1.,preciseReverseResidual=-1.;
+    double forwardInteriorIOR=-1.,reverseInteriorIOR=-1.;
 };
 inline bool CloseMass(double a,double b){
     return std::isfinite(a)&&std::isfinite(b)&&std::fabs(a-b)<=2.e-6;

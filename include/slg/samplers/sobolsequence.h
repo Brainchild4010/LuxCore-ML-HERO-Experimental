@@ -42,6 +42,8 @@ public:
 	float rng0, rng1;
 
 	static void GenerateDirectionVectors(u_int *vectors, const u_int dimensions);
+	static void GenerateDirectionVectors(u_int *vectors, const u_int dimensions,
+			const u_int columns);
 private:
 	u_int SobolDimension(const u_int index, const u_int dimension) const;
 

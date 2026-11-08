@@ -21281,17 +21281,26 @@ static const SobolDirectionNumbers SOBOL_NUMBERS[SOBOL_MAX_DIMENSIONS - 1] = {
 };
 
 void slg::SobolSequence::GenerateDirectionVectors(u_int *vectors, const u_int dimensions) {
+	GenerateDirectionVectors(vectors, dimensions, SOBOL_BITS);
+}
+
+void slg::SobolSequence::GenerateDirectionVectors(u_int *vectors, const u_int dimensions,
+		const u_int columns) {
 	if (dimensions == 0u || dimensions > SOBOL_MAX_DIMENSIONS)
         throw std::runtime_error("SOBOL direction-vector dimension limit exceeded");
+	if (columns == 0u || columns > 52u)
+		throw std::runtime_error("SOBOL direction-vector column limit exceeded");
     assert(dimensions <= SOBOL_MAX_DIMENSIONS);
 
-	const u_int L = SOBOL_BITS;
+	const u_int L = columns;
 
 	// First dimension is an exception
 	u_int *v = &vectors[0];
 
 	for (u_int i = 0; i < L; i++)
-		v[i] = 1 << (31 - i); // all m's = 1
+		// A 32-bit Sobol value has no additional first-dimension precision
+		// after column 32. Other dimensions continue through the recurrence.
+		v[i] = (i < 32u) ? (1u << (31u - i)) : 0u; // all m's = 1
 
 	for (u_int dim = 1; dim < dimensions; dim++) {
 		const SobolDirectionNumbers *numbers = &SOBOL_NUMBERS[dim - 1];

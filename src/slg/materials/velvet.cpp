@@ -18,31 +18,14 @@
 
 #include "slg/materials/velvet.h"
 #include "slg/engines/mlhero_velvet_audit15lq.h"
+#include "slg/engines/mlhero_velvet_spectral15nn.h"
+#include "slg/engines/mlhero_glossy2_spectral15nj.h"
+
+#include <limits>
 
 using namespace std;
 using namespace luxrays;
 using namespace slg;
-
-namespace {
-
-// Material::Evaluate() returns f(light, eye) * |cos(light)|.  Clamp the
-// physical BRDF before applying that transport cosine so the result remains
-// reciprocal when light and eye directions are exchanged.
-static inline float VelvetCosWeightedValue(const float phaseThickness,
-		const float absLightCos, const float absEyeCos) {
-	const float cosineProduct = absLightCos * absEyeCos;
-	if (!(cosineProduct > 0.f))
-		return 0.f;
-
-	float brdf = phaseThickness / cosineProduct;
-	if (brdf > 1.f)
-		brdf = 1.f;
-	else if (brdf < 0.f)
-		brdf = 0.f;
-	return brdf * absLightCos;
-}
-
-}
 
 //------------------------------------------------------------------------------
 // Velvet material
@@ -83,15 +66,9 @@ Spectrum VelvetMaterial::Evaluate(const HitPoint &hitPoint,
 
 	// Compute phase function
 
-	const float B = 3.0f * cosv;
-
-	const float polynomial = 1.0f + A1 * cosv + A2 * 0.5f * (B * cosv - 1.0f) +
-		A3 * 0.5f * (5.0f * cosv * cosv * cosv - B);
-	const float phaseThickness = polynomial * delta / (4.0f * M_PI);
-
 	// Clamp the physical BRDF (page 7), not the direction-dependent
 	// cosine-weighted transport value.
-	const float p = VelvetCosWeightedValue(phaseThickness,
+	const float p = mlhero15nn::PhaseFactor(A1, A2, A3, delta, cosv,
 		fabsf(localLightDir.z), fabsf(localEyeDir.z));
 
 	return Kd->GetSpectrumValue(hitPoint).Clamp(0.f, 1.f) * p;
@@ -121,23 +98,62 @@ Spectrum VelvetMaterial::Sample(const HitPoint &hitPoint,
 
 	// Compute phase function
 
-	const float B = 3.0f * cosv;
-
-	const float polynomial = 1.0f + A1 * cosv + A2 * 0.5f * (B * cosv - 1.0f) +
-		A3 * 0.5f * (5.0f * cosv * cosv * cosv - B);
-	const float phaseThickness = polynomial * delta / (4.0f * M_PI);
 	const float absLightCos = hitPoint.fromLight ? fabsf(localFixedDir.z) :
 		fabsf(localSampledDir->z);
 	const float absEyeCos = hitPoint.fromLight ? fabsf(localSampledDir->z) :
 		fabsf(localFixedDir.z);
 
 	// Use the same reciprocal BRDF clamp as Evaluate().
-	const float p = VelvetCosWeightedValue(phaseThickness, absLightCos, absEyeCos);
+	const float p = mlhero15nn::PhaseFactor(A1, A2, A3, delta, cosv,
+		absLightCos, absEyeCos);
 
 	if (audit15lq.Active())
 		audit15lq.Accept(slg::mlhero15kk::V(*localSampledDir), *pdfW, p);
 
 	return Kd->GetSpectrumValue(hitPoint).Clamp(0.f, 1.f) * (p / *pdfW);
+}
+
+bool VelvetMaterial::PrepareMLHeroSpectralEndpoint15nn(
+		const HitPoint &hitPoint, const Vector &localLightDir,
+		const Vector &localEyeDir,
+		MLHeroVelvetSpectralEndpoint15nn *prepared) const {
+	if (!prepared)
+		return false;
+
+	prepared->event = DIFFUSE | REFLECT;
+	prepared->kd = Kd->GetSpectrumValue(hitPoint).Clamp(0.f, 1.f);
+	const float a1 = P1->GetFloatValue(hitPoint);
+	const float a2 = P2->GetFloatValue(hitPoint);
+	const float a3 = P3->GetFloatValue(hitPoint);
+	const float thickness = Thickness->GetFloatValue(hitPoint);
+	const float cosv = -Dot(localLightDir, localEyeDir);
+	prepared->phaseFactor = mlhero15nn::PhaseFactor(a1, a2, a3,
+		thickness, cosv, fabsf(localLightDir.z), fabsf(localEyeDir.z));
+
+	return prepared->kd.IsValid() && std::isfinite(a1) &&
+		std::isfinite(a2) && std::isfinite(a3) &&
+		std::isfinite(thickness) && std::isfinite(cosv) &&
+		std::isfinite(prepared->phaseFactor) &&
+		prepared->phaseFactor >= 0.f;
+}
+
+bool VelvetMaterial::EvaluateMLHeroSpectralEndpoint15nn(
+		const MLHeroVelvetSpectralEndpoint15nn &prepared,
+		const float waveLength, const bool basisCompensation,
+		float *value) {
+	if (!value || !std::isfinite(waveLength) ||
+			!std::isfinite(prepared.phaseFactor) ||
+			prepared.phaseFactor < 0.f || !prepared.kd.IsValid())
+		return false;
+
+	const float kd = mlhero15nj::Reflectance(prepared.kd, waveLength,
+		basisCompensation);
+	const double result = double(kd) * double(prepared.phaseFactor);
+	if (!std::isfinite(result) || result < 0.0 ||
+			result > double(std::numeric_limits<float>::max()))
+		return false;
+	*value = float(result);
+	return true;
 }
 
 void VelvetMaterial::Pdf(const HitPoint &hitPoint,

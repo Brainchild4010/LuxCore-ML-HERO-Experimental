@@ -5,11 +5,12 @@
 namespace slg { namespace {
 // Actual post-material lane values, before current RR compensation.
 // Eta history is camera-only. RGB/negative/nonfinite inputs retain baseline.
-static bool MLHeroMaterialBeta15fv(unsigned n,bool collapsed,
+static bool MLHeroMaterialBeta15fv(unsigned n,bool collapsed,unsigned activeLane,
         const double post[8][3],bool etaValid,const double eta[8],double *beta) {
-    *beta=0.;if(n<2||n>8||!etaValid)return false;
+    *beta=0.;if(n<2||n>8||!etaValid||(collapsed&&activeLane>=n))return false;
     const unsigned count=collapsed?1:n;
-    for(unsigned i=0;i<count;++i){
+    for(unsigned slot=0;slot<count;++slot){
+        const unsigned i=collapsed?activeLane:slot;
         for(unsigned c=0;c<3;++c)
             if(!std::isfinite(post[i][c])||post[i][c]<0.)return false;
         if(post[i][0]!=post[i][1]||post[i][0]!=post[i][2]||

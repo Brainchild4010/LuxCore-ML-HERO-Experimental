@@ -27,6 +27,18 @@ namespace slg {
 // Velvet material
 //------------------------------------------------------------------------------
 
+// Phase 15nn caches the native Velvet scalar lobe separately from Kd.  The
+// scalar lobe is direction/phase/thickness dependent but not dispersive; only
+// Kd is reconstructed at the requested HERO wavelength.
+struct MLHeroVelvetSpectralEndpoint15nn {
+	BSDFEvent event;
+	luxrays::Spectrum kd;
+	float phaseFactor;
+
+	MLHeroVelvetSpectralEndpoint15nn() : event(NONE), kd(0.f),
+		phaseFactor(0.f) { }
+};
+
 class VelvetMaterial : public Material {
 public:
 	VelvetMaterial(TextureConstPtr frontTransp, TextureConstPtr backTransp,
@@ -49,6 +61,18 @@ public:
 	virtual void Pdf(const HitPoint &hitPoint,
 		const luxrays::Vector &localLightDir, const luxrays::Vector &localEyeDir,
 		float *directPdfW, float *reversePdfW) const;
+
+	// ML HERO phase 15nn: exact Velvet endpoint behind an outer MixMaterial.
+	// Sampling, event, PDF, phase function, thickness and geometry remain
+	// native.  Only the cached Kd texture is evaluated at one wavelength.
+	bool PrepareMLHeroSpectralEndpoint15nn(const HitPoint &hitPoint,
+		const luxrays::Vector &localLightDir,
+		const luxrays::Vector &localEyeDir,
+		MLHeroVelvetSpectralEndpoint15nn *prepared) const;
+	static bool EvaluateMLHeroSpectralEndpoint15nn(
+		const MLHeroVelvetSpectralEndpoint15nn &prepared,
+		const float waveLength, const bool basisCompensation,
+		float *value);
 
 	virtual void AddReferencedTextures(std::unordered_set<const Texture *>  &referencedTexsreferencedTexs) const;
 	virtual void UpdateTextureReferences(TextureConstRef oldTex, TextureRef newTex);

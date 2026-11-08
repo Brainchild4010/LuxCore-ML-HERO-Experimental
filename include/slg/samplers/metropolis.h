@@ -99,6 +99,15 @@ public:
 	// Used, most of the times, when not having a film
 	MetropolisSampleType GetLastSampleAcceptance(float &weight) const;
 
+	// ML HERO 15my diagnostic-only primary-state snapshots. The digest uses
+	// only dimensions realized by the evaluated proposal/current path and is
+	// independent of thread, mutation stamp and scheduling metadata.
+	void GetMLHeroProposedPrimaryState15my(u_longlong *hash,
+		u_int *activeDimensions, u_int *mutationStamp,
+		bool *largeMutation) const;
+	void GetMLHeroCurrentPrimaryState15my(u_longlong *hash,
+		u_int *activeDimensions, u_int *acceptedStamp) const;
+
 	virtual luxrays::PropertiesUPtr ToProperties() const;
 
 	u_int GetLargeMutationCount() const { return largeMutationCount; }
@@ -147,6 +156,7 @@ private:
 	u_int largeMutationCount;
 	
 	bool isLargeMutation;
+	bool mlHeroCurrentPrimaryInitialized15my;
 };
 
 }

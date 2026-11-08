@@ -23,17 +23,19 @@ static void MLHeroMaterialRRReset15fu(bool enabled) {
 // is removed by the caller; previous RR and emission weights are retained.
 static void MLHeroMaterialRRRecord15fu(unsigned side,unsigned material,unsigned depth,
         bool active,bool killed,double random,double cap,unsigned n,bool collapsed,
+        unsigned activeLane,
         const double pre[8][3],const double post[8][3],const unsigned routes[8],
         bool etaHistoryValid,const double eta[8]) {
     if(!mlHeroMaterialRR15fu.enabled||side>1||material>2)return;
     auto &a=mlHeroMaterialRR15fu.bins[side][material][depth<=64?depth:65];
     ++a.calls;if(active){++a.active;if(killed)++a.killed;}
-    if(n<2||n>8){++a.invalid;return;}
+    if(n<2||n>8||(collapsed&&activeLane>=n)){++a.invalid;return;}
     const unsigned count=collapsed?1:n;
     const double norm=collapsed?1./n:1.;
     bool finite=true,scalar=true,etaOK=etaHistoryValid&&side==0;
     double pm=0,beta=0,eb=0;
-    for(unsigned i=0;i<count;++i){
+    for(unsigned slot=0;slot<count;++slot){
+        const unsigned i=collapsed?activeLane:slot;
         if(routes[i]<5)++a.routes[routes[i]];
         for(unsigned c=0;c<3;++c){
             finite=finite&&std::isfinite(pre[i][c])&&pre[i][c]>=0&&

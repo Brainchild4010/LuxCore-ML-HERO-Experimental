@@ -10,12 +10,12 @@ struct Vec {
     template<class V> Vec(const V &v):x(v.x),y(v.y),z(v.z){}
 };
 struct Snapshot {
-    bool valid=false,fromLight=false,transmit=false,vndf=false,importance=false;
+    bool valid=false,fromLight=false,transmit=false,vndf=false,ggx=false,importance=false;
     bool krBlack=false,ktBlack=false;
     bool precise15kl=false;
     mlhero15kk::V fixedPrecise15kl,sampledPrecise15kl,whPrecise15kl;
     const void *material=nullptr;
-    float nc=0.f,nt=0.f,roughness=0.f,anisotropy=0.f;
+    float nc=0.f,nt=0.f,roughness=0.f,anisotropy=0.f,alphaX=0.f,alphaY=0.f;
     float sampleD=0.f,sampleSpecPdf=0.f,probability=0.f,samplePdf=0.f;
     Vec fixed,sampled,wh;
 };

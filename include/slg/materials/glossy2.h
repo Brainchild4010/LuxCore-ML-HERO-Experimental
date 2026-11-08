@@ -23,6 +23,33 @@
 
 namespace slg {
 
+// ML HERO phase 15nk: texture-independent cached state for repeated
+// wavelength evaluation of one already selected Glossy2 direction pair.
+struct MLHeroGlossy2SpectralEndpoint15nk {
+	BSDFEvent event;
+	bool baseOnly;
+	bool fromLight;
+	bool multibounce;
+	luxrays::Spectrum kd;
+	luxrays::Spectrum ks;
+	luxrays::Spectrum ka;
+	luxrays::Vector localFixedDir;
+	luxrays::Vector localSampledDir;
+	float baseGeometry;
+	float cosi;
+	float coso;
+	float depth;
+	float roughness;
+	float anisotropy;
+	float wrapperFactor;
+
+	MLHeroGlossy2SpectralEndpoint15nk() : event(NONE), baseOnly(false),
+		fromLight(false), multibounce(false), kd(0.f), ks(0.f), ka(0.f),
+		localFixedDir(), localSampledDir(), baseGeometry(0.f), cosi(0.f),
+		coso(0.f), depth(0.f), roughness(0.f), anisotropy(0.f),
+		wrapperFactor(1.f) { }
+};
+
 //------------------------------------------------------------------------------
 // Glossy2 material
 //------------------------------------------------------------------------------
@@ -60,6 +87,41 @@ public:
 		luxrays::Spectrum *schlickS, luxrays::Spectrum *absorptionValue,
 		luxrays::Spectrum *baseContribution, luxrays::Spectrum *coatingContribution,
 		luxrays::Spectrum *combinedResult) const;
+
+	// ML HERO phase 15nd: exact Evaluate() numerator decomposition for DLS.
+	// Unlike the sampled-bounce helper above, these values are not divided by
+	// a sampling PDF.
+	bool EvaluateMLHeroEvaluateComponents15nd(const HitPoint &hitPoint,
+		const luxrays::Vector &localLightDir, const luxrays::Vector &localEyeDir,
+		BSDFEvent *event, luxrays::Spectrum *kdValue,
+		luxrays::Spectrum *baseContribution,
+		luxrays::Spectrum *coatingContribution,
+		luxrays::Spectrum *combinedResult) const;
+
+	// ML HERO phase 15nj: evaluate the original Glossy2 formula at one
+	// wavelength. Kd, Schlick Ks and coating absorption Ka are independently
+	// reconstructed; no RGB component is fitted to a scalar surrogate.
+	bool EvaluateMLHeroAtWaveLength15nj(const HitPoint &hitPoint,
+		const luxrays::Vector &localLightDir,
+		const luxrays::Vector &localEyeDir, const float waveLength,
+		const bool basisCompensation, BSDFEvent *event,
+		float *value) const;
+
+	// ML HERO phase 15nk: cache all texture and geometric inputs once, then
+	// evaluate the same selected direction at every packet wavelength.
+	bool PrepareMLHeroSpectralEndpoint15nk(const HitPoint &hitPoint,
+		const luxrays::Vector &localLightDir,
+		const luxrays::Vector &localEyeDir,
+		MLHeroGlossy2SpectralEndpoint15nk *prepared) const;
+	static bool EvaluateMLHeroSpectralEndpoint15nk(
+		const MLHeroGlossy2SpectralEndpoint15nk &prepared,
+		const float waveLength, const bool basisCompensation,
+		float *value);
+	static bool EvaluateMLHeroNativeComponentsPrepared15nk(
+		const MLHeroGlossy2SpectralEndpoint15nk &prepared,
+		luxrays::Spectrum *baseContribution,
+		luxrays::Spectrum *coatingContribution,
+		luxrays::Spectrum *combinedResult);
 
 	virtual void AddReferencedTextures(std::unordered_set<const Texture *>  &referencedTexsreferencedTexs) const;
 	virtual void UpdateTextureReferences(TextureConstRef oldTex, TextureRef newTex);

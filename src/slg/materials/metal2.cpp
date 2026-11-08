@@ -177,13 +177,11 @@ bool Metal2Material::EvaluateFresnelAtWaveLength(const HitPoint &hitPoint, const
 	if (!fresnelTex || !fresnel)
 		return false;
 
-	Spectrum eta, kk;
-	if (!fresnelTex->GetNKAtWaveLength(hitPoint, waveLength, &eta, &kk))
+	if (!fresnelTex->EvaluateAtWaveLength(hitPoint, cosi, waveLength, fresnel))
 		return false;
 
-	*fresnel = FresnelTexture::GeneralEvaluate(eta, kk, cosi);
 	fresnel->Clamp(0.f, 1.f);
-	return true;
+	return !fresnel->IsNaN() && !fresnel->IsInf();
 }
 
 bool Metal2Material::EvaluateAtWaveLength(const HitPoint &hitPoint,

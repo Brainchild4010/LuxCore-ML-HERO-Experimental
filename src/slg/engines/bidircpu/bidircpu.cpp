@@ -69,10 +69,12 @@ void BiDirCPURenderEngine::StartLockLess() {
 
 	maxEyePathDepth = (u_int)Max(1, cfg.Get(GetDefaultProps()->Get("path.maxdepth")).Get<int>());
 	maxLightPathDepth = (u_int)Max(1, cfg.Get(GetDefaultProps()->Get("light.maxdepth")).Get<int>());
-    if (GetType() == BIDIRCPU && cfg.Get(Property("sampler.type")("SOBOL")).Get<std::string>() == "SOBOL") {
+	const std::string samplerType = cfg.Get(Property("sampler.type")("SOBOL")).Get<std::string>();
+	const bool lowDiscrepancySampler = samplerType == "SOBOL" || samplerType == "ZSOBOL";
+	if (GetType() == BIDIRCPU && lowDiscrepancySampler) {
         const unsigned long long required = 14ull + 5ull*maxLightPathDepth + 10ull*maxEyePathDepth;
         if (required > SOBOL_MAX_DIMENSIONS)
-            throw std::runtime_error("BIDIRCPU + SOBOL: requested " + std::to_string(required) +
+            throw std::runtime_error("BIDIRCPU + SOBOL/ZSOBOL: requested " + std::to_string(required) +
                 " sample dimensions, maximum " + std::to_string(SOBOL_MAX_DIMENSIONS) +
                 ". Reduce Eye/Light Depth (equal depths: maximum 1412).");
     }
@@ -95,6 +97,21 @@ void BiDirCPURenderEngine::StartLockLess() {
 	mlHeroCurrentDiagnostics = cfg.Get(GetDefaultProps()->Get("path.mlhero.currentdiagnostics")).Get<bool>();
 	mlHeroLegacyDiagnostics = cfg.Get(GetDefaultProps()->Get("path.mlhero.legacydiagnostics")).Get<bool>();
 	mlHeroHeavyDiagnostics = cfg.Get(GetDefaultProps()->Get("path.mlhero.heavydiagnostics")).Get<bool>();
+	// 15ng/15nh normally reserve five Sobol dimensions per EYE depth and
+	// wavelength lane for visible split-child DLS. At high depths, the compact
+	// layout keeps five dimensions per depth and gives every lane a distinct,
+	// measure-preserving Cranley-Patterson shift. Existing native BIDIR
+	// dimensions remain at their original indices.
+	if (GetType() == BIDIRCPU && mlHeroSplittingRequested15gl &&
+			lowDiscrepancySampler) {
+		const unsigned long long compactRequired15ng = 14ull +
+			5ull * maxLightPathDepth + 15ull * maxEyePathDepth;
+		if (compactRequired15ng > SOBOL_MAX_DIMENSIONS)
+			throw std::runtime_error("BIDIRCPU + SOBOL/ZSOBOL + HERO splitting 15nh: requested " +
+				std::to_string(compactRequired15ng) + " compact sample dimensions, maximum " +
+				std::to_string(SOBOL_MAX_DIMENSIONS) +
+				". Reduce Eye/Light Depth (equal depths: maximum 1059; 1024 is supported).");
+	}
 	rrDepth = (u_int)Max(1, cfg.Get(GetDefaultProps()->Get("path.russianroulette.depth")).Get<int>());
 	rrImportanceCap = Clamp(cfg.Get(GetDefaultProps()->Get("path.russianroulette.cap")).Get<double>(), 0.0, 1.0);
     mlHeroRRMaterialExperiment = cfg.Get(GetDefaultProps()->Get("path.mlhero.rr.materialexperiment")).Get<bool>();

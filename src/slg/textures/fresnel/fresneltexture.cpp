@@ -26,6 +26,19 @@ using namespace slg;
 // Fresnel texture
 //------------------------------------------------------------------------------
 
+bool FresnelTexture::EvaluateAtWaveLength(const HitPoint &hitPoint,
+		const float cosi, const float waveLength, Spectrum *fresnel) const {
+	if (!fresnel)
+		return false;
+
+	Spectrum eta, k;
+	if (!GetNKAtWaveLength(hitPoint, waveLength, &eta, &k))
+		return false;
+
+	*fresnel = GeneralEvaluate(eta, k, cosi).Clamp(0.f, 1.f);
+	return !fresnel->IsNaN() && !fresnel->IsInf();
+}
+
 float FresnelTexture::ApproxN(const float Fr) {
 	const float sqrtReflectance = sqrtf(Clamp(Fr, 0.f, .999f));
 

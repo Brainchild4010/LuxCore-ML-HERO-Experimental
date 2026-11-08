@@ -77,7 +77,17 @@ bool EvaluateMLHeroMicrofacetOwnershipPrecise15kl(const HitPoint &hitPoint,
 		float *heroMicrofacetPdf, float *laneSharedMicrofacetPdf,
 		float *naturalJacobian, float *sharedJacobian,
 		float *naturalDirPdf, float *sharedDirPdf,
-		float *naturalDirDelta, float *sharedWhDelta, bool *naturalTir) const ;
+		float *naturalDirDelta, float *sharedWhDelta, bool *naturalTir,
+		mlhero15kk::V *naturalChildDir = nullptr,
+		BSDFEvent *naturalChildEvent = nullptr,
+		luxrays::Spectrum *naturalChildValue = nullptr,
+		float *naturalChildDirectPdf = nullptr,
+		float *naturalChildReversePdf = nullptr,
+		bool *naturalChildPairValid = nullptr,
+		bool *naturalChildPairTransmit = nullptr,
+		float *naturalChildAbsLightZ = nullptr,
+		float *naturalChildAbsEyeZ = nullptr,
+		bool *naturalChildHemisphereZero = nullptr) const ;
 
 	bool HasMLHeroDispersion(const HitPoint &hitPoint) const;
 

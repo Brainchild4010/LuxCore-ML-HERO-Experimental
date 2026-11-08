@@ -1,4 +1,5 @@
 #include "slg/engines/mlhero_volume_direction15kp.h"
+#include "slg/engines/mlhero_glass_reverse_precision15mx.h"
 /***************************************************************************
  * Copyright 1998-2020 by authors (see AUTHORS.txt)                        *
  *                                                                         *
@@ -20,6 +21,7 @@
 #include "slg/textures/fresnel/fresneltexture.h"
 #include "slg/materials/glass.h"
 #include "slg/materials/thinfilmcoating.h"
+#include <cassert>
 
 using namespace std;
 using namespace luxrays;
@@ -247,6 +249,45 @@ thread_local u_int mlHeroWavelengthCount = 1u;
 thread_local u_int mlHeroActiveLane = 0u;
 thread_local float mlHeroWaveLengths[ML_HERO_MAX_WAVELENGTHS] = { -1.f, -1.f, -1.f, -1.f, -1.f, -1.f, -1.f, -1.f };
 thread_local float mlHeroSampleWeights[ML_HERO_MAX_WAVELENGTHS] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f };
+
+// 15lx: exact save/restore around the bounded shadow-child production Bounce.
+// The wavelength packet itself is immutable during the nested call, so only
+// the mutable transport cursor and dispersion bookkeeping belong here.
+struct MLHeroTransportTLS15lx {
+    float wavelength, sampleWeight, cauchyB;
+    bool dispersionUsed, packetFallback;
+    GlassDispersionModel model;
+    GlassSellmeierPreset preset;
+    u_int activeLane;
+    bool valid;
+};
+static thread_local MLHeroTransportTLS15lx mlHeroTransportTLS15lx = {};
+
+void slg::PushMLHeroTransportTLS15lx() {
+    assert(!mlHeroTransportTLS15lx.valid);
+    mlHeroTransportTLS15lx.wavelength = mlDispersionWaveLength;
+    mlHeroTransportTLS15lx.sampleWeight = mlDispersionSampleWeight;
+    mlHeroTransportTLS15lx.cauchyB = mlDispersionCurrentCauchyB;
+    mlHeroTransportTLS15lx.dispersionUsed = mlDispersionUsed;
+    mlHeroTransportTLS15lx.packetFallback = mlHeroPacketFallbackUsed;
+    mlHeroTransportTLS15lx.model = mlDispersionCurrentModel;
+    mlHeroTransportTLS15lx.preset = mlDispersionCurrentSellmeierPreset;
+    mlHeroTransportTLS15lx.activeLane = mlHeroActiveLane;
+    mlHeroTransportTLS15lx.valid = true;
+}
+
+void slg::PopMLHeroTransportTLS15lx() {
+    assert(mlHeroTransportTLS15lx.valid);
+    mlDispersionWaveLength = mlHeroTransportTLS15lx.wavelength;
+    mlDispersionSampleWeight = mlHeroTransportTLS15lx.sampleWeight;
+    mlDispersionCurrentCauchyB = mlHeroTransportTLS15lx.cauchyB;
+    mlDispersionUsed = mlHeroTransportTLS15lx.dispersionUsed;
+    mlHeroPacketFallbackUsed = mlHeroTransportTLS15lx.packetFallback;
+    mlDispersionCurrentModel = mlHeroTransportTLS15lx.model;
+    mlDispersionCurrentSellmeierPreset = mlHeroTransportTLS15lx.preset;
+    mlHeroActiveLane = mlHeroTransportTLS15lx.activeLane;
+    mlHeroTransportTLS15lx.valid = false;
+}
 
 void SetMLHeroEnabled(const bool enabled) {
 	mlHeroEnabled = enabled;
@@ -1159,6 +1200,51 @@ PropertiesUPtr GlassMaterial::ToProperties(const ImageMapCache &imgMapCache, con
 }
 // vim: autoindent noexpandtab tabstop=4 shiftwidth=4
 
+// 15mx BEGIN: independent Double IOR reconstruction for the 15kt reciprocal
+// direction proof. Native Glass Sample/Evaluate/Pdf and their Float IOR values
+// remain unchanged.
+static double MLWaveLength2IORDouble15mx(const double waveLength,
+		const double baseIOR, const double cauchyB,
+		const GlassDispersionModel model,
+		const GlassSellmeierPreset preset) {
+	if (model == GLASS_DISPERSION_SELLMEIER) {
+		double b1, b2, b3, c1, c2, c3;
+		switch (preset) {
+			case GLASS_SELLMEIER_FUSED_SILICA:
+				b1=.6961663; b2=.4079426; b3=.8974794;
+				c1=.00467914826; c2=.0135120631; c3=97.9340025;
+				break;
+			case GLASS_SELLMEIER_SF10:
+				b1=1.62153902; b2=.256287842; b3=1.64447552;
+				c1=.0122241457; c2=.0595736775; c3=147.468793;
+				break;
+			case GLASS_SELLMEIER_SF11:
+				b1=1.73759695; b2=.313747346; b3=1.89878101;
+				c1=.0131887076; c2=.0623068142; c3=155.23629;
+				break;
+			case GLASS_SELLMEIER_N_BK7:
+			default:
+				b1=1.03961212; b2=.231792344; b3=1.01046945;
+				c1=.00600069867; c2=.0200179144; c3=103.560653;
+				break;
+		}
+		const double lambda = waveLength / 1000.;
+		const double lambda2 = lambda * lambda;
+		const double n2 = 1. + b1 * lambda2 / (lambda2 - c1) +
+			b2 * lambda2 / (lambda2 - c2) +
+			b3 * lambda2 / (lambda2 - c3);
+		return std::sqrt(std::max(1., n2));
+	}
+	if (cauchyB > 0.) {
+		const double reference = .58756;
+		const double lambda = waveLength / 1000.;
+		const double a = baseIOR - cauchyB / (reference * reference);
+		return a + cauchyB / (lambda * lambda);
+	}
+	return baseIOR;
+}
+// 15mx END
+
 // 15kt BEGIN: diagnostic evaluation only; the native Sample/Pdf/Evaluate stay unchanged.
 slg::mlhero15kt::Evidence GlassMaterial::EvaluateMLHeroReverseMass15kt(
         const HitPoint &forwardHit,const HitPoint &reverseHit,
@@ -1184,7 +1270,12 @@ slg::mlhero15kt::Evidence GlassMaterial::EvaluateMLHeroReverseMass15kt(
             mlDispersionCurrentCauchyB=b;mlDispersionCurrentModel=model;mlDispersionCurrentSellmeierPreset=preset;}
     } restore;
     a.wavelength=mlDispersionWaveLength;
-    struct Lobes {float threshold=0.f,mass=0.f,nc=0.f,nt=0.f;bool tir=false;Vector direction;};
+    struct Lobes {
+        float threshold=0.f,mass=0.f,nc=0.f,nt=0.f;
+        double ntLambda=0.;
+        bool tir=false;
+        Vector direction;
+    };
     auto evaluate=[&](const HitPoint &hp,const Vector &local,Lobes &out)->bool {
         const Spectrum kr=Kr->GetSpectrumValue(hp).Clamp(0.f,1.f);
         const Spectrum kt=Kt->GetSpectrumValue(hp).Clamp(0.f,1.f);
@@ -1213,6 +1304,9 @@ slg::mlhero15kt::Evidence GlassMaterial::EvaluateMLHeroReverseMass15kt(
         if(transmit&&!t.Black())out.direction=transmitted;
         else if(reflect&&!r.Black())out.direction=reflected;
         out.nc=nc;out.nt=nt;
+        out.ntLambda=MLWaveLength2IORDouble15mx((double)a.wavelength,
+            (double)nt,(double)b,dispersionModel,sellmeierPreset);
+        if(!(out.ntLambda>0.)||!std::isfinite(out.ntLambda))return false;
         return std::isfinite(out.threshold)&&std::isfinite(out.mass)&&out.mass>=0.f&&out.mass<=1.f;
     };
     a.status=INVALID_LOBES;Lobes forward,reverse;
@@ -1221,11 +1315,30 @@ slg::mlhero15kt::Evidence GlassMaterial::EvaluateMLHeroReverseMass15kt(
     a.forwardThreshold=forward.threshold;a.reverseThreshold=reverse.threshold;
     a.forwardMatches=CloseMass(forward.mass,nativeForwardMass);a.reverseTir=reverse.tir;
     a.nc=reverse.nc;a.nt=reverse.nt;
+    a.forwardInteriorIOR=forward.ntLambda;
+    a.reverseInteriorIOR=reverse.ntLambda;
     if(reverse.mass>0.f){
+        // Retain the old rounded-direction replay as a measured comparison,
+        // not as the support decision. It is ill-conditioned when the original
+        // fixed direction is almost tangent to the interface.
         const Vector predicted=slg::mlhero15kp::Normalize(reverse.direction);
         const double x=double(predicted.x)-fixed.x,y=double(predicted.y)-fixed.y,z=double(predicted.z)-fixed.z;
-        a.directionResidual=std::sqrt(x*x+y*y+z*z);
-        a.supported=std::isfinite(a.directionResidual)&&a.directionResidual<=1.e-4;
+        a.legacyDirectionResidual=std::sqrt(x*x+y*y+z*z);
+        a.legacySupported=std::isfinite(a.legacyDirectionResidual)&&
+            a.legacyDirectionResidual<=1.e-4;
+
+        // 15mx: compare the actual native direction against an independent
+        // Double forward solution, then reverse that unrounded solution with
+        // the reverse HitPoint's own IORs. The 1e-4 acceptance bound is exactly
+        // the pre-15mx bound; only the numerical construction changed.
+        const auto proof=slg::mlhero15mx::Prove(
+            slg::mlhero15mx::V(fixed),slg::mlhero15mx::V(reverseFixed),transmit,
+            (double)forward.nc,forward.ntLambda,(double)reverse.nc,reverse.ntLambda,1.e-4);
+        a.preciseProofValid=proof.valid;
+        a.preciseForwardResidual=proof.forwardResidual;
+        a.preciseReverseResidual=proof.reverseResidual;
+        a.directionResidual=proof.combinedResidual;
+        a.supported=proof.supported;
     }
     return a;
 }

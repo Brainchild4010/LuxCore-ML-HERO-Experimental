@@ -36,6 +36,10 @@
 
 namespace slg {
 
+struct MLHeroGlossy2SpectralEndpoint15nk;
+struct MLHeroMixSpectralEndpoint15nm;
+struct MLHeroMixDiagnostic15no;
+
 // OpenCL data types
 namespace ocl {
 #include "slg/bsdf/bsdf_types.cl"
@@ -216,7 +220,18 @@ public:
 			float *heroMicrofacetPdf, float *laneSharedMicrofacetPdf,
 			float *naturalJacobian, float *sharedJacobian,
 			float *naturalDirPdf, float *sharedDirPdf,
-			float *naturalDirDelta, float *sharedWhDelta, bool *naturalTir) const;
+			float *naturalDirDelta, float *sharedWhDelta, bool *naturalTir,
+			luxrays::Vector *naturalChildDir = nullptr,
+			BSDFEvent *naturalChildEvent = nullptr,
+			luxrays::Spectrum *naturalChildValue = nullptr,
+			float *naturalChildDirectPdf = nullptr,
+			float *naturalChildReversePdf = nullptr,
+			bool *naturalChildPairValid = nullptr,
+			bool *naturalChildPairTransmit = nullptr,
+			float *naturalChildAbsLightZ = nullptr,
+			float *naturalChildAbsEyeZ = nullptr,
+			bool *naturalChildHemisphereZero = nullptr,
+			luxrays::Spectrum *naturalChildWrappedValue = nullptr) const;
 
 	// ML HERO phase 15ac diagnostic: exact RGB component split for Glossy2
 	// using the already sampled bounce direction and mixture PDF.
@@ -226,6 +241,66 @@ public:
 			luxrays::Spectrum *schlickS, luxrays::Spectrum *absorptionValue,
 			luxrays::Spectrum *baseContribution, luxrays::Spectrum *coatingContribution,
 			float *wrapperFactor, luxrays::Spectrum *combinedResult) const;
+
+	// ML HERO phase 15nd: exact Glossy2 Evaluate() decomposition after the
+	// same BSDF wrapper corrections used by DirectLightSampling.
+	bool EvaluateMLHeroGlossy2Components15nd(
+			const luxrays::Vector &generatedDir, const BSDFEvent expectedEvent,
+			luxrays::Spectrum *kdValue,
+			luxrays::Spectrum *baseContribution,
+			luxrays::Spectrum *coatingContribution,
+			luxrays::Spectrum *combinedResult) const;
+
+	// ML HERO phase 15nj: exact wavelength-domain Glossy2 endpoint value,
+	// including the same public BSDF wrapper corrections as Evaluate().
+	bool EvaluateMLHeroGlossy2AtWaveLength15nj(
+			const luxrays::Vector &generatedDir,
+			const BSDFEvent expectedEvent, const float waveLength,
+			const bool basisCompensation,
+			luxrays::Spectrum *value) const;
+	bool PrepareMLHeroGlossy2SpectralEndpoint15nk(
+			const luxrays::Vector &generatedDir,
+			const BSDFEvent expectedEvent,
+			MLHeroGlossy2SpectralEndpoint15nk *prepared) const;
+	bool EvaluateMLHeroGlossy2Prepared15nk(
+			const MLHeroGlossy2SpectralEndpoint15nk &prepared,
+			const float waveLength, const bool basisCompensation,
+			luxrays::Spectrum *value) const;
+	bool EvaluateMLHeroGlossy2NativeComponentsPrepared15nk(
+			const MLHeroGlossy2SpectralEndpoint15nk &prepared,
+			luxrays::Spectrum *baseContribution,
+			luxrays::Spectrum *coatingContribution,
+			luxrays::Spectrum *combinedResult) const;
+
+	// ML HERO phase 15nl: read-only Mix material audit. These helpers expose
+	// the native child weights and RGB Evaluate() decomposition only to the
+	// bounded CPU BIDIR diagnostic. They never participate in transport.
+	bool GetMLHeroMixMetadata15nl(MaterialType *typeA, MaterialType *typeB,
+			u_int *idA, u_int *idB, float *mixFactor) const;
+	bool EvaluateMLHeroMixComponents15nl(const luxrays::Vector &generatedDir,
+			luxrays::Spectrum *weightedA, luxrays::Spectrum *weightedB,
+			luxrays::Spectrum *combinedResult,
+			BSDFEvent *eventA, BSDFEvent *eventB,
+			float *directPdfA, float *directPdfB,
+			float *reversePdfA, float *reversePdfB) const;
+
+	// ML HERO phase 15nm: fail-closed spectral evaluation of an outer MIX.
+	// The native direction, child selection, mixture PDF and event remain
+	// authoritative.  Only the already selected endpoint value is evaluated at
+	// the packet wavelength after an exact native-closure check.
+	bool PrepareMLHeroMixSpectralEndpoint15nm(
+			const luxrays::Vector &generatedDir,
+			const BSDFEvent expectedEvent,
+			const luxrays::Spectrum &nativeValue,
+			const bool sampled, const float nativePdfW,
+			MLHeroMixSpectralEndpoint15nm *prepared,
+			MLHeroMixDiagnostic15no *diagnostic15no = nullptr) const;
+	bool EvaluateMLHeroMixPrepared15nm(
+			const MLHeroMixSpectralEndpoint15nm &prepared,
+			const float waveLength, const bool glossy2BasisCompensation,
+			const bool velvetBasisCompensation,
+			luxrays::Spectrum *value,
+			MLHeroMixDiagnostic15no *diagnostic15no = nullptr) const;
 
 	luxrays::Spectrum ShadowCatcherSample(Vector *sampledDir,
 		float *pdfW, float *absCosSampledDir, BSDFEvent *event) const;
